@@ -295,9 +295,8 @@ impl SliceOffsetTable {
         // slice's end as the start of its **file-order** successor
         // (NOT the same plane's next slice — see the struct docstring
         // for why).
-        let abs_start = |plane: usize, slice: usize| -> usize {
-            wire[plane * nb_slices + slice] as usize + 32
-        };
+        let abs_start =
+            |plane: usize, slice: usize| -> usize { wire[plane * nb_slices + slice] as usize + 32 };
         let abs_end = |plane: usize, slice: usize| -> usize {
             // Slice-major file order: after (p, s) comes (p+1, s),
             // wrapping to (0, s+1) at the last plane.
@@ -362,5 +361,158 @@ mod tests {
         let mut bytes = [0u8; 32];
         bytes[..4].copy_from_slice(b"XXXX");
         assert!(FileHeader::parse(&bytes).is_err());
+    }
+
+    /// Build a synthetic 32-byte file header for a YUV422P frame with
+    /// the given dimensions and slice height, then append a
+    /// plane-major slice-offset table populated from the supplied
+    /// `wire_starts[plane][slice]` (relative to byte 32). Returns the
+    /// concatenated bytes plus the absolute offset where slice
+    /// payloads should begin (== huffman_start in our parser, which
+    /// the synthesised "Huffman descriptor" then occupies; tests can
+    /// pad past `huffman_start` to whatever `packet_len` they want).
+    fn build_synthetic_packet(
+        format: FormatCode,
+        width: u32,
+        height: u32,
+        slice_height: u32,
+        wire_starts: &[Vec<u32>],
+        packet_len: usize,
+    ) -> Vec<u8> {
+        let planes = format.planes();
+        let nb_slices = (height as usize).div_ceil(slice_height as usize);
+        assert_eq!(wire_starts.len(), planes);
+        for v in wire_starts {
+            assert_eq!(v.len(), nb_slices);
+        }
+        let mut out = vec![0u8; packet_len];
+        out[0..4].copy_from_slice(b"MAGY");
+        out[4..8].copy_from_slice(&32u32.to_le_bytes());
+        out[8] = 7; // version
+        out[9] = format as u8;
+        out[10] = 12; // max_huff_length (informational)
+        out[14] = 0; // flags
+        out[16..20].copy_from_slice(&width.to_le_bytes());
+        out[20..24].copy_from_slice(&height.to_le_bytes());
+        out[24..28].copy_from_slice(&width.to_le_bytes());
+        out[28..32].copy_from_slice(&slice_height.to_le_bytes());
+        // bytes 32..36 = leading le32 (skipped by decoder, value irrelevant)
+        out[32..36].copy_from_slice(&0u32.to_le_bytes());
+        let mut p = 36;
+        for plane in 0..planes {
+            for slice in 0..nb_slices {
+                out[p..p + 4].copy_from_slice(&wire_starts[plane][slice].to_le_bytes());
+                p += 4;
+            }
+        }
+        out[p] = planes as u8; // sanity byte
+        p += 1;
+        // permutation bytes (ignored by parser, leave zero)
+        p += planes * nb_slices;
+        let _ = p;
+        out
+    }
+
+    #[test]
+    fn slice_offset_table_single_slice_yuv422p() {
+        // 64x48 YUV422P, 1 slice. Plane 0 starts at +800, plane 1 at
+        // +1000, plane 2 at +1100. Packet length 1234.
+        let wire = vec![vec![800u32], vec![1000u32], vec![1100u32]];
+        let pkt = build_synthetic_packet(FormatCode::Yuv422P, 64, 48, 48, &wire, 1234);
+        let hdr = FileHeader::parse(&pkt).unwrap();
+        let table = SliceOffsetTable::parse(&pkt, &hdr, 1234).unwrap();
+        assert_eq!(table.starts[0], vec![832]); // 800 + 32
+        assert_eq!(table.starts[1], vec![1032]);
+        assert_eq!(table.starts[2], vec![1132]);
+        // Slice-major file order: plane 0 ends at plane 1 start; plane
+        // 1 ends at plane 2 start; plane 2 (the last) ends at packet_len.
+        assert_eq!(table.ends[0], vec![1032]);
+        assert_eq!(table.ends[1], vec![1132]);
+        assert_eq!(table.ends[2], vec![1234]);
+    }
+
+    #[test]
+    fn slice_offset_table_multi_slice_interleaved() {
+        // 64x48 YUV422P, 4 slices (slice_height=12). Mirrors the wire
+        // values observed in the FFmpeg fixture that broke the previous
+        // implementation: plane 0 first-slice starts 833/1105/1329/1553
+        // interleaved with plane 1 starts 957/1217/1441/1733 and plane
+        // 2 starts 1029/1273/1497/1833. packet_len = 1970 (matches the
+        // fixture). Verifies that:
+        //   * starts come straight from the wire (slice-index ordered),
+        //   * ends derive from the **file-order** successor relation
+        //     (end(p, s) = start(p+1, s) if p+1<planes else
+        //                  start(0, s+1) if s+1<nb_slices else packet_len),
+        //   * none of the ends are the naive "same plane next slice".
+        let wire = vec![
+            vec![833u32, 1105, 1329, 1553],
+            vec![957u32, 1217, 1441, 1733],
+            vec![1029u32, 1273, 1497, 1833],
+        ];
+        let pkt = build_synthetic_packet(FormatCode::Yuv422P, 64, 48, 12, &wire, 1970);
+        let hdr = FileHeader::parse(&pkt).unwrap();
+        let table = SliceOffsetTable::parse(&pkt, &hdr, 1970).unwrap();
+
+        // Starts: wire + 32, in slice-index order.
+        assert_eq!(table.starts[0], vec![865, 1137, 1361, 1585]);
+        assert_eq!(table.starts[1], vec![989, 1249, 1473, 1765]);
+        assert_eq!(table.starts[2], vec![1061, 1305, 1529, 1865]);
+
+        // Ends — file-order successor of (plane, slice):
+        //   plane 0: ends = start(1, s) for s=0..3
+        //   plane 1: ends = start(2, s) for s=0..3
+        //   plane 2 last plane: end(2, s) = start(0, s+1) for s<3,
+        //                       end(2, 3) = packet_len = 1970.
+        assert_eq!(table.ends[0], vec![989, 1249, 1473, 1765]);
+        assert_eq!(table.ends[1], vec![1061, 1305, 1529, 1865]);
+        assert_eq!(table.ends[2], vec![1137, 1361, 1585, 1970]);
+
+        // Sanity: every (start, end) range is non-empty (slice prefix
+        // is at least 2 bytes — flag + predictor — so end - start ≥ 2).
+        for plane in 0..3 {
+            for slice in 0..4 {
+                let st = table.starts[plane][slice];
+                let en = table.ends[plane][slice];
+                assert!(
+                    en >= st + 2,
+                    "plane {plane} slice {slice} too small ({}..{})",
+                    st,
+                    en,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn slice_offset_table_rejects_oob_offset() {
+        // Plane 0 slice 0 starts beyond packet end → reject.
+        let wire = vec![vec![5000u32], vec![1000u32], vec![1100u32]];
+        let pkt = build_synthetic_packet(FormatCode::Yuv422P, 64, 48, 48, &wire, 1234);
+        let hdr = FileHeader::parse(&pkt).unwrap();
+        let err = SliceOffsetTable::parse(&pkt, &hdr, 1234)
+            .expect_err("expected out-of-bounds offset to be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("exceeds packet length"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn slice_offset_table_rejects_descending_offset() {
+        // Plane 0 slice 1 starts before slice 0 → end(0, 0) =
+        // start(1, 0) = 1000+32 = 1032 > start(0, 0) = 800+32 = 832 ✓,
+        // but end(1, 0) = start(0, 1) = 100+32 = 132 < start(1, 0) =
+        // 1032 → "end precedes start".
+        let wire = vec![vec![800u32, 100], vec![1000u32, 50], vec![1100u32, 200]];
+        let pkt = build_synthetic_packet(FormatCode::Yuv422P, 64, 48, 24, &wire, 1234);
+        let hdr = FileHeader::parse(&pkt).unwrap();
+        let err = SliceOffsetTable::parse(&pkt, &hdr, 1234)
+            .expect_err("expected non-monotone wire offsets to be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("precedes start") || msg.contains("not monotone"),
+            "unexpected error message: {msg}"
+        );
     }
 }
