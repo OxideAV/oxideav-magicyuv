@@ -218,17 +218,23 @@ impl FileHeader {
 
 /// Slice-offset table parsed from bytes `[32..]` of a packet.
 ///
-/// `offsets[plane]` is a vector of length `nb_slices + 1`; entry `s` is
-/// the absolute byte offset (in the packet) of the start of slice `s`,
-/// entry `nb_slices` is the absolute end-of-plane byte offset (the start
-/// of the next plane's slice 0, or the packet length for the last
-/// plane). The decoder converts the plane-major le32 wire entries into
-/// this slightly more convenient form.
+/// The wire stores `planes * nb_slices` plane-major le32 starts (each
+/// relative to byte 32). The slice payloads themselves are written
+/// **slice-major** in the file: (plane 0 slice 0), (plane 1 slice 0),
+/// ..., (plane P-1 slice 0), (plane 0 slice 1), ... — so the
+/// per-plane starts are not monotone in the packet, and a slice's end
+/// is the **file-order successor's** start, not the same plane's next
+/// slice's start. We expose `starts` + `ends` separately to keep this
+/// distinction explicit.
 #[derive(Clone, Debug)]
 pub struct SliceOffsetTable {
-    /// `offsets[plane][slice]` = absolute start byte; trailing entry =
-    /// absolute end byte of last slice in that plane.
-    pub offsets: Vec<Vec<usize>>,
+    /// `starts[plane][slice]` = absolute byte offset of the slice's
+    /// first byte (length `nb_slices`).
+    pub starts: Vec<Vec<usize>>,
+    /// `ends[plane][slice]` = absolute byte offset one past the slice's
+    /// last byte (= start of whatever slice comes next in file order,
+    /// or `packet_len` for the file's last slice).
+    pub ends: Vec<Vec<usize>>,
     /// Absolute byte offset where the per-plane Huffman descriptors begin.
     pub huffman_start: usize,
 }
@@ -285,39 +291,53 @@ impl SliceOffsetTable {
         p += perm_len;
         let huffman_start = p;
 
-        // Convert wire entries to absolute byte offsets per (plane, slice).
-        let mut offsets: Vec<Vec<usize>> = Vec::with_capacity(planes);
-        for plane in 0..planes {
-            let mut v: Vec<usize> = Vec::with_capacity(nb_slices + 1);
-            for slice in 0..nb_slices {
-                let e = wire[plane * nb_slices + slice] as usize;
-                v.push(e + 32);
-            }
-            // Terminator: the start of plane (plane+1) slice 0, or packet end.
-            let term = if plane + 1 < planes {
-                wire[(plane + 1) * nb_slices] as usize + 32
+        // Compute per-(plane, slice) absolute start; then derive each
+        // slice's end as the start of its **file-order** successor
+        // (NOT the same plane's next slice — see the struct docstring
+        // for why).
+        let abs_start = |plane: usize, slice: usize| -> usize {
+            wire[plane * nb_slices + slice] as usize + 32
+        };
+        let abs_end = |plane: usize, slice: usize| -> usize {
+            // Slice-major file order: after (p, s) comes (p+1, s),
+            // wrapping to (0, s+1) at the last plane.
+            if plane + 1 < planes {
+                abs_start(plane + 1, slice)
+            } else if slice + 1 < nb_slices {
+                abs_start(0, slice + 1)
             } else {
                 packet_len
-            };
-            v.push(term);
-            // Sanity: monotone non-decreasing within the plane.
-            for w in v.windows(2) {
-                if w[1] < w[0] {
-                    return Err(Error::invalid(format!(
-                        "magicyuv: slice offsets not monotone in plane {plane}"
-                    )));
-                }
-                if w[1] > packet_len {
-                    return Err(Error::invalid(format!(
-                        "magicyuv: slice offset {} exceeds packet length {}",
-                        w[1], packet_len
-                    )));
-                }
             }
-            offsets.push(v);
+        };
+        let mut starts: Vec<Vec<usize>> = Vec::with_capacity(planes);
+        let mut ends: Vec<Vec<usize>> = Vec::with_capacity(planes);
+        for plane in 0..planes {
+            let mut s_v: Vec<usize> = Vec::with_capacity(nb_slices);
+            let mut e_v: Vec<usize> = Vec::with_capacity(nb_slices);
+            for slice in 0..nb_slices {
+                let st = abs_start(plane, slice);
+                let en = abs_end(plane, slice);
+                if st > packet_len || en > packet_len {
+                    return Err(Error::invalid(format!(
+                        "magicyuv: slice {slice} plane {plane} byte range \
+                         [{st}..{en}) exceeds packet length {packet_len}"
+                    )));
+                }
+                if en < st {
+                    return Err(Error::invalid(format!(
+                        "magicyuv: slice {slice} plane {plane} end {en} \
+                         precedes start {st}"
+                    )));
+                }
+                s_v.push(st);
+                e_v.push(en);
+            }
+            starts.push(s_v);
+            ends.push(e_v);
         }
         Ok(Self {
-            offsets,
+            starts,
+            ends,
             huffman_start,
         })
     }

@@ -130,8 +130,8 @@ pub fn decode_packet(bytes: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
             let plane_h = plane_row_end - plane_row_start;
             let _ = h_sub;
 
-            let pstart = table.offsets[plane][slice];
-            let pend = table.offsets[plane][slice + 1];
+            let pstart = table.starts[plane][slice];
+            let pend = table.ends[plane][slice];
             if pstart + 2 > pend || pend > bytes.len() {
                 return Err(Error::invalid(format!(
                     "magicyuv: slice {slice} plane {plane} bad range [{pstart}..{pend}) of {})",

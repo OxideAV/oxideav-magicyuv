@@ -63,28 +63,46 @@ fn run_ffmpeg(args: &[&str]) -> Vec<u8> {
 }
 
 fn encode_magy(width: u32, height: u32, pix_fmt: &str, predictor: &str) -> Vec<u8> {
-    // Pipe AVI to stdout via the matroska mux? No — AVI works fine to
-    // stdout when format is forced. Use lavfi testsrc as the source.
-    run_ffmpeg(&[
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-f",
-        "lavfi",
-        "-i",
-        &format!("testsrc=size={width}x{height}:duration=1:rate=1"),
-        "-frames:v",
-        "1",
-        "-pix_fmt",
-        pix_fmt,
-        "-c:v",
-        "magicyuv",
-        "-pred",
-        predictor,
-        "-f",
-        "avi",
-        "-",
-    ])
+    encode_magy_slices(width, height, pix_fmt, predictor, None)
+}
+
+/// Same as [`encode_magy`] but optionally requests `slices` (FFmpeg's
+/// `-slices N`) — useful for forcing multi-slice frames at sizes too
+/// small to trigger the encoder's automatic slice subdivision.
+fn encode_magy_slices(
+    width: u32,
+    height: u32,
+    pix_fmt: &str,
+    predictor: &str,
+    slices: Option<u32>,
+) -> Vec<u8> {
+    let testsrc = format!("testsrc=size={width}x{height}:duration=1:rate=1");
+    let mut args: Vec<String> = vec![
+        "-hide_banner".into(),
+        "-loglevel".into(),
+        "error".into(),
+        "-f".into(),
+        "lavfi".into(),
+        "-i".into(),
+        testsrc,
+        "-frames:v".into(),
+        "1".into(),
+        "-pix_fmt".into(),
+        pix_fmt.into(),
+        "-c:v".into(),
+        "magicyuv".into(),
+        "-pred".into(),
+        predictor.into(),
+    ];
+    if let Some(n) = slices {
+        args.push("-slices".into());
+        args.push(n.to_string());
+    }
+    args.push("-f".into());
+    args.push("avi".into());
+    args.push("-".into());
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_ffmpeg(&arg_refs)
 }
 
 fn decode_raw(avi: &[u8], pix_fmt: &str) -> Vec<u8> {
@@ -269,4 +287,126 @@ fn yuv420p_median_320x240_multi_slice() {
         240,
         "yuv420p/median/320x240 (multi-slice)",
     );
+}
+
+/// GBRAP (`M8RA`, format 0x66) — 4-plane, RGB-decorrelated. Decoder
+/// emits packed `Rgba` (one VideoPlane). Reference is FFmpeg's `rgba`
+/// rawvideo dump so we exercise the decorrelation + RGB swizzle on
+/// the alpha-bearing path.
+fn try_decode_gbrap_test(predictor: &str, width: u32, height: u32, label: &str) {
+    if !ffmpeg_available() {
+        eprintln!("[SKIP] {label}: ffmpeg not on PATH");
+        return;
+    }
+    let avi = encode_magy(width, height, "gbrap", predictor);
+    let theirs = decode_raw(&avi, "rgba");
+
+    let packet = extract_magy_packet(&avi).expect("MAGY packet not found in AVI");
+    let frame = oxideav_magicyuv::decoder::decode_packet(packet, None)
+        .expect("our decoder returned an error on a real M8RA packet");
+    assert_eq!(
+        frame.planes.len(),
+        1,
+        "{label}: GBRAP decode should emit one packed RGBA plane"
+    );
+    let ours = &frame.planes[0].data;
+    assert_bit_exact(label, ours, &theirs);
+}
+
+#[test]
+fn gbrap_left_64x48() {
+    try_decode_gbrap_test("left", 64, 48, "gbrap/left/64x48");
+}
+
+#[test]
+fn gbrap_gradient_64x48() {
+    try_decode_gbrap_test("gradient", 64, 48, "gbrap/gradient/64x48");
+}
+
+#[test]
+fn gbrap_median_64x48() {
+    try_decode_gbrap_test("median", 64, 48, "gbrap/median/64x48");
+}
+
+/// YUVA 4:4:4 (`M8YA`, format 0x6a). Wire layout is Y/U/V/A planar
+/// (4 planes, no chroma subsampling, no RGB decorrelation). The
+/// decoder emits the four planes as-is in (Y, U, V, A) order and the
+/// PixelFormat falls back to `Yuv444P` (no native YUVA in
+/// `oxideav-core`). We compare the concatenated planes to FFmpeg's
+/// `yuva444p` rawvideo dump.
+fn try_decode_yuva444p_test(predictor: &str, width: u32, height: u32, label: &str) {
+    if !ffmpeg_available() {
+        eprintln!("[SKIP] {label}: ffmpeg not on PATH");
+        return;
+    }
+    let avi = encode_magy(width, height, "yuva444p", predictor);
+    let theirs = decode_raw(&avi, "yuva444p");
+
+    let packet = extract_magy_packet(&avi).expect("MAGY packet not found in AVI");
+    let frame = oxideav_magicyuv::decoder::decode_packet(packet, None)
+        .expect("our decoder returned an error on a real M8YA packet");
+    assert_eq!(
+        frame.planes.len(),
+        4,
+        "{label}: YUVA444P decode should emit four planes (Y, U, V, A)"
+    );
+    let ours = frame_planes_concat(&frame);
+    assert_bit_exact(label, &ours, &theirs);
+}
+
+#[test]
+fn yuva444p_left_64x48() {
+    try_decode_yuva444p_test("left", 64, 48, "yuva444p/left/64x48");
+}
+
+#[test]
+fn yuva444p_gradient_64x48() {
+    try_decode_yuva444p_test("gradient", 64, 48, "yuva444p/gradient/64x48");
+}
+
+#[test]
+fn yuva444p_median_64x48() {
+    try_decode_yuva444p_test("median", 64, 48, "yuva444p/median/64x48");
+}
+
+/// Force a multi-slice frame at a small size by passing FFmpeg's
+/// `-slices 4`. This exercises the per-plane Huffman-shared,
+/// per-slice-prefix-pair decode path on a 4-slice frame whose
+/// `slice_height` is 12 luma rows (= 6 chroma rows for 4:2:0). The
+/// canonical 320×240 fixture (above) only has 2 slices.
+#[test]
+fn yuv422p_median_64x48_4slices() {
+    let label = "yuv422p/median/64x48 -slices 4";
+    if !ffmpeg_available() {
+        eprintln!("[SKIP] {label}: ffmpeg not on PATH");
+        return;
+    }
+    let avi = encode_magy_slices(64, 48, "yuv422p", "median", Some(4));
+    let theirs = decode_raw(&avi, "yuv422p");
+
+    let packet = extract_magy_packet(&avi).expect("MAGY packet not found in AVI");
+    let frame = oxideav_magicyuv::decoder::decode_packet(packet, None)
+        .expect("our decoder returned an error on a forced multi-slice packet");
+    let ours = frame_planes_concat(&frame);
+    assert_bit_exact(label, &ours, &theirs);
+}
+
+/// Same as above but on the GBRP path, which additionally exercises
+/// the per-slice predictor + multi-slice + post-decorrelation pass.
+#[test]
+fn gbrp_left_64x48_4slices() {
+    let label = "gbrp/left/64x48 -slices 4";
+    if !ffmpeg_available() {
+        eprintln!("[SKIP] {label}: ffmpeg not on PATH");
+        return;
+    }
+    let avi = encode_magy_slices(64, 48, "gbrp", "left", Some(4));
+    let theirs = decode_raw(&avi, "rgb24");
+
+    let packet = extract_magy_packet(&avi).expect("MAGY packet not found in AVI");
+    let frame = oxideav_magicyuv::decoder::decode_packet(packet, None)
+        .expect("our decoder returned an error on a forced multi-slice GBRP packet");
+    assert_eq!(frame.planes.len(), 1);
+    let ours = &frame.planes[0].data;
+    assert_bit_exact(label, ours, &theirs);
 }
