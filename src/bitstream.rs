@@ -59,32 +59,6 @@ impl<'a> BitReader<'a> {
         ((self.cache >> shift) & ((1u64 << n) - 1)) as u32
     }
 
-    /// Drop `n` consumed bits.
-    #[inline]
-    pub fn consume(&mut self, n: u32) {
-        debug_assert!(n <= self.nbits);
-        self.nbits -= n;
-        // Keep the top `nbits` bits valid by masking — equivalent to
-        // discarding the lower bits we just "consumed".
-        let mask = if self.nbits == 64 {
-            !0u64
-        } else if self.nbits == 0 {
-            0
-        } else {
-            (1u64 << self.nbits) - 1
-        };
-        // The high bits of `cache` are the live bits; rotate them down.
-        // We model the cache as "high `nbits` bits valid", so after
-        // consuming, the new high `nbits-n` bits are already in place;
-        // we just keep their natural position by re-computing from a
-        // shifted-in form. Simplest: re-shift cache so bits used are gone.
-        // Since shift-down in refill() is by 8, we keep `cache` storing
-        // the live bits left-aligned in the low `nbits` region — but our
-        // implementation actually keeps them right-aligned in the low
-        // `nbits` bits. Re-mask to the new live region.
-        let _ = mask;
-    }
-
     /// Read `n` bits MSB-first. Returns up to 32 bits.
     #[inline]
     pub fn read_bits(&mut self, n: u32) -> u32 {

@@ -123,12 +123,12 @@ pub fn decode_packet(bytes: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
         for plane in 0..nb_planes {
             let pw = plane_widths[plane];
             // Subsample the slice-row range vertically for chroma planes.
+            // (Horizontal subsampling is already baked into `plane_widths`,
+            // so no per-iteration h_sub adjustment is needed here.)
             let v_sub = chroma_v_sub(&header, plane);
-            let h_sub = chroma_h_sub(&header, plane);
             let plane_row_start = row_start >> v_sub;
             let plane_row_end = row_end_for_plane(row_end, header.height as usize, v_sub);
             let plane_h = plane_row_end - plane_row_start;
-            let _ = h_sub;
 
             let pstart = table.starts[plane][slice];
             let pend = table.ends[plane][slice];
@@ -247,13 +247,6 @@ fn chroma_v_sub(h: &FileHeader, plane: usize) -> usize {
         return 0;
     }
     h.format.v_subsample() as usize
-}
-
-fn chroma_h_sub(h: &FileHeader, plane: usize) -> usize {
-    if plane == 0 || plane >= 3 {
-        return 0;
-    }
-    h.format.h_subsample() as usize
 }
 
 /// Convert a luma row-end into a chroma row-end with vertical subsampling.
