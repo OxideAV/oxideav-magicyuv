@@ -15,34 +15,97 @@
 //! [15]      reserved
 //! [16..20]  width  (le32)
 //! [20..24]  height (le32)
-//! [24..28]  slice_width  (le32, must equal width per FFmpeg decoder)
+//! [24..28]  slice_width  (le32; may equal width or a smaller tile width)
 //! [28..32]  slice_height (le32)
 //! [32..36]  leading le32 (skipped by decoder)
-//! [36..36+4*planes*nb_slices] slice-offset table, plane-major le32s
+//! [36..36+4*planes*nb_slices_total] slice-offset table, plane-major le32s
 //! [next byte] sanity == nb_planes
-//! [next planes*nb_slices bytes] permutation (skipped)
+//! [next planes*nb_slices_total bytes] permutation (skipped)
 //! ```
+//!
+//! `nb_slices_total = nb_slices_x * nb_slices_y` (the grid product). The
+//! 8-bit-only FFmpeg encoder always emits `nb_slices_x = 1`; the
+//! horizontal partition is allowed by the bitstream and is implemented
+//! both on encode and decode.
 
 use oxideav_core::{Error, PixelFormat, Result};
 
 pub const MAGY_MAGIC: [u8; 4] = *b"MAGY";
 
+/// Family of the format byte's pixel layout.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum FormatFamily {
+    /// GBRP (3 planes, RGB-decorrelated).
+    Gbrp,
+    /// GBRAP (4 planes, RGB-decorrelated).
+    Gbrap,
+    /// YUV 4:4:4 (3 planes, no subsampling).
+    Yuv444P,
+    /// YUV 4:2:2 (3 planes, h_sub = 1).
+    Yuv422P,
+    /// YUV 4:2:0 (3 planes, h_sub = 1, v_sub = 1).
+    Yuv420P,
+    /// YUVA 4:4:4 (4 planes, no subsampling).
+    Yuva444P,
+    /// Single-plane grayscale.
+    Gray,
+}
+
+impl FormatFamily {
+    pub fn planes(self) -> usize {
+        match self {
+            Self::Gray => 1,
+            Self::Gbrp | Self::Yuv444P | Self::Yuv422P | Self::Yuv420P => 3,
+            Self::Gbrap | Self::Yuva444P => 4,
+        }
+    }
+
+    pub fn rgb_decorrelated(self) -> bool {
+        matches!(self, Self::Gbrp | Self::Gbrap)
+    }
+
+    pub fn h_subsample(self) -> u32 {
+        match self {
+            Self::Yuv422P | Self::Yuv420P => 1,
+            _ => 0,
+        }
+    }
+
+    pub fn v_subsample(self) -> u32 {
+        match self {
+            Self::Yuv420P => 1,
+            _ => 0,
+        }
+    }
+}
+
+/// One specific (family × bit-depth) pair, identified by the file-header
+/// format byte. The decoder's main dispatch uses this; the encoder picks
+/// one when constructing a packet.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum FormatCode {
-    /// `M8RG` — GBRP, 8-bit, 3 planes, RGB-decorrelated.
-    Gbrp = 0x65,
-    /// `M8RA` — GBRAP, 8-bit, 4 planes, RGB-decorrelated.
-    Gbrap = 0x66,
-    /// `M8Y4` — YUV 4:4:4, 8-bit, 3 planes.
-    Yuv444P = 0x67,
-    /// `M8Y2` — YUV 4:2:2, 8-bit, 3 planes.
-    Yuv422P = 0x68,
-    /// `M8Y0` — YUV 4:2:0, 8-bit, 3 planes.
-    Yuv420P = 0x69,
-    /// `M8YA` — YUVA 4:4:4, 8-bit, 4 planes.
-    Yuva444P = 0x6a,
-    /// `M8G0` — GRAY8.
-    Gray8 = 0x6b,
+    /// `M8RG` 0x65 — GBRP, 8-bit.
+    Gbrp,
+    /// `M8RA` 0x66 — GBRAP, 8-bit.
+    Gbrap,
+    /// `M8Y4` 0x67 — YUV 4:4:4, 8-bit.
+    Yuv444P,
+    /// `M8Y2` 0x68 — YUV 4:2:2, 8-bit.
+    Yuv422P,
+    /// `M8Y0` 0x69 — YUV 4:2:0, 8-bit.
+    Yuv420P,
+    /// `M8YA` 0x6a — YUVA 4:4:4, 8-bit.
+    Yuva444P,
+    /// `M8G0` 0x6b — GRAY8.
+    Gray8,
+    /// 0x6c — YUV 4:2:2, 10-bit.
+    Yuv422P10,
+    /// 0x73 — GRAY10.
+    Gray10,
+    /// 0x76 — YUV 4:4:4, 10-bit.
+    Yuv444P10,
+    /// 0x7b — YUV 4:2:0, 10-bit.
+    Yuv420P10,
 }
 
 impl FormatCode {
@@ -55,57 +118,93 @@ impl FormatCode {
             0x69 => Self::Yuv420P,
             0x6a => Self::Yuva444P,
             0x6b => Self::Gray8,
-            // Higher bit-depth codes (0x6c..) are spec'd but not
-            // implemented in this version; decode returns Unsupported
-            // before reaching the predictor stage.
+            0x6c => Self::Yuv422P10,
+            0x73 => Self::Gray10,
+            0x76 => Self::Yuv444P10,
+            0x7b => Self::Yuv420P10,
+            // Codes 0x6d/0x6e (GBRP10/GBRAP10), 0x6f/0x70 (GBRP12/
+            // GBRAP12), 0x71/0x72 (GBRP14/GBRAP14) are recognised by
+            // the FFmpeg decoder but the workspace `oxideav-core`
+            // PixelFormat enum has no GBRP10/12/14 / GBRAP10/12/14
+            // variants today — surface them as `Unsupported` until
+            // core grows the variants. 0x74/0x75/0x77/0x78/0x79/0x7a
+            // are reserved gaps.
             _ => {
                 return Err(Error::unsupported(format!(
-                    "magicyuv: format byte 0x{b:02x} not supported (8-bit only today)"
+                    "magicyuv: format byte 0x{b:02x} not supported by this decoder"
                 )))
             }
         })
     }
 
-    /// Number of planes for this format.
+    pub fn as_byte(self) -> u8 {
+        match self {
+            Self::Gbrp => 0x65,
+            Self::Gbrap => 0x66,
+            Self::Yuv444P => 0x67,
+            Self::Yuv422P => 0x68,
+            Self::Yuv420P => 0x69,
+            Self::Yuva444P => 0x6a,
+            Self::Gray8 => 0x6b,
+            Self::Yuv422P10 => 0x6c,
+            Self::Gray10 => 0x73,
+            Self::Yuv444P10 => 0x76,
+            Self::Yuv420P10 => 0x7b,
+        }
+    }
+
+    pub fn family(self) -> FormatFamily {
+        match self {
+            Self::Gbrp => FormatFamily::Gbrp,
+            Self::Gbrap => FormatFamily::Gbrap,
+            Self::Yuv444P | Self::Yuv444P10 => FormatFamily::Yuv444P,
+            Self::Yuv422P | Self::Yuv422P10 => FormatFamily::Yuv422P,
+            Self::Yuv420P | Self::Yuv420P10 => FormatFamily::Yuv420P,
+            Self::Yuva444P => FormatFamily::Yuva444P,
+            Self::Gray8 | Self::Gray10 => FormatFamily::Gray,
+        }
+    }
+
     pub fn planes(self) -> usize {
-        match self {
-            Self::Gray8 => 1,
-            Self::Gbrp | Self::Yuv444P | Self::Yuv422P | Self::Yuv420P => 3,
-            Self::Gbrap | Self::Yuva444P => 4,
-        }
+        self.family().planes()
     }
 
-    /// Bits per sample (always 8 for the formats we decode today).
+    /// Bits per sample (8 / 10 / 12 / 14).
     pub fn bps(self) -> u8 {
-        8
+        match self {
+            Self::Gbrp
+            | Self::Gbrap
+            | Self::Yuv444P
+            | Self::Yuv422P
+            | Self::Yuv420P
+            | Self::Yuva444P
+            | Self::Gray8 => 8,
+            Self::Yuv422P10 | Self::Gray10 | Self::Yuv444P10 | Self::Yuv420P10 => 10,
+        }
     }
 
-    /// Whether the encoder applied the implicit GBR↔RGB decorrelation
-    /// `B' = B - G; R' = R - G; G' = G` before prediction.
+    /// True when each sample occupies 2 bytes on disk (raw mode) and the
+    /// in-memory predictor uses `u16` arithmetic.
+    pub fn is_high_bit_depth(self) -> bool {
+        self.bps() > 8
+    }
+
     pub fn rgb_decorrelated(self) -> bool {
-        matches!(self, Self::Gbrp | Self::Gbrap)
+        self.family().rgb_decorrelated()
     }
 
-    /// Horizontal chroma subsampling shift (0 for full, 1 for half).
     pub fn h_subsample(self) -> u32 {
-        match self {
-            Self::Yuv422P | Self::Yuv420P => 1,
-            _ => 0,
-        }
+        self.family().h_subsample()
     }
 
-    /// Vertical chroma subsampling shift.
     pub fn v_subsample(self) -> u32 {
-        match self {
-            Self::Yuv420P => 1,
-            _ => 0,
-        }
+        self.family().v_subsample()
     }
 
     /// The PixelFormat the decoder emits for this format. We decode the
-    /// GBRP / GBRAP wire formats to packed RGB24 (after inverse
-    /// decorrelation) since `oxideav-core::PixelFormat` doesn't (yet)
-    /// have a `Gbrp` planar variant.
+    /// GBRP / GBRAP wire formats to packed RGB24 / RGBA (after inverse
+    /// decorrelation) since `oxideav-core::PixelFormat` doesn't expose a
+    /// `Gbrp` planar variant.
     pub fn output_pixel_format(self) -> PixelFormat {
         match self {
             Self::Gbrp => PixelFormat::Rgb24,
@@ -117,6 +216,10 @@ impl FormatCode {
             // becomes a 4th plane by convention.
             Self::Yuva444P => PixelFormat::Yuv444P,
             Self::Gray8 => PixelFormat::Gray8,
+            Self::Yuv422P10 => PixelFormat::Yuv422P10Le,
+            Self::Yuv444P10 => PixelFormat::Yuv444P10Le,
+            Self::Yuv420P10 => PixelFormat::Yuv420P10Le,
+            Self::Gray10 => PixelFormat::Gray10Le,
         }
     }
 }
@@ -176,14 +279,23 @@ impl FileHeader {
         if width == 0 || height == 0 {
             return Err(Error::invalid("magicyuv: zero-sized frame"));
         }
-        if slice_width != width {
-            return Err(Error::unsupported(format!(
-                "magicyuv: slice_width ({slice_width}) != width ({width}) — \
-                 horizontal tiling not implemented (matches FFmpeg's PATCHWELCOME)"
+        if slice_width == 0 || slice_height == 0 {
+            return Err(Error::invalid("magicyuv: zero slice_width or slice_height"));
+        }
+        if slice_width > width {
+            return Err(Error::invalid(format!(
+                "magicyuv: slice_width ({slice_width}) > width ({width})"
             )));
         }
-        if slice_height == 0 {
-            return Err(Error::invalid("magicyuv: zero slice_height"));
+        // Horizontal alignment to the chroma grid: every slice column
+        // must cover an integer number of chroma samples. (FFmpeg's
+        // decoder enforces this implicitly because it derives chroma
+        // tile widths from a left-shift.)
+        let h_sub = format.h_subsample();
+        if h_sub > 0 && (slice_width % (1u32 << h_sub) != 0) {
+            return Err(Error::invalid(format!(
+                "magicyuv: slice_width {slice_width} not aligned to chroma h-subsampling {h_sub}",
+            )));
         }
         Ok(Self {
             format,
@@ -198,16 +310,42 @@ impl FileHeader {
         })
     }
 
-    /// Number of slices, derived per §3.3.
-    pub fn nb_slices(&self) -> usize {
+    /// Number of vertical slice rows (= what the original FFmpeg-only
+    /// implementation called `nb_slices`).
+    pub fn nb_slices_y(&self) -> usize {
         (self.height as usize).div_ceil(self.slice_height as usize)
     }
 
-    /// Pixel-row range covered by slice `s` (start, end_exclusive).
-    pub fn slice_row_range(&self, s: usize) -> (usize, usize) {
-        let start = s * self.slice_height as usize;
-        let end = ((s + 1) * self.slice_height as usize).min(self.height as usize);
+    /// Number of horizontal slice columns.
+    pub fn nb_slices_x(&self) -> usize {
+        (self.width as usize).div_ceil(self.slice_width as usize)
+    }
+
+    /// Total number of slices on the wire (`nb_slices_x * nb_slices_y`).
+    pub fn nb_slices(&self) -> usize {
+        self.nb_slices_x() * self.nb_slices_y()
+    }
+
+    /// Pixel-row range covered by row-band `s_y` (start, end_exclusive).
+    pub fn slice_row_range(&self, s_y: usize) -> (usize, usize) {
+        let start = s_y * self.slice_height as usize;
+        let end = ((s_y + 1) * self.slice_height as usize).min(self.height as usize);
         (start, end)
+    }
+
+    /// Pixel-column range covered by column-band `s_x`
+    /// (start, end_exclusive).
+    pub fn slice_col_range(&self, s_x: usize) -> (usize, usize) {
+        let start = s_x * self.slice_width as usize;
+        let end = ((s_x + 1) * self.slice_width as usize).min(self.width as usize);
+        (start, end)
+    }
+
+    /// Map a (row-band, col-band) pair to the linear slice index that
+    /// indexes into [`SliceOffsetTable::starts`]. Slice major-order is
+    /// row-major across columns: `index = s_y * nb_slices_x + s_x`.
+    pub fn slice_index(&self, s_x: usize, s_y: usize) -> usize {
+        s_y * self.nb_slices_x() + s_x
     }
 
     /// Whether this stream sets the full-color-range flag (bit 2).
@@ -218,18 +356,18 @@ impl FileHeader {
 
 /// Slice-offset table parsed from bytes `[32..]` of a packet.
 ///
-/// The wire stores `planes * nb_slices` plane-major le32 starts (each
-/// relative to byte 32). The slice payloads themselves are written
-/// **slice-major** in the file: (plane 0 slice 0), (plane 1 slice 0),
-/// ..., (plane P-1 slice 0), (plane 0 slice 1), ... — so the
-/// per-plane starts are not monotone in the packet, and a slice's end
-/// is the **file-order successor's** start, not the same plane's next
-/// slice's start. We expose `starts` + `ends` separately to keep this
-/// distinction explicit.
+/// The wire stores `planes * nb_slices_total` plane-major le32 starts
+/// (each relative to byte 32). The slice payloads themselves are
+/// written **slice-major** in the file: (plane 0 slice 0), (plane 1
+/// slice 0), ..., (plane P-1 slice 0), (plane 0 slice 1), ... — so
+/// the per-plane starts are not monotone in the packet, and a slice's
+/// end is the **file-order successor's** start, not the same plane's
+/// next slice's start. We expose `starts` + `ends` separately to keep
+/// this distinction explicit.
 #[derive(Clone, Debug)]
 pub struct SliceOffsetTable {
     /// `starts[plane][slice]` = absolute byte offset of the slice's
-    /// first byte (length `nb_slices`).
+    /// first byte (length `nb_slices_total`).
     pub starts: Vec<Vec<usize>>,
     /// `ends[plane][slice]` = absolute byte offset one past the slice's
     /// last byte (= start of whatever slice comes next in file order,
@@ -354,6 +492,8 @@ mod tests {
         assert_eq!(FormatCode::Yuv422P.h_subsample(), 1);
         assert_eq!(FormatCode::Yuv420P.v_subsample(), 1);
         assert_eq!(FormatCode::Gray8.planes(), 1);
+        assert_eq!(FormatCode::Yuv422P10.bps(), 10);
+        assert!(FormatCode::Gray10.is_high_bit_depth());
     }
 
     #[test]
@@ -375,12 +515,15 @@ mod tests {
         format: FormatCode,
         width: u32,
         height: u32,
+        slice_width: u32,
         slice_height: u32,
         wire_starts: &[Vec<u32>],
         packet_len: usize,
     ) -> Vec<u8> {
         let planes = format.planes();
-        let nb_slices = (height as usize).div_ceil(slice_height as usize);
+        let nb_slices_x = (width as usize).div_ceil(slice_width as usize);
+        let nb_slices_y = (height as usize).div_ceil(slice_height as usize);
+        let nb_slices = nb_slices_x * nb_slices_y;
         assert_eq!(wire_starts.len(), planes);
         for v in wire_starts {
             assert_eq!(v.len(), nb_slices);
@@ -388,15 +531,14 @@ mod tests {
         let mut out = vec![0u8; packet_len];
         out[0..4].copy_from_slice(b"MAGY");
         out[4..8].copy_from_slice(&32u32.to_le_bytes());
-        out[8] = 7; // version
-        out[9] = format as u8;
-        out[10] = 12; // max_huff_length (informational)
-        out[14] = 0; // flags
+        out[8] = 7;
+        out[9] = format.as_byte();
+        out[10] = 12;
+        out[14] = 0;
         out[16..20].copy_from_slice(&width.to_le_bytes());
         out[20..24].copy_from_slice(&height.to_le_bytes());
-        out[24..28].copy_from_slice(&width.to_le_bytes());
+        out[24..28].copy_from_slice(&slice_width.to_le_bytes());
         out[28..32].copy_from_slice(&slice_height.to_le_bytes());
-        // bytes 32..36 = leading le32 (skipped by decoder, value irrelevant)
         out[32..36].copy_from_slice(&0u32.to_le_bytes());
         let mut p = 36;
         for plane in 0..planes {
@@ -405,9 +547,8 @@ mod tests {
                 p += 4;
             }
         }
-        out[p] = planes as u8; // sanity byte
+        out[p] = planes as u8;
         p += 1;
-        // permutation bytes (ignored by parser, leave zero)
         p += planes * nb_slices;
         let _ = p;
         out
@@ -415,17 +556,13 @@ mod tests {
 
     #[test]
     fn slice_offset_table_single_slice_yuv422p() {
-        // 64x48 YUV422P, 1 slice. Plane 0 starts at +800, plane 1 at
-        // +1000, plane 2 at +1100. Packet length 1234.
         let wire = vec![vec![800u32], vec![1000u32], vec![1100u32]];
-        let pkt = build_synthetic_packet(FormatCode::Yuv422P, 64, 48, 48, &wire, 1234);
+        let pkt = build_synthetic_packet(FormatCode::Yuv422P, 64, 48, 64, 48, &wire, 1234);
         let hdr = FileHeader::parse(&pkt).unwrap();
         let table = SliceOffsetTable::parse(&pkt, &hdr, 1234).unwrap();
-        assert_eq!(table.starts[0], vec![832]); // 800 + 32
+        assert_eq!(table.starts[0], vec![832]);
         assert_eq!(table.starts[1], vec![1032]);
         assert_eq!(table.starts[2], vec![1132]);
-        // Slice-major file order: plane 0 ends at plane 1 start; plane
-        // 1 ends at plane 2 start; plane 2 (the last) ends at packet_len.
         assert_eq!(table.ends[0], vec![1032]);
         assert_eq!(table.ends[1], vec![1132]);
         assert_eq!(table.ends[2], vec![1234]);
@@ -433,86 +570,71 @@ mod tests {
 
     #[test]
     fn slice_offset_table_multi_slice_interleaved() {
-        // 64x48 YUV422P, 4 slices (slice_height=12). Mirrors the wire
-        // values observed in the FFmpeg fixture that broke the previous
-        // implementation: plane 0 first-slice starts 833/1105/1329/1553
-        // interleaved with plane 1 starts 957/1217/1441/1733 and plane
-        // 2 starts 1029/1273/1497/1833. packet_len = 1970 (matches the
-        // fixture). Verifies that:
-        //   * starts come straight from the wire (slice-index ordered),
-        //   * ends derive from the **file-order** successor relation
-        //     (end(p, s) = start(p+1, s) if p+1<planes else
-        //                  start(0, s+1) if s+1<nb_slices else packet_len),
-        //   * none of the ends are the naive "same plane next slice".
         let wire = vec![
             vec![833u32, 1105, 1329, 1553],
             vec![957u32, 1217, 1441, 1733],
             vec![1029u32, 1273, 1497, 1833],
         ];
-        let pkt = build_synthetic_packet(FormatCode::Yuv422P, 64, 48, 12, &wire, 1970);
+        let pkt = build_synthetic_packet(FormatCode::Yuv422P, 64, 48, 64, 12, &wire, 1970);
         let hdr = FileHeader::parse(&pkt).unwrap();
         let table = SliceOffsetTable::parse(&pkt, &hdr, 1970).unwrap();
 
-        // Starts: wire + 32, in slice-index order.
         assert_eq!(table.starts[0], vec![865, 1137, 1361, 1585]);
         assert_eq!(table.starts[1], vec![989, 1249, 1473, 1765]);
         assert_eq!(table.starts[2], vec![1061, 1305, 1529, 1865]);
 
-        // Ends — file-order successor of (plane, slice):
-        //   plane 0: ends = start(1, s) for s=0..3
-        //   plane 1: ends = start(2, s) for s=0..3
-        //   plane 2 last plane: end(2, s) = start(0, s+1) for s<3,
-        //                       end(2, 3) = packet_len = 1970.
         assert_eq!(table.ends[0], vec![989, 1249, 1473, 1765]);
         assert_eq!(table.ends[1], vec![1061, 1305, 1529, 1865]);
         assert_eq!(table.ends[2], vec![1137, 1361, 1585, 1970]);
 
-        // Sanity: every (start, end) range is non-empty (slice prefix
-        // is at least 2 bytes — flag + predictor — so end - start ≥ 2).
         for plane in 0..3 {
             for slice in 0..4 {
                 let st = table.starts[plane][slice];
                 let en = table.ends[plane][slice];
-                assert!(
-                    en >= st + 2,
-                    "plane {plane} slice {slice} too small ({}..{})",
-                    st,
-                    en,
-                );
+                assert!(en >= st + 2);
             }
         }
     }
 
     #[test]
     fn slice_offset_table_rejects_oob_offset() {
-        // Plane 0 slice 0 starts beyond packet end → reject.
         let wire = vec![vec![5000u32], vec![1000u32], vec![1100u32]];
-        let pkt = build_synthetic_packet(FormatCode::Yuv422P, 64, 48, 48, &wire, 1234);
+        let pkt = build_synthetic_packet(FormatCode::Yuv422P, 64, 48, 64, 48, &wire, 1234);
         let hdr = FileHeader::parse(&pkt).unwrap();
-        let err = SliceOffsetTable::parse(&pkt, &hdr, 1234)
-            .expect_err("expected out-of-bounds offset to be rejected");
+        let err = SliceOffsetTable::parse(&pkt, &hdr, 1234).unwrap_err();
         let msg = format!("{err}");
-        assert!(
-            msg.contains("exceeds packet length"),
-            "unexpected error message: {msg}"
-        );
+        assert!(msg.contains("exceeds packet length"));
     }
 
     #[test]
     fn slice_offset_table_rejects_descending_offset() {
-        // Plane 0 slice 1 starts before slice 0 → end(0, 0) =
-        // start(1, 0) = 1000+32 = 1032 > start(0, 0) = 800+32 = 832 ✓,
-        // but end(1, 0) = start(0, 1) = 100+32 = 132 < start(1, 0) =
-        // 1032 → "end precedes start".
         let wire = vec![vec![800u32, 100], vec![1000u32, 50], vec![1100u32, 200]];
-        let pkt = build_synthetic_packet(FormatCode::Yuv422P, 64, 48, 24, &wire, 1234);
+        let pkt = build_synthetic_packet(FormatCode::Yuv422P, 64, 48, 64, 24, &wire, 1234);
         let hdr = FileHeader::parse(&pkt).unwrap();
-        let err = SliceOffsetTable::parse(&pkt, &hdr, 1234)
-            .expect_err("expected non-monotone wire offsets to be rejected");
+        let err = SliceOffsetTable::parse(&pkt, &hdr, 1234).unwrap_err();
         let msg = format!("{err}");
-        assert!(
-            msg.contains("precedes start") || msg.contains("not monotone"),
-            "unexpected error message: {msg}"
-        );
+        assert!(msg.contains("precedes start") || msg.contains("not monotone"));
+    }
+
+    /// 64×48 YUV422P split into 2 horizontal columns × 1 row =
+    /// `nb_slices_x = 2`, `nb_slices_y = 1`. Wire stores 2 slices per
+    /// plane. File-order is (p0,s0)(p1,s0)(p2,s0)(p0,s1)(p1,s1)(p2,s1)
+    /// so each successor's start ≥ previous start.
+    #[test]
+    fn slice_offset_table_horizontal_tiles() {
+        let wire = vec![vec![400u32, 1500], vec![700u32, 1700], vec![1000u32, 2000]];
+        let pkt = build_synthetic_packet(FormatCode::Yuv422P, 64, 48, 32, 48, &wire, 2400);
+        let hdr = FileHeader::parse(&pkt).unwrap();
+        assert_eq!(hdr.nb_slices_x(), 2);
+        assert_eq!(hdr.nb_slices_y(), 1);
+        let t = SliceOffsetTable::parse(&pkt, &hdr, 2400).unwrap();
+        assert_eq!(t.starts[0], vec![432, 1532]);
+        assert_eq!(t.starts[1], vec![732, 1732]);
+        assert_eq!(t.starts[2], vec![1032, 2032]);
+        // Ends in file order: (p0,s0)→p1,s0; (p1,s0)→p2,s0; (p2,s0)→p0,s1;
+        // (p0,s1)→p1,s1; (p1,s1)→p2,s1; (p2,s1)→packet_len.
+        assert_eq!(t.ends[0], vec![732, 1732]);
+        assert_eq!(t.ends[1], vec![1032, 2032]);
+        assert_eq!(t.ends[2], vec![1532, 2400]);
     }
 }

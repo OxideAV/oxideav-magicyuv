@@ -105,6 +105,77 @@ impl<'a> BitReader<'a> {
     }
 }
 
+/// MSB-first bit writer, the encoder-side mirror of [`BitReader`].
+///
+/// Bits are appended high-bit-first into a growing `Vec<u8>`. After all
+/// bits are written, [`BitWriter::finish`] zero-pads to the next byte
+/// boundary and returns the produced byte vector.
+pub struct BitWriter {
+    out: Vec<u8>,
+    /// In-flight byte being filled from the MSB side.
+    cur: u8,
+    /// Number of bits currently filled in `cur` (0..=7).
+    nbits: u8,
+}
+
+impl Default for BitWriter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BitWriter {
+    pub fn new() -> Self {
+        Self {
+            out: Vec::new(),
+            cur: 0,
+            nbits: 0,
+        }
+    }
+
+    pub fn with_capacity(cap: usize) -> Self {
+        Self {
+            out: Vec::with_capacity(cap),
+            cur: 0,
+            nbits: 0,
+        }
+    }
+
+    /// Append `n` bits (≤ 32) of `value` MSB-first.
+    #[inline]
+    pub fn write_bits(&mut self, n: u32, value: u32) {
+        debug_assert!(n <= 32);
+        let mut bits_left = n;
+        while bits_left > 0 {
+            let room = 8u32 - self.nbits as u32;
+            let take = bits_left.min(room);
+            let chunk = (value >> (bits_left - take)) & ((1u32 << take) - 1);
+            let shift = room - take;
+            self.cur |= (chunk as u8) << shift;
+            self.nbits += take as u8;
+            bits_left -= take;
+            if self.nbits == 8 {
+                self.out.push(self.cur);
+                self.cur = 0;
+                self.nbits = 0;
+            }
+        }
+    }
+
+    /// Bytes written so far (excluding any in-flight partial byte).
+    pub fn bytes_written(&self) -> usize {
+        self.out.len()
+    }
+
+    /// Finalise: pad the in-flight byte with zeros and return the buffer.
+    pub fn finish(mut self) -> Vec<u8> {
+        if self.nbits > 0 {
+            self.out.push(self.cur);
+        }
+        self.out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,5 +206,24 @@ mod tests {
         // Subsequent reads are zero (encoder zero-pads).
         assert_eq!(br.read_bits(8), 0x00);
         assert_eq!(br.read_bits(16), 0x0000);
+    }
+
+    #[test]
+    fn writer_then_reader_round_trip() {
+        // Write then read identical bit sequences.
+        let mut bw = BitWriter::new();
+        bw.write_bits(3, 0b101); // 1 0 1
+        bw.write_bits(5, 0b01101); // 0 1 1 0 1
+        bw.write_bits(8, 0xA7);
+        bw.write_bits(1, 0);
+        bw.write_bits(11, 0b101_0011_1100);
+        let bytes = bw.finish();
+
+        let mut br = BitReader::new(&bytes);
+        assert_eq!(br.read_bits(3), 0b101);
+        assert_eq!(br.read_bits(5), 0b01101);
+        assert_eq!(br.read_bits(8), 0xA7);
+        assert_eq!(br.read_bits(1), 0);
+        assert_eq!(br.read_bits(11), 0b101_0011_1100);
     }
 }

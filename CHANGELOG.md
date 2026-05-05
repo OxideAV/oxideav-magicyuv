@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Encoder.** Pure-Rust `Frame -> Packet` encoder mirroring the
+  decoder. Supports all seven 8-bit format codes the FFmpeg encoder
+  emits (`M8RG`/`M8RA`/`M8Y4`/`M8Y2`/`M8Y0`/`M8YA`/`M8G0`), all three
+  predictors (LEFT/GRADIENT/MEDIAN), arbitrary `nb_slices_x ×
+  nb_slices_y` slice grids, plus the four 10-bit codes the decoder
+  understands (`M0Y2`/`M0Y4`/`M0Y0`/`M0G0`).
+  - Histogram-driven canonical-Huffman length builder
+    (`huffman::build_lengths_from_histogram`) that pads zero-frequency
+    symbols to a placeholder length so the resulting code is a complete
+    canonical prefix code (Σ 2^-len = 1) — required by FFmpeg's
+    `ff_vlc_init_multi_from_lengths` decoder-side validator.
+  - Wire-code synthesiser (`huffman::build_canonical_codes`) that
+    inverts the decoder's "high-first with descending-symbol tiebreak"
+    canonical convention.
+  - MSB-first `bitstream::BitWriter` mirror of the existing
+    `BitReader`, plus encoder-side predictor functions
+    (`predictor::encode_{left,gradient,median}_{u8,u16}`).
+- **Horizontally-tiled slices** decoded. The decoder previously
+  rejected `slice_width != width` (matching FFmpeg's `PATCHWELCOME`);
+  it now handles arbitrary `nb_slices_x × nb_slices_y` rectangular
+  grids. Each (slice_x, slice_y) tile carries its own
+  (flag, predictor) prefix and Huffman-coded residual stream;
+  predictors operate on the tile rectangle (LEFT for the tile's first
+  row, predictor's "top" neighbour from the tile's previous row, etc.).
+- **10-bit decode** for the four format bytes the FFmpeg decoder
+  recognises that have a corresponding `oxideav-core::PixelFormat`
+  variant: `0x6c` (YUV422P10 → `Yuv422P10Le`), `0x73` (GRAY10 →
+  `Gray10Le`), `0x76` (YUV444P10 → `Yuv444P10Le`), `0x7b` (YUV420P10
+  → `Yuv420P10Le`). Predictor + Huffman + raw paths all use `u16`
+  arithmetic with `mask = (1 << bps) - 1`. Higher-bit-depth GBRP /
+  GBRAP / 12-bit / 14-bit codes remain `Unsupported` pending core
+  pixel-format additions.
+- **FFmpeg cross-decode tests.** Eleven new integration tests build a
+  minimal AVI container around the encoder output and feed it back to
+  `ffmpeg -c:v magicyuv`. All eleven (yuv422p/yuv420p/yuv444p/gray8/
+  gbrp × predictors, plus a multi-slice case and a 320×240 case)
+  round-trip bit-exactly through ffmpeg's reference decoder.
+
 ## [0.0.2](https://github.com/OxideAV/oxideav-magicyuv/compare/v0.0.1...v0.0.2) - 2026-05-04
 
 ### Other
@@ -15,7 +55,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - add unit tests for SliceOffsetTable parser + apply rustfmt
 - fix multi-slice (>1) decode by tracking per-slice ends explicitly
 
-### Fixed
+### Fixed (pre-0.0.2)
 
 - Multi-slice (nb_slices > 1) frames now decode bit-exactly. The wire
   layout's "plane-major slice starts" is **not** monotone within a
@@ -29,7 +69,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   successor relation. New 4-slice forced-via-`-slices N` interop tests
   cover the regression.
 
-### Added
+### Added (pre-0.0.2)
 
 - Interop tests for the previously-untested `M8RA` (GBRAP → packed
   Rgba) and `M8YA` (YUVA 4:4:4 → 4-plane Y/U/V/A) format codes,

@@ -9,11 +9,24 @@
 //! 3. Parse one Huffman length descriptor per plane and build a
 //!    canonical-Huffman decoder.
 //! 4. For each slice, for each plane: read the (flag, predictor) prefix
-//!    pair, decode `slice_h * plane_w` residuals (Huffman if flag bit 0
-//!    clear, raw bytes if set), apply the per-row predictor.
+//!    pair, decode `slice_h * slice_plane_w` residuals (Huffman if flag
+//!    bit 0 clear, raw bytes/uint16 if set), apply the per-row predictor
+//!    on the slice rectangle.
 //! 5. If the format is RGB-decorrelated (`M8RG` / `M8RA`), invert the
 //!    `B' = B - G; R' = R - G` transform pixel-by-pixel and pack the
 //!    result into the chosen output `PixelFormat` (RGB24 / RGBA).
+//!
+//! Slices form a `nb_slices_x × nb_slices_y` rectangular grid. The
+//! 8-bit FFmpeg-only encoder always emits `nb_slices_x = 1` (full-width
+//! row bands), but the bitstream permits `nb_slices_x ≥ 1` and the
+//! decoder handles arbitrary tilings.
+//!
+//! For 10/12/14-bit content (`bps > 8`) the predictor and Huffman
+//! buffers widen to `u16`; the wire still carries the per-symbol
+//! Huffman index (alphabet `1 << bps`), and the predictor's `mask` is
+//! `(1 << bps) - 1`. Raw mode reads `bps`-bit literals as **little-
+//! endian 2-byte words** (the only on-wire form the trace doc and the
+//! upstream decoder agree on).
 
 use oxideav_core::frame::VideoPlane;
 use oxideav_core::Decoder;
@@ -22,9 +35,12 @@ use oxideav_core::{
 };
 
 use crate::bitstream::BitReader;
-use crate::header::{FileHeader, FormatCode, SliceOffsetTable};
+use crate::header::{FileHeader, FormatFamily, SliceOffsetTable};
 use crate::huffman::{CanonicalHuffman, LengthTable};
-use crate::predictor::{apply_gradient_u8, apply_left_u8, apply_median_u8, Predictor};
+use crate::predictor::{
+    apply_gradient_u16, apply_gradient_u8, apply_left_u16, apply_left_u8, apply_median_u16,
+    apply_median_u8, Predictor,
+};
 
 /// Cap on a single-frame plane allocation, matched to the workspace
 /// convention (32k × 32k) — adversarial headers with billion-pixel
@@ -90,23 +106,55 @@ pub fn decode_packet(bytes: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
         )));
     }
     let table = SliceOffsetTable::parse(bytes, &header, bytes.len())?;
-    let nb_slices = header.nb_slices();
     let nb_planes = header.format.planes();
 
     // Plane dimensions (pre-decorrelation, pre-output packing).
     let plane_widths = plane_widths(&header);
     let plane_heights = plane_heights(&header);
 
-    // Allocate per-plane working buffers, contiguous & tightly packed
-    // (stride == width). These hold the raw decoded samples in plane
-    // order: for GBRP that's G/B/R; for YUV that's Y/U/V; for GRAY8
-    // it's the single luma plane.
+    let alphabet = 1usize << header.format.bps();
+
+    if header.format.is_high_bit_depth() {
+        decode_packet_u16(
+            bytes,
+            pts,
+            header,
+            table,
+            plane_widths,
+            plane_heights,
+            alphabet,
+        )
+    } else {
+        decode_packet_u8(
+            bytes,
+            pts,
+            header,
+            table,
+            nb_planes,
+            plane_widths,
+            plane_heights,
+            alphabet,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_packet_u8(
+    bytes: &[u8],
+    pts: Option<i64>,
+    header: FileHeader,
+    table: SliceOffsetTable,
+    nb_planes: usize,
+    plane_widths: Vec<usize>,
+    plane_heights: Vec<usize>,
+    alphabet: usize,
+) -> Result<VideoFrame> {
+    // Allocate per-plane working buffers.
     let mut planes: Vec<Vec<u8>> = (0..nb_planes)
         .map(|p| vec![0u8; plane_widths[p] * plane_heights[p]])
         .collect();
 
     // Decode the per-plane Huffman length descriptors.
-    let alphabet = 1usize << header.format.bps();
     let mut huffmans: Vec<CanonicalHuffman> = Vec::with_capacity(nb_planes);
     {
         let mut p = table.huffman_start;
@@ -117,79 +165,81 @@ pub fn decode_packet(bytes: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
         }
     }
 
-    // Decode each slice, plane by plane.
-    for slice in 0..nb_slices {
-        let (row_start, row_end) = header.slice_row_range(slice);
-        for plane in 0..nb_planes {
-            let pw = plane_widths[plane];
-            // Subsample the slice-row range vertically for chroma planes.
-            // (Horizontal subsampling is already baked into `plane_widths`,
-            // so no per-iteration h_sub adjustment is needed here.)
-            let v_sub = chroma_v_sub(&header, plane);
-            let plane_row_start = row_start >> v_sub;
-            let plane_row_end = row_end_for_plane(row_end, header.height as usize, v_sub);
-            let plane_h = plane_row_end - plane_row_start;
+    let nb_x = header.nb_slices_x();
+    let nb_y = header.nb_slices_y();
 
-            let pstart = table.starts[plane][slice];
-            let pend = table.ends[plane][slice];
-            if pstart + 2 > pend || pend > bytes.len() {
-                return Err(Error::invalid(format!(
-                    "magicyuv: slice {slice} plane {plane} bad range [{pstart}..{pend}) of {})",
-                    bytes.len(),
-                )));
-            }
-            let flag = bytes[pstart];
-            let pred = Predictor::from_byte(bytes[pstart + 1])?;
-            let payload = &bytes[pstart + 2..pend];
+    for sy in 0..nb_y {
+        for sx in 0..nb_x {
+            let slice_idx = header.slice_index(sx, sy);
+            let (row_start, row_end) = header.slice_row_range(sy);
+            let (col_start, col_end) = header.slice_col_range(sx);
+            for plane in 0..nb_planes {
+                let pw = plane_widths[plane];
+                let v_sub = chroma_v_sub(&header, plane);
+                let h_sub = chroma_h_sub(&header, plane);
+                let plane_row_start = row_start >> v_sub;
+                let plane_row_end = subsample_end(row_end, header.height as usize, v_sub);
+                let plane_h = plane_row_end - plane_row_start;
+                let plane_col_start = col_start >> h_sub;
+                let plane_col_end = subsample_end(col_end, header.width as usize, h_sub);
+                let plane_w = plane_col_end - plane_col_start;
 
-            // Slice destination view inside the plane buffer.
-            let dst_off = plane_row_start * pw;
-            let dst = &mut planes[plane][dst_off..dst_off + plane_h * pw];
-
-            if flag & 1 != 0 {
-                // Raw mode: literal bytes (8-bit only here).
-                if payload.len() < dst.len() {
+                let pstart = table.starts[plane][slice_idx];
+                let pend = table.ends[plane][slice_idx];
+                if pstart + 2 > pend || pend > bytes.len() {
                     return Err(Error::invalid(format!(
-                        "magicyuv: raw slice payload too short ({} < {})",
-                        payload.len(),
-                        dst.len()
+                        "magicyuv: slice {slice_idx} plane {plane} bad range \
+                         [{pstart}..{pend}) of {})",
+                        bytes.len(),
                     )));
                 }
-                dst.copy_from_slice(&payload[..dst.len()]);
-            } else {
-                // Huffman residuals.
-                let huff = &huffmans[plane];
-                let mut br = BitReader::new(payload);
-                for px in dst.iter_mut() {
-                    *px = huff.decode(&mut br)? as u8;
+                let flag = bytes[pstart];
+                let pred = Predictor::from_byte(bytes[pstart + 1])?;
+                let payload = &bytes[pstart + 2..pend];
+
+                let needed = plane_h * plane_w;
+                let mut tile = vec![0u8; needed];
+
+                if flag & 1 != 0 {
+                    // Raw mode: literal bytes (8-bit only here).
+                    let n = tile.len();
+                    if payload.len() < n {
+                        return Err(Error::invalid(format!(
+                            "magicyuv: raw slice payload too short ({} < {n})",
+                            payload.len(),
+                        )));
+                    }
+                    tile.copy_from_slice(&payload[..n]);
+                } else {
+                    // Huffman residuals.
+                    let huff = &huffmans[plane];
+                    let mut br = BitReader::new(payload);
+                    for px in tile.iter_mut() {
+                        *px = huff.decode(&mut br)? as u8;
+                    }
+                }
+
+                // Apply the per-slice predictor on the tile (slice-local
+                // coordinates: stride == plane_w, height == plane_h).
+                match pred {
+                    Predictor::Left => apply_left_u8(&mut tile, plane_w, plane_w, plane_h),
+                    Predictor::Gradient => apply_gradient_u8(&mut tile, plane_w, plane_w, plane_h),
+                    Predictor::Median => apply_median_u8(&mut tile, plane_w, plane_w, plane_h),
+                }
+
+                // Blit tile into the plane buffer.
+                for r in 0..plane_h {
+                    let dst_off = (plane_row_start + r) * pw + plane_col_start;
+                    planes[plane][dst_off..dst_off + plane_w]
+                        .copy_from_slice(&tile[r * plane_w..(r + 1) * plane_w]);
                 }
             }
-
-            // Apply the per-slice predictor.
-            match pred {
-                Predictor::Left => apply_left_u8(dst, pw, pw, plane_h),
-                Predictor::Gradient => apply_gradient_u8(dst, pw, pw, plane_h),
-                Predictor::Median => apply_median_u8(dst, pw, pw, plane_h),
-            }
-
-            // RGB decorrelation: applied per-slice after predictor,
-            // before storing pixels (trace doc §3.7). For the MagicYUV
-            // decorrelation: G is plane 0, B is plane 1, R is plane 2.
-            // We add plane 0 (G) to planes 1 (B) and 2 (R) at the same
-            // pixel index. Done after both planes' predictors run, so
-            // we defer this to the post-loop pass below.
         }
     }
 
-    // RGB decorrelation pass — invert the encoder's B' = B - G,
-    // R' = R - G transform. Empirically the wire plane order for the
-    // GBRP / GBRAP family (`0x65` / `0x66`) is **B', G, R'** — NOT
-    // G, B, R as the trace document's prose implies. Verified with a
-    // pure-green (R=0, G=255, B=1) constant-color fixture: the
-    // second-most-common residual sym in the wire's first descriptor
-    // is sym 2 (= B' for green = 1 − 255 = 2 mod 256), sym 255 in
-    // the second descriptor (= G), and sym 1 in the third (= R' =
-    // 0 − 255 = 1 mod 256).
+    // RGB decorrelation pass. Wire plane order for GBRP/GBRAP family is
+    // empirically B', G, R' (see crate-level note in the original
+    // decoder). Apply across the entire plane after all slices land.
     if header.format.rgb_decorrelated() {
         let total = plane_widths[1] * plane_heights[1];
         debug_assert_eq!(total, planes[1].len());
@@ -198,24 +248,144 @@ pub fn decode_packet(bytes: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
             planes[0][i] = planes[0][i].wrapping_add(g);
             planes[2][i] = planes[2][i].wrapping_add(g);
         }
-        // Alpha (plane 3) for GBRAP passes through.
     }
 
-    // Pack into the output VideoFrame.
-    let out = pack_output(&header, planes, plane_widths, plane_heights);
+    let out = pack_output_u8(&header, planes, plane_widths, plane_heights);
+    Ok(VideoFrame { pts, planes: out })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_packet_u16(
+    bytes: &[u8],
+    pts: Option<i64>,
+    header: FileHeader,
+    table: SliceOffsetTable,
+    plane_widths: Vec<usize>,
+    plane_heights: Vec<usize>,
+    alphabet: usize,
+) -> Result<VideoFrame> {
+    let nb_planes = header.format.planes();
+    let bps = header.format.bps();
+    let mask: u16 = if bps >= 16 {
+        0xFFFF
+    } else {
+        ((1u32 << bps) - 1) as u16
+    };
+
+    let mut planes: Vec<Vec<u16>> = (0..nb_planes)
+        .map(|p| vec![0u16; plane_widths[p] * plane_heights[p]])
+        .collect();
+
+    let mut huffmans: Vec<CanonicalHuffman> = Vec::with_capacity(nb_planes);
+    {
+        let mut p = table.huffman_start;
+        for _ in 0..nb_planes {
+            let (lt, np) = LengthTable::parse(bytes, p, alphabet)?;
+            p = np;
+            huffmans.push(CanonicalHuffman::build(&lt.lengths)?);
+        }
+    }
+
+    let nb_x = header.nb_slices_x();
+    let nb_y = header.nb_slices_y();
+
+    for sy in 0..nb_y {
+        for sx in 0..nb_x {
+            let slice_idx = header.slice_index(sx, sy);
+            let (row_start, row_end) = header.slice_row_range(sy);
+            let (col_start, col_end) = header.slice_col_range(sx);
+            for plane in 0..nb_planes {
+                let pw = plane_widths[plane];
+                let v_sub = chroma_v_sub(&header, plane);
+                let h_sub = chroma_h_sub(&header, plane);
+                let plane_row_start = row_start >> v_sub;
+                let plane_row_end = subsample_end(row_end, header.height as usize, v_sub);
+                let plane_h = plane_row_end - plane_row_start;
+                let plane_col_start = col_start >> h_sub;
+                let plane_col_end = subsample_end(col_end, header.width as usize, h_sub);
+                let plane_w = plane_col_end - plane_col_start;
+
+                let pstart = table.starts[plane][slice_idx];
+                let pend = table.ends[plane][slice_idx];
+                if pstart + 2 > pend || pend > bytes.len() {
+                    return Err(Error::invalid(format!(
+                        "magicyuv: slice {slice_idx} plane {plane} bad range \
+                         [{pstart}..{pend}) of {})",
+                        bytes.len(),
+                    )));
+                }
+                let flag = bytes[pstart];
+                let pred = Predictor::from_byte(bytes[pstart + 1])?;
+                let payload = &bytes[pstart + 2..pend];
+
+                let needed = plane_h * plane_w;
+                let mut tile = vec![0u16; needed];
+
+                if flag & 1 != 0 {
+                    // Raw mode: 16-bit-packed little-endian samples
+                    // (one u16 per sample, bps bits used; high bits 0).
+                    let need_bytes = needed * 2;
+                    if payload.len() < need_bytes {
+                        return Err(Error::invalid(format!(
+                            "magicyuv: raw slice payload too short ({} < {need_bytes})",
+                            payload.len(),
+                        )));
+                    }
+                    for (i, px) in tile.iter_mut().enumerate() {
+                        let lo = payload[2 * i] as u16;
+                        let hi = payload[2 * i + 1] as u16;
+                        *px = (lo | (hi << 8)) & mask;
+                    }
+                } else {
+                    let huff = &huffmans[plane];
+                    let mut br = BitReader::new(payload);
+                    for px in tile.iter_mut() {
+                        *px = huff.decode(&mut br)? as u16;
+                    }
+                }
+
+                match pred {
+                    Predictor::Left => apply_left_u16(&mut tile, plane_w, plane_w, plane_h, mask),
+                    Predictor::Gradient => {
+                        apply_gradient_u16(&mut tile, plane_w, plane_w, plane_h, mask)
+                    }
+                    Predictor::Median => {
+                        apply_median_u16(&mut tile, plane_w, plane_w, plane_h, mask)
+                    }
+                }
+
+                for r in 0..plane_h {
+                    let dst_off = (plane_row_start + r) * pw + plane_col_start;
+                    planes[plane][dst_off..dst_off + plane_w]
+                        .copy_from_slice(&tile[r * plane_w..(r + 1) * plane_w]);
+                }
+            }
+        }
+    }
+
+    if header.format.rgb_decorrelated() {
+        let total = plane_widths[1] * plane_heights[1];
+        for i in 0..total {
+            let g = planes[1][i];
+            planes[0][i] = ((planes[0][i] as u32).wrapping_add(g as u32) as u16) & mask;
+            planes[2][i] = ((planes[2][i] as u32).wrapping_add(g as u32) as u16) & mask;
+        }
+    }
+
+    let out = pack_output_u16(&header, planes, plane_widths, plane_heights);
     Ok(VideoFrame { pts, planes: out })
 }
 
 fn plane_widths(h: &FileHeader) -> Vec<usize> {
     let w = h.width as usize;
     let h_sub = h.format.h_subsample() as usize;
-    match h.format {
-        FormatCode::Gray8 => vec![w],
-        FormatCode::Gbrp => vec![w; 3],
-        FormatCode::Gbrap => vec![w; 4],
-        FormatCode::Yuva444P => vec![w; 4],
-        FormatCode::Yuv444P => vec![w; 3],
-        FormatCode::Yuv422P | FormatCode::Yuv420P => {
+    match h.format.family() {
+        FormatFamily::Gray => vec![w],
+        FormatFamily::Gbrp => vec![w; 3],
+        FormatFamily::Gbrap => vec![w; 4],
+        FormatFamily::Yuva444P => vec![w; 4],
+        FormatFamily::Yuv444P => vec![w; 3],
+        FormatFamily::Yuv422P | FormatFamily::Yuv420P => {
             let cw = (w + (1 << h_sub) - 1) >> h_sub;
             vec![w, cw, cw]
         }
@@ -225,13 +395,13 @@ fn plane_widths(h: &FileHeader) -> Vec<usize> {
 fn plane_heights(h: &FileHeader) -> Vec<usize> {
     let height = h.height as usize;
     let v_sub = h.format.v_subsample() as usize;
-    match h.format {
-        FormatCode::Gray8 => vec![height],
-        FormatCode::Gbrp => vec![height; 3],
-        FormatCode::Gbrap => vec![height; 4],
-        FormatCode::Yuva444P => vec![height; 4],
-        FormatCode::Yuv444P | FormatCode::Yuv422P => vec![height; 3],
-        FormatCode::Yuv420P => {
+    match h.format.family() {
+        FormatFamily::Gray => vec![height],
+        FormatFamily::Gbrp => vec![height; 3],
+        FormatFamily::Gbrap => vec![height; 4],
+        FormatFamily::Yuva444P => vec![height; 4],
+        FormatFamily::Yuv444P | FormatFamily::Yuv422P => vec![height; 3],
+        FormatFamily::Yuv420P => {
             let ch = (height + (1 << v_sub) - 1) >> v_sub;
             vec![height, ch, ch]
         }
@@ -243,26 +413,34 @@ fn chroma_v_sub(h: &FileHeader, plane: usize) -> usize {
         return 0;
     }
     if plane >= 3 {
-        // Alpha plane — full resolution.
         return 0;
     }
     h.format.v_subsample() as usize
 }
 
-/// Convert a luma row-end into a chroma row-end with vertical subsampling.
-fn row_end_for_plane(luma_row_end: usize, total_height: usize, v_sub: usize) -> usize {
-    if v_sub == 0 {
-        return luma_row_end;
+fn chroma_h_sub(h: &FileHeader, plane: usize) -> usize {
+    if plane == 0 {
+        return 0;
     }
-    // For YUV 4:2:0, the chroma plane is exactly height/2 rows tall;
-    // each chroma row covers two luma rows. The slice row-end is always
-    // even per §3.3, so no rounding needed.
-    let chroma_total = (total_height + (1 << v_sub) - 1) >> v_sub;
-    let r = luma_row_end >> v_sub;
+    if plane >= 3 {
+        return 0;
+    }
+    h.format.h_subsample() as usize
+}
+
+/// Convert a luma boundary into a chroma boundary, rounding **up** for
+/// the trailing edge so the boundary still covers the full luma extent
+/// when the frame is not divisible by the chroma subsampling factor.
+fn subsample_end(luma_end: usize, total: usize, sub: usize) -> usize {
+    if sub == 0 {
+        return luma_end;
+    }
+    let chroma_total = (total + (1 << sub) - 1) >> sub;
+    let r = luma_end >> sub;
     r.min(chroma_total)
 }
 
-fn pack_output(
+fn pack_output_u8(
     header: &FileHeader,
     planes: Vec<Vec<u8>>,
     pw: Vec<usize>,
@@ -271,17 +449,15 @@ fn pack_output(
     let pf = header.format.output_pixel_format();
     let w = header.width as usize;
     let h = header.height as usize;
-    match (header.format, pf) {
-        (FormatCode::Gray8, PixelFormat::Gray8) => vec![VideoPlane {
+    match (header.format.family(), pf) {
+        (FormatFamily::Gray, PixelFormat::Gray8) => vec![VideoPlane {
             stride: w,
             data: planes.into_iter().next().unwrap(),
         }],
-        (FormatCode::Yuv422P, _)
-        | (FormatCode::Yuv420P, _)
-        | (FormatCode::Yuv444P, _)
-        | (FormatCode::Yuva444P, _) => {
-            // Already planar in our buffers — emit as-is, in plane order.
-            // For YUV the plane order is Y/U/V which is what core expects.
+        (FormatFamily::Yuv422P, _)
+        | (FormatFamily::Yuv420P, _)
+        | (FormatFamily::Yuv444P, _)
+        | (FormatFamily::Yuva444P, _) => {
             let mut out = Vec::with_capacity(planes.len());
             for (i, data) in planes.into_iter().enumerate() {
                 out.push(VideoPlane {
@@ -289,15 +465,12 @@ fn pack_output(
                     data,
                 });
             }
-            // Sanity: planes[i] length == pw[i] * ph[i].
             for i in 0..out.len() {
                 debug_assert_eq!(out[i].data.len(), pw[i] * ph[i]);
             }
             out
         }
-        (FormatCode::Gbrp, PixelFormat::Rgb24) => {
-            // Wire plane 0 = B, plane 1 = G, plane 2 = R (after the
-            // GBR decorrelation pass that ran above). Pack R, G, B.
+        (FormatFamily::Gbrp, PixelFormat::Rgb24) => {
             let mut packed = vec![0u8; w * h * 3];
             for i in 0..(w * h) {
                 packed[i * 3] = planes[2][i]; // R
@@ -309,7 +482,7 @@ fn pack_output(
                 data: packed,
             }]
         }
-        (FormatCode::Gbrap, PixelFormat::Rgba) => {
+        (FormatFamily::Gbrap, PixelFormat::Rgba) => {
             let mut packed = vec![0u8; w * h * 4];
             for i in 0..(w * h) {
                 packed[i * 4] = planes[2][i]; // R
@@ -322,6 +495,48 @@ fn pack_output(
                 data: packed,
             }]
         }
-        _ => unreachable!("unhandled (format, pixel_format) pair"),
+        _ => unreachable!("unhandled (family, pixel_format) pair for u8 path"),
     }
+}
+
+fn pack_output_u16(
+    header: &FileHeader,
+    planes: Vec<Vec<u16>>,
+    pw: Vec<usize>,
+    ph: Vec<usize>,
+) -> Vec<VideoPlane> {
+    let pf = header.format.output_pixel_format();
+    match (header.format.family(), pf) {
+        (FormatFamily::Gray, PixelFormat::Gray10Le) => {
+            let p = planes.into_iter().next().unwrap();
+            vec![VideoPlane {
+                stride: pw[0] * 2,
+                data: u16_to_le_bytes(p),
+            }]
+        }
+        (FormatFamily::Yuv422P, _) | (FormatFamily::Yuv420P, _) | (FormatFamily::Yuv444P, _) => {
+            let mut out = Vec::with_capacity(planes.len());
+            for (i, data) in planes.into_iter().enumerate() {
+                let stride = pw[i] * 2;
+                out.push(VideoPlane {
+                    stride,
+                    data: u16_to_le_bytes(data),
+                });
+            }
+            for i in 0..out.len() {
+                debug_assert_eq!(out[i].data.len(), pw[i] * ph[i] * 2);
+            }
+            out
+        }
+        _ => unreachable!("unhandled (family, pixel_format) pair for u16 path"),
+    }
+}
+
+fn u16_to_le_bytes(v: Vec<u16>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(v.len() * 2);
+    for s in v {
+        out.push((s & 0xFF) as u8);
+        out.push(((s >> 8) & 0xFF) as u8);
+    }
+    out
 }
