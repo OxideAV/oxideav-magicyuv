@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.2](https://github.com/OxideAV/oxideav-magicyuv/compare/v0.0.1...v0.0.2) - 2026-05-04
+
+### Other
+
+- remove dead BitReader::consume + unused chroma_h_sub helper
+- add unit tests for SliceOffsetTable parser + apply rustfmt
+- fix multi-slice (>1) decode by tracking per-slice ends explicitly
+
 ### Fixed
 
 - Multi-slice (nb_slices > 1) frames now decode bit-exactly. The wire
