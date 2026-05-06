@@ -5,14 +5,17 @@ Pure-Rust MagicYUV lossless video codec for the
 
 ## Status
 
-**Round 2 — clean-room rebuild.** Decodes the full native FOURCC
+**Round 3 — clean-room rebuild.** Decodes the full native FOURCC
 set: 8-bit (M8RG, M8RA, M8Y4, M8Y2, M8Y0, M8YA, M8G0) and 10/12/14-bit
 (M0RG, M0RA, M2RG, M2RA, M4RG, M4RA, M0Y2, M0Y4, M0Y0, M0G0).
 Honours `flags & FLAG_INTERLACED` for field-stride=2 prediction
-(`spec/04` §5.1).  A public encoder API (`encode_frame`,
-`encode_avi`) emits wire-format frames the decoder round-trips
-byte-for-byte. A `trace` Cargo feature surfaces a JSONL trace tape
-for the Auditor's lockstep harness.
+(`spec/04` §5.1). A public encoder API (`encode_frame`, `encode_avi`,
+`encode_avi_opendml`) emits wire-format frames + AVI envelopes
+(single-RIFF AVI 1.0 and multi-RIFF OpenDML 2.0 per `spec/06` §6.1)
+the decoder round-trips byte-for-byte. A `trace` Cargo feature
+surfaces a JSONL trace tape for the Auditor's lockstep harness; round
+3 fixed the `huff.used` field schema to the per-symbol `{length,
+code}` map the audit/02 §4.2 forward spec required.
 
 The implementation is built against the strict-isolation clean-room
 workspace at
@@ -36,16 +39,20 @@ binary, no Python reference source, no `old` branch.
 | Per-plane Huffman      | spec/05 §1.1 (RLE descriptor)         |
 | Canonical-code build   | spec/05 §2.0 (longest-length-first cumulative — **NOT** RFC 1951; auditor round 2 correction) |
 | Raw-mode fallback      | spec/05 §4.1                           |
-| AVI demuxer            | spec/06 (RIFF / strf / 00dc; OpenDML out of scope for round 1) |
+| AVI demuxer            | spec/06 (RIFF / strf / 00dc; OpenDML 2.0 multi-RIFF supported on both decode + encode in round 3) |
 
 ## Public API
 
 - [`decode_frame`] — decode a single MAGY-prefixed frame's bytes.
   Returns one [`DecodedPlane`] per native plane; sample storage is
   `u8` for 8-bit FOURCCs and `u16` for 10/12/14-bit FOURCCs.
-- [`encode_frame`] / [`encode_avi`] — public encoder API.
+- [`encode_frame`] / [`encode_avi`] / [`encode_avi_opendml`] — public
+  encoder API. The OpenDML variant takes a `RiffSegmentLimit` and
+  emits a multi-RIFF (`AVI ` + `AVIX` continuations + `indx` super-index)
+  envelope per `spec/06` §6.1.
 - [`avi::AviReader`] — walk an AVI file's `00dc` chunks for end-to-end
-  decode.
+  decode. Aggregates frames across every top-level RIFF in the file,
+  so OpenDML 2.0 multi-RIFF inputs are demuxed transparently.
 - [`header::parse`] — standalone v7 header parser, also re-used for
   the AVI `strf` extradata (byte-identical per spec/06 §4.1).
 - [`Error`], [`Result`] — crate-local error type.

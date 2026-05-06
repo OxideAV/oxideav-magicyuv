@@ -1,12 +1,14 @@
 //! Pure-Rust MagicYUV v7 lossless decoder + encoder.
 //!
-//! **Round 2 — clean-room rebuild.** The crate decodes the full
+//! **Round 3 — clean-room rebuild.** The crate decodes the full
 //! native FOURCC set: 8-bit (M8RG, M8RA, M8Y4, M8Y2, M8Y0, M8YA,
 //! M8G0) and 10/12/14-bit (M0RG, M0RA, M2RG, M2RA, M4RG, M4RA, M0Y2,
 //! M0Y4, M0Y0, M0G0). Interlaced field-stride=2 prediction
 //! (`flags & 0x02`) is honoured per `spec/04` §5.1. A public encoder
-//! API ([`encode_frame`], [`encode_avi`]) produces wire-format frames
-//! that round-trip through [`decode_frame`].
+//! API ([`encode_frame`], [`encode_avi`], [`encode_avi_opendml`])
+//! produces wire-format frames + AVI envelopes (single-RIFF AVI 1.0
+//! and multi-RIFF OpenDML 2.0 per `spec/06` §6.1) that round-trip
+//! through [`decode_frame`] / [`avi::AviReader`].
 //!
 //! ## Pipeline
 //!
@@ -73,7 +75,10 @@ pub mod tables;
 pub(crate) mod trace;
 
 pub use crate::decoder::{decode_frame, DecodedFrame, DecodedPlane, Samples};
-pub use crate::encoder::{encode_avi, encode_frame, EncodeOptions, PlaneInput, SliceMode};
+pub use crate::encoder::{
+    encode_avi, encode_avi_opendml, encode_frame, AviKind, EncodeOptions, PlaneInput,
+    RiffSegmentLimit, SliceMode,
+};
 pub use crate::error::{Error, Result};
 
 // Framework integration — only when the `registry` feature is on.

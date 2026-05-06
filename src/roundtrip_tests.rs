@@ -669,6 +669,118 @@ fn trace_emits_audit02_event_vocabulary() {
 
 #[cfg(feature = "trace")]
 #[test]
+fn trace_huff_used_field_is_per_symbol_map() {
+    use std::io::Read;
+    let _g = trace_lock();
+    // Per audit/02 §4.2 + audit/03 §2 the `huff.used` field MUST be a
+    // per-symbol `{symbol: {length, code}}` map (NOT a bool) emitted in
+    // symbol-ascending order with insertion order `length, code`. The
+    // codes carried in the map MUST match the canonical-Huffman codes
+    // the decoder's own `HuffmanTable::build` produces from the parsed
+    // descriptor — that's what makes the Auditor's strict jq-line-diff
+    // pass against the Python reference codec's `--trace` output.
+    let rec = lookup_round1(0x6b).unwrap(); // M8G0 (single plane).
+    let pixels: Vec<u8> = (0..(16 * 16)).map(|i| ((i * 37) & 0xff) as u8).collect();
+    let bytes = encode_frame(
+        rec,
+        16,
+        16,
+        28,
+        vec![PlaneInput::U8(pixels.clone())],
+        EncodeOptions {
+            predictor: PredictorKind::Gradient,
+            mode: SliceMode::Huffman,
+            interlaced: false,
+        },
+    )
+    .unwrap();
+    let path = std::env::temp_dir().join(format!(
+        "magicyuv-trace-huff-used-{}-{}.jsonl",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_file(&path);
+    std::env::set_var("OXIDEAV_MAGICYUV_TRACE_FILE", &path);
+    let _ = decode_frame(&bytes).expect("decode");
+    std::env::remove_var("OXIDEAV_MAGICYUV_TRACE_FILE");
+    let mut s = String::new();
+    std::fs::File::open(&path)
+        .unwrap()
+        .read_to_string(&mut s)
+        .unwrap();
+    let _ = std::fs::remove_file(&path);
+
+    // Find a line with kind=huff for plane 0 — we encoded a fresh
+    // file, so the very first huff event in the tape is ours.
+    let huff_line = s
+        .lines()
+        .find(|l| l.contains("\"kind\":\"huff\""))
+        .expect("at least one huff event");
+
+    // The serialised `used` field MUST start with `{` (i.e. be a map),
+    // NOT `true` / `false` (the round-2 bool form).
+    let used_idx = huff_line
+        .find("\"used\":")
+        .expect("huff event must carry a `used` field");
+    let after = &huff_line[used_idx + "\"used\":".len()..];
+    assert!(
+        after.starts_with('{'),
+        "huff.used must be an object, not a bool: {after:?}"
+    );
+    assert!(
+        !after.starts_with("true"),
+        "huff.used must not be `true` (round-2 schema)"
+    );
+    assert!(
+        !after.starts_with("false"),
+        "huff.used must not be `false` (round-2 schema)"
+    );
+
+    // Cross-check the per-symbol payload against the canonical-Huffman
+    // builder's own output: re-derive the lengths from the descriptor
+    // bytes we just emitted, build the same canonical-code table, and
+    // confirm a sampled `(symbol → {length, code})` pair matches.
+    //
+    // Pick the first symbol whose code-length is positive, parse its
+    // value out of the JSON map, and compare.
+    use crate::huffman::{parse_lengths, HuffmanTable};
+    // Re-derive the descriptor bytes by re-running the encode pipeline
+    // off the same input. Easier: parse them out of the trace event's
+    // `descriptor_bytes` hex field.
+    let dh_idx =
+        huff_line.find("\"descriptor_bytes\":\"").unwrap() + "\"descriptor_bytes\":\"".len();
+    let dh_end = dh_idx + huff_line[dh_idx..].find('"').unwrap();
+    let hex = &huff_line[dh_idx..dh_end];
+    let mut desc = Vec::with_capacity(hex.len() / 2);
+    for i in (0..hex.len()).step_by(2) {
+        desc.push(u8::from_str_radix(&hex[i..i + 2], 16).unwrap());
+    }
+    let (lens, _) = parse_lengths(&desc, 256, 12, 0).expect("parse lens");
+    let table = HuffmanTable::build(lens.clone(), 0).expect("build");
+    let codes = table.codes();
+    // Find the first symbol with positive length.
+    let (s_check, l_check) = lens
+        .iter()
+        .enumerate()
+        .find(|(_, &l)| l > 0)
+        .map(|(s, &l)| (s, l))
+        .expect("at least one positive-length symbol");
+    let c_check = codes[s_check];
+    // Look for `"<s>":{"length":<L>,"code":<C>}` in the trace line —
+    // this is the exact insertion order the audit/02 §4.2 schema
+    // requires (`length` before `code`).
+    let needle = format!("\"{s_check}\":{{\"length\":{l_check},\"code\":{c_check}}}");
+    assert!(
+        huff_line.contains(&needle),
+        "expected substring not found in huff trace event\n  needle: {needle}\n  haystack: {huff_line}"
+    );
+}
+
+#[cfg(feature = "trace")]
+#[test]
 fn trace_omits_when_env_var_unset() {
     let _g = trace_lock();
     let rec = lookup_round1(0x6b).unwrap();

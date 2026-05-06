@@ -96,7 +96,14 @@ pub(crate) enum Event<'a> {
         descriptor_length: usize,
         n_symbols: usize,
         max_length: u8,
-        used: bool,
+        /// Per-symbol canonical-Huffman code table:
+        /// `(symbol, length, code)` triples for symbols with `length > 0`,
+        /// in **symbol-ascending** order. Serialised as
+        /// `"used":{"<sym>":{"length":<L>,"code":<C>}, …}` so the
+        /// Auditor's strict jq-line-diff matches the Python ref's
+        /// `dict` insertion order (`length` before `code` per
+        /// audit/02 §4.2 + audit/03 §2).
+        used: &'a [(u32, u8, u32)],
     },
     Payload {
         slice: usize,
@@ -219,8 +226,27 @@ impl<'a> Event<'a> {
                 push_int_field(out, "descriptor_length", *descriptor_length as u64);
                 push_int_field(out, "n_symbols", *n_symbols as u64);
                 push_int_field(out, "max_length", *max_length as u64);
-                out.push_str(",\"used\":");
-                out.push_str(if *used { "true" } else { "false" });
+                // `used` is a per-symbol canonical-Huffman code map per
+                // audit/02 §4.2: keys are decimal symbol indices, values
+                // are `{length, code}` objects in that insertion order.
+                // Symbols with length == 0 are omitted (only the symbols
+                // the descriptor actually used appear).
+                out.push_str(",\"used\":{");
+                let mut first = true;
+                for (sym, length, code) in used.iter() {
+                    if !first {
+                        out.push(',');
+                    }
+                    first = false;
+                    out.push('"');
+                    out.push_str(&format!("{}", sym));
+                    out.push_str("\":{\"length\":");
+                    out.push_str(&format!("{}", length));
+                    out.push_str(",\"code\":");
+                    out.push_str(&format!("{}", code));
+                    out.push('}');
+                }
+                out.push('}');
                 out.push('}');
             }
             Event::Payload {

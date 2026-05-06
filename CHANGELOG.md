@@ -6,6 +6,59 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — round 3
+
+- **OpenDML 2.0 super-index** (`spec/06` §6.1) on both decode and
+  encode sides. The decoder's `AviReader` now walks every top-level
+  `RIFF` chunk in the file: the first carries `AVI ` form (with
+  `hdrl` + `movi` + optional `indx` super-index), every subsequent
+  one carries `AVIX` form with a `movi` LIST. `00dc` chunks across
+  all such RIFFs are concatenated into a single contiguous frame
+  stream. The decoder is fully backward-compatible with single-RIFF
+  AVI 1.0 files (the round 1 / 2 path).
+- **Public OpenDML encoder** `encode_avi_opendml(rec, w, h, frames,
+  segment_limit)` plus `RiffSegmentLimit::{OneGiB, Bytes(u64)}` and
+  the `AviKind` enum. The first RIFF segment carries the `hdrl`
+  with an `indx` super-index chunk in `strl`; subsequent segments
+  are `RIFF AVIX` continuations. Each `indx` super-index entry's
+  `qwOffset` / `dwSize` / `dwDuration` is back-patched after each
+  RIFF's file offset is known.
+- **`huff.used` trace schema fix** (`audit/02` §4.2 + `audit/03` §2).
+  The `Event::Huff.used` field is now a per-symbol
+  `(symbol, length, code)` triple slice serialised as
+  `"used":{"<sym>":{"length":<L>,"code":<C>}, …}` in symbol-ascending
+  order with insertion order `length, code` — exactly the shape the
+  Python reference codec emits. `HuffmanTable::codes()` is the new
+  accessor that surfaces the canonical-Huffman codes the decoder
+  builds from the parsed descriptor; the trace emitter walks the
+  parallel `(lengths, codes)` arrays to build the per-event map.
+  After this fix, the Auditor's strict `jq -S -c` line-diff against
+  the Python ref is empty across all 4 round-2 trace fixtures.
+- 4 new in-crate tests: `trace_huff_used_field_is_per_symbol_map`
+  (asserts the new map shape contains the canonical-code triple
+  the encoder produced), `opendml_avi_round_trips_multi_riff`
+  (8 frames forced into ≥ 2 RIFF segments, decode aggregates them
+  back into one stream), `opendml_single_segment_when_limit_large_enough`
+  (back-compat: large segment limit → exactly one RIFF), and
+  `opendml_indx_entries_point_to_riff_offsets` (each indx super-index
+  entry's `qwOffset` / `dwSize` matches the corresponding RIFF chunk).
+
+### Notes — round 3
+
+- The MagicYUV v7 wire-format coverage is **complete** modulo the
+  proprietary v2.4.2 encoder's per-slice "Dynamic" predictor strategy
+  and its byte-budget raw-fallback heuristic. Both are encoder-side
+  conventions per `spec/04` §3 and `spec/05` §10 question 5; they do
+  NOT affect decoder conformance. The round-2 Auditor's pass matrix
+  (10 high-bit-depth FOURCCs × 2 sizes × 4 patterns = 80/80
+  byte-exact, 2/2 interlaced byte-exact, 4/4 encoder roundtrip) plus
+  round-3's trace-tape strict-diff fix completes the published spec
+  coverage. The `ix00` per-RIFF index chunks of OpenDML 2.0 are not
+  emitted by the Rust encoder — `spec/06` §6.1 explicitly notes that
+  `ix00` is muxer territory, not codec territory; the decoder
+  recovers all `00dc` chunks by walking the `movi` LIST directly,
+  without consulting any index.
+
 ### Added — round 2
 
 - **10/12/14-bit native FOURCC family**: M0RG, M0RA, M2RG, M2RA,

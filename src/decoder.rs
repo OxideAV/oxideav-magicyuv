@@ -276,14 +276,25 @@ pub fn decode_frame(bytes: &[u8]) -> Result<DecodedFrame> {
         let table = HuffmanTable::build(lens, plane)?;
         #[cfg(feature = "trace")]
         if let Some(t) = &tracer {
-            let used_any = !table.is_empty();
+            // Build per-symbol `(symbol, length, code)` triples in
+            // symbol-ascending order, matching `audit/02` §4.2 +
+            // `audit/03` §2 (Python ref's `huff.used` is a per-symbol
+            // map, NOT a bool).
+            let lengths = table.lengths();
+            let codes = table.codes();
+            let mut used_map: Vec<(u32, u8, u32)> = Vec::new();
+            for (s, &l) in lengths.iter().enumerate() {
+                if l > 0 {
+                    used_map.push((s as u32, l, codes[s]));
+                }
+            }
             t.emit(Event::Huff {
                 plane,
                 descriptor_bytes: &preamble[desc_start..desc_start + used],
                 descriptor_length: used,
                 n_symbols,
                 max_length: max_huff_len,
-                used: used_any,
+                used: &used_map,
             });
         }
         #[cfg(not(feature = "trace"))]

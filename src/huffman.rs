@@ -113,6 +113,11 @@ pub fn parse_lengths(
 pub struct HuffmanTable {
     /// Code length for each input symbol (`L[s] == 0` ⇒ unused).
     lengths: Vec<u8>,
+    /// Canonical Huffman code per symbol (`code[s] == 0` when
+    /// `lengths[s] == 0`). Surfaced by [`Self::codes`] so the trace
+    /// emitter can produce the per-symbol `{length, code}` map per
+    /// `audit/02` §4.2.
+    codes: Vec<u32>,
     /// `max_len_used`. For an all-unused descriptor (Kraft 0) this is
     /// 0; we never actually decode such a table, but parse_lengths
     /// allows it.
@@ -188,6 +193,7 @@ impl HuffmanTable {
         if max_len == 0 {
             return Ok(Self {
                 lengths,
+                codes: code,
                 max_len,
                 primary,
                 primary_bits,
@@ -267,6 +273,7 @@ impl HuffmanTable {
 
         Ok(Self {
             lengths,
+            codes: code,
             max_len,
             primary,
             primary_bits,
@@ -318,6 +325,14 @@ impl HuffmanTable {
     /// Borrow the per-symbol length array (debug / cross-validation).
     pub fn lengths(&self) -> &[u8] {
         &self.lengths
+    }
+
+    /// Borrow the per-symbol canonical-Huffman code array. Entries
+    /// with `lengths[s] == 0` are zero and should be ignored. Used by
+    /// the `trace` feature emitter to mirror the Python ref's
+    /// `huff.used` map per `audit/02` §4.2.
+    pub fn codes(&self) -> &[u32] {
+        &self.codes
     }
 }
 
