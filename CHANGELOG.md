@@ -6,6 +6,15 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Declare native v7 FourCCs (`M8RG`, `M8RA`, `M8Y4`, `M8Y2`, `M8Y0`,
+  `M8YA`, `M8G0`, `M0RG`, `M0RA`, `M0Y4`, `M0Y2`, `M0Y0`, `M0G0`,
+  `M2RG`, `M2RA`, `M4RG`, `M4RA` — 17 total, per spec/01 §4.1) via
+  `CodecInfo::tags([CodecTag::fourcc(…)])` so `oxideav-avi` can
+  resolve them through `CodecResolver` without a hand-maintained
+  codec_map.
+
 ### Added — round 3
 
 - **OpenDML 2.0 super-index** (`spec/06` §6.1) on both decode and

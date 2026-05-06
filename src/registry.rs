@@ -9,7 +9,7 @@
 #![cfg(feature = "registry")]
 
 use oxideav_core::{
-    CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecRegistry, Decoder,
+    CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecRegistry, CodecTag, Decoder,
     Error as CoreError, Frame, MediaType, Packet, PixelFormat, Result as CoreResult,
     RuntimeContext, VideoFrame, VideoPlane,
 };
@@ -22,6 +22,15 @@ use crate::tables::Family;
 pub const CODEC_ID_STR: &str = "magicyuv";
 
 /// Register the MagicYUV codec with `reg`.
+///
+/// Claims the 17 native v7 FourCCs from `spec/01` §4.1 + the
+/// `tables/00-fourcc-table.csv` ordering: 7 8-bit families
+/// (`M8RG` / `M8RA` / `M8Y4` / `M8Y2` / `M8Y0` / `M8YA` / `M8G0`),
+/// 6 10-bit (`M0RG` / `M0RA` / `M0Y4` / `M0Y2` / `M0Y0` / `M0G0`),
+/// 2 12-bit (`M2RG` / `M2RA`), and 2 14-bit (`M4RG` / `M4RA`). These
+/// declarations let `oxideav-avi`'s demuxer resolve a MagicYUV
+/// stream's `biCompression` straight through `CodecResolver` without
+/// a hand-maintained FourCC table on the container side.
 pub fn register_codecs(reg: &mut CodecRegistry) {
     let caps = CodecCapabilities::video("magicyuv_sw")
         .with_decode()
@@ -30,7 +39,30 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
     reg.register(
         CodecInfo::new(CodecId::new(CODEC_ID_STR))
             .capabilities(caps)
-            .decoder(make_decoder),
+            .decoder(make_decoder)
+            .tags([
+                // 8-bit families (spec/01 §4.1)
+                CodecTag::fourcc(b"M8RG"),
+                CodecTag::fourcc(b"M8RA"),
+                CodecTag::fourcc(b"M8Y4"),
+                CodecTag::fourcc(b"M8Y2"),
+                CodecTag::fourcc(b"M8Y0"),
+                CodecTag::fourcc(b"M8YA"),
+                CodecTag::fourcc(b"M8G0"),
+                // 10-bit families
+                CodecTag::fourcc(b"M0RG"),
+                CodecTag::fourcc(b"M0RA"),
+                CodecTag::fourcc(b"M0Y4"),
+                CodecTag::fourcc(b"M0Y2"),
+                CodecTag::fourcc(b"M0Y0"),
+                CodecTag::fourcc(b"M0G0"),
+                // 12-bit families
+                CodecTag::fourcc(b"M2RG"),
+                CodecTag::fourcc(b"M2RA"),
+                // 14-bit families
+                CodecTag::fourcc(b"M4RG"),
+                CodecTag::fourcc(b"M4RA"),
+            ]),
     );
 }
 
@@ -212,6 +244,40 @@ mod tests {
         assert!(
             ctx.codecs.has_decoder(&codec_id),
             "codec registration should install a decoder factory"
+        );
+    }
+
+    #[test]
+    fn register_claims_all_17_native_fourccs() {
+        // spec/01 §4.1 + tables/00-fourcc-table.csv. After
+        // registration the resolver must surface "magicyuv" for every
+        // one of these — that's how `oxideav-avi`'s demuxer plumbs
+        // FourCC → codec_id without its own codec table.
+        use oxideav_core::ProbeContext;
+        let mut reg = CodecRegistry::new();
+        register_codecs(&mut reg);
+        let fourccs: [&[u8; 4]; 17] = [
+            b"M8RG", b"M8RA", b"M8Y4", b"M8Y2", b"M8Y0", b"M8YA", b"M8G0", b"M0RG", b"M0RA",
+            b"M0Y4", b"M0Y2", b"M0Y0", b"M0G0", b"M2RG", b"M2RA", b"M4RG", b"M4RA",
+        ];
+        for fc in fourccs {
+            let tag = CodecTag::fourcc(fc);
+            let resolved = reg
+                .resolve_tag_ref(&ProbeContext::new(&tag))
+                .map(|c| c.as_str());
+            assert_eq!(
+                resolved,
+                Some(CODEC_ID_STR),
+                "FourCC {:?} did not resolve to magicyuv",
+                std::str::from_utf8(fc).unwrap_or("????"),
+            );
+        }
+        // Case-insensitive lookup also lands on magicyuv.
+        let lower = CodecTag::fourcc(b"m8rg");
+        assert_eq!(
+            reg.resolve_tag_ref(&ProbeContext::new(&lower))
+                .map(|c| c.as_str()),
+            Some(CODEC_ID_STR),
         );
     }
 
