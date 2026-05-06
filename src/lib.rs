@@ -75,6 +75,8 @@ pub mod tables;
 pub(crate) mod trace;
 
 pub use crate::decoder::{decode_frame, DecodedFrame, DecodedPlane, Samples};
+#[cfg(feature = "registry")]
+pub use crate::encoder::output_params;
 pub use crate::encoder::{
     encode_avi, encode_avi_opendml, encode_frame, AviKind, EncodeOptions, PlaneInput,
     RiffSegmentLimit, SliceMode,

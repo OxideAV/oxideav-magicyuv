@@ -282,6 +282,71 @@ mod tests {
     }
 
     #[test]
+    fn output_params_carry_configured_fourcc_tag() {
+        // The encoder-side `output_params()` helper plumbs each FOURCC
+        // straight into `CodecParameters::tag`. The 17 native v7
+        // FourCCs (spec/01 §4.1) all round-trip through it, which is
+        // what muxers consume to emit the right wire FourCC.
+        use crate::encoder::output_params;
+        use crate::tables::{lookup, lookup_round2};
+        use oxideav_core::CodecTag;
+
+        // 8-bit families.
+        for &fb in &[0x65u8, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x6b] {
+            let rec = lookup(fb).unwrap_or_else(|| panic!("missing record 0x{fb:02x}"));
+            let p = output_params(rec, 64, 64);
+            assert_eq!(
+                p.tag,
+                Some(CodecTag::fourcc(&rec.fourcc)),
+                "FourCC {:?} (format byte 0x{:02x}) did not round-trip via output_params().tag",
+                std::str::from_utf8(&rec.fourcc).unwrap_or("????"),
+                fb,
+            );
+            assert_eq!(p.codec_id.as_str(), CODEC_ID_STR);
+            assert_eq!(p.width, Some(64));
+            assert_eq!(p.height, Some(64));
+        }
+        // High-bit-depth families. Use the round-2 lookup which
+        // accepts every native FOURCC byte.
+        for fb in 0x00..=0xFFu8 {
+            if let Ok(rec) = lookup_round2(fb) {
+                let p = output_params(rec, 32, 32);
+                assert_eq!(
+                    p.tag,
+                    Some(CodecTag::fourcc(&rec.fourcc)),
+                    "FourCC {:?} (format byte 0x{:02x}) did not round-trip via output_params().tag",
+                    std::str::from_utf8(&rec.fourcc).unwrap_or("????"),
+                    fb,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn output_params_tag_resolves_back_to_magicyuv_via_registry() {
+        // Forward direction: the FourCC the encoder writes via
+        // `output_params().tag` must resolve to "magicyuv" through
+        // the registry's `resolve_tag` — closing the round-trip loop
+        // that `oxideav-avi`'s muxer + demuxer rely on.
+        use crate::encoder::output_params;
+        use crate::tables::lookup;
+        use oxideav_core::ProbeContext;
+
+        let rec = lookup(0x66).expect("M8RA");
+        let p = output_params(rec, 64, 64);
+        let tag = p.tag.as_ref().expect("tag set by output_params");
+
+        let mut reg = CodecRegistry::new();
+        register_codecs(&mut reg);
+        let resolved = reg.resolve_tag_ref(&ProbeContext::new(tag));
+        assert_eq!(
+            resolved.map(|c| c.as_str()),
+            Some(CODEC_ID_STR),
+            "encoder's output FourCC must resolve back to magicyuv",
+        );
+    }
+
+    #[test]
     fn end_to_end_decode_via_registry_m8g0() {
         let rec = lookup_round1(0x6b).unwrap();
         let pixels: Vec<u8> = (0..(16 * 16)).map(|i| (i & 0xff) as u8).collect();

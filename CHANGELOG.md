@@ -14,6 +14,17 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `CodecInfo::tags([CodecTag::fourcc(…)])` so `oxideav-avi` can
   resolve them through `CodecResolver` without a hand-maintained
   codec_map.
+- **`encoder::output_params(rec, width, height) -> CodecParameters`**
+  helper (gated on the default-on `registry` feature). Returns the
+  `CodecParameters` value that an `Encoder::output_params()` impl
+  would surface — in particular `params.tag = Some(CodecTag::fourcc(rec.fourcc))`
+  so `oxideav-avi`'s muxer writes the configured wire FourCC
+  (one of the 17 native v7 codes) without needing the previous
+  `extradata[0..4]` printable-FourCC hint hack. The tag flows from
+  the encoder's `FourccRecord` directly to the muxer via
+  `CodecParameters::tag` — the architectural correction that
+  replaces the never-published 0.1.25 `CodecResolver::tag_for_codec`
+  inverse-lookup path.
 
 ### Added — round 3
 

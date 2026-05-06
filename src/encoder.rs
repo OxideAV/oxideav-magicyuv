@@ -89,6 +89,30 @@ pub fn encode_frame(
     }
 }
 
+/// Build the [`oxideav_core::CodecParameters`] this encoder produces for
+/// a given (FOURCC, width, height) configuration.
+///
+/// Equivalent to what an `Encoder::output_params()` impl would return.
+/// In particular, the returned params carry **`tag = Some(CodecTag::fourcc(rec.fourcc))`**
+/// so muxers writing the encoder's packets emit the right FourCC on the wire
+/// (one of the 17 native v7 codes — `M8RG`, `M8RA`, `M8Y4`, `M8Y2`, `M8Y0`,
+/// `M8YA`, `M8G0` for 8-bit; `M0RG`, `M0RA`, `M0Y4`, `M0Y2`, `M0Y0`, `M0G0`
+/// for 10-bit; `M2RG`, `M2RA` for 12-bit; `M4RG`, `M4RA` for 14-bit).
+///
+/// Compiled only when the default-on `registry` feature is enabled (the
+/// `oxideav-core` framework integration). Standalone consumers
+/// (`default-features = false`) build pure-Rust frame bytes via
+/// [`encode_frame`] and don't need this helper.
+#[cfg(feature = "registry")]
+pub fn output_params(rec: FourccRecord, width: u32, height: u32) -> oxideav_core::CodecParameters {
+    use oxideav_core::{CodecId, CodecParameters, CodecTag};
+    let mut p = CodecParameters::video(CodecId::new(crate::registry::CODEC_ID_STR))
+        .with_tag(CodecTag::fourcc(&rec.fourcc));
+    p.width = Some(width);
+    p.height = Some(height);
+    p
+}
+
 /// Per-plane input buffer for the encoder.
 #[derive(Debug, Clone)]
 pub enum PlaneInput {
