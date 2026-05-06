@@ -122,20 +122,6 @@ pub(crate) enum Event<'a> {
     PreambleTrailing {
         extra_bytes: &'a [u8],
     },
-    Avi {
-        chunk: &'a str,
-        size: usize,
-        extra: &'a [(&'a str, AviField<'a>)],
-    },
-}
-
-/// Lightweight tagged value for Avi event extras (avoids serde).
-#[allow(dead_code)]
-pub(crate) enum AviField<'a> {
-    U32(u32),
-    USize(usize),
-    Str(&'a str),
-    Bytes(&'a [u8]),
 }
 
 impl<'a> Event<'a> {
@@ -281,34 +267,6 @@ impl<'a> Event<'a> {
             Event::PreambleTrailing { extra_bytes } => {
                 out.push_str("{\"kind\":\"preamble_trailing\"");
                 push_hex_field(out, "extra_bytes", extra_bytes);
-                out.push('}');
-            }
-            Event::Avi { chunk, size, extra } => {
-                out.push_str("{\"kind\":\"avi\"");
-                push_str_field(out, "chunk", chunk);
-                push_int_field(out, "size", *size as u64);
-                for (k, v) in extra.iter() {
-                    out.push(',');
-                    out.push('"');
-                    out.push_str(k);
-                    out.push_str("\":");
-                    match v {
-                        AviField::U32(n) => out.push_str(&format!("{}", n)),
-                        AviField::USize(n) => out.push_str(&format!("{}", n)),
-                        AviField::Str(s) => {
-                            out.push('"');
-                            out.push_str(s);
-                            out.push('"');
-                        }
-                        AviField::Bytes(b) => {
-                            out.push('"');
-                            for byte in b.iter() {
-                                out.push_str(&format!("{:02x}", byte));
-                            }
-                            out.push('"');
-                        }
-                    }
-                }
                 out.push('}');
             }
         }

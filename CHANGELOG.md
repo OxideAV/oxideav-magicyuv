@@ -6,6 +6,16 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Removed
+
+- `avi::AviReader`, `avi::AviKind`, `avi::RiffSegmentLimit`,
+  `encode_avi`, `encode_avi_opendml`, and the `src/avi.rs` module.
+  AVI is a container; its decode + encode (including OpenDML 2.0
+  multi-RIFF support) live in `oxideav-avi` (round trip tests there
+  reference `oxideav-magicyuv` as a dev-dep). The codec crate now
+  exposes only raw MAGY-frame encode/decode + the framework
+  `Decoder` impl + `output_params()`.
+
 ### Added
 
 - Declare native v7 FourCCs (`M8RG`, `M8RA`, `M8Y4`, `M8Y2`, `M8Y0`,

@@ -1,14 +1,14 @@
 //! Pure-Rust MagicYUV v7 lossless decoder + encoder.
 //!
-//! **Round 3 — clean-room rebuild.** The crate decodes the full
-//! native FOURCC set: 8-bit (M8RG, M8RA, M8Y4, M8Y2, M8Y0, M8YA,
-//! M8G0) and 10/12/14-bit (M0RG, M0RA, M2RG, M2RA, M4RG, M4RA, M0Y2,
-//! M0Y4, M0Y0, M0G0). Interlaced field-stride=2 prediction
-//! (`flags & 0x02`) is honoured per `spec/04` §5.1. A public encoder
-//! API ([`encode_frame`], [`encode_avi`], [`encode_avi_opendml`])
-//! produces wire-format frames + AVI envelopes (single-RIFF AVI 1.0
-//! and multi-RIFF OpenDML 2.0 per `spec/06` §6.1) that round-trip
-//! through [`decode_frame`] / [`avi::AviReader`].
+//! **Codec-only crate.** AVI is a container, not a codec, and its
+//! demux + mux (including OpenDML 2.0 multi-RIFF) live in
+//! `oxideav-avi`. This crate handles only the MAGY frame wire format.
+//! It decodes the full native FOURCC set: 8-bit (M8RG, M8RA, M8Y4,
+//! M8Y2, M8Y0, M8YA, M8G0) and 10/12/14-bit (M0RG, M0RA, M2RG, M2RA,
+//! M4RG, M4RA, M0Y2, M0Y4, M0Y0, M0G0). Interlaced field-stride=2
+//! prediction (`flags & 0x02`) is honoured per `spec/04` §5.1. The
+//! public encoder API ([`encode_frame`]) produces wire-format frames
+//! that round-trip through [`decode_frame`] byte-for-byte.
 //!
 //! ## Pipeline
 //!
@@ -28,16 +28,12 @@
 //!    JPEG-LS** at 10/12/14-bit.
 //! 6. **RGB inter-plane decorrelation reversal**: `spec/03` §4
 //!    audit-corrected wire order is `(B', G, R')[, A]`.
-//! 7. **AVI demux** ([`avi::AviReader`]): walks RIFF / `strf` /
-//!    `00dc` chunks per [`spec/06`].
 //!
 //! ## Public API
 //!
 //! - [`decode_frame`] — decode one MAGY-prefixed frame's bytes into
 //!   per-plane buffers.
 //! - [`encode_frame`] — encode one frame from per-plane pixel buffers.
-//! - [`encode_avi`] — wrap one or more frames in a single-RIFF AVI.
-//! - [`avi::AviReader`] — walk an AVI file and pull each frame out.
 //! - [`Error`] / [`Result`] — crate-local error type.
 //!
 //! ## Cargo features
@@ -54,11 +50,9 @@
 //! [`spec/04` §4]: https://github.com/OxideAV/docs/blob/master/video/magicyuv/spec/04-prediction-modes.md
 //! [`spec/05` §1.1]: https://github.com/OxideAV/docs/blob/master/video/magicyuv/spec/05-entropy-coding.md
 //! [`spec/05` §2.0]: https://github.com/OxideAV/docs/blob/master/video/magicyuv/spec/05-entropy-coding.md
-//! [`spec/06`]: https://github.com/OxideAV/docs/blob/master/video/magicyuv/spec/06-avi-carriage.md
 
 #![forbid(unsafe_code)]
 
-pub mod avi;
 pub mod bitreader;
 pub mod decoder;
 pub mod encoder;
@@ -77,10 +71,7 @@ pub(crate) mod trace;
 pub use crate::decoder::{decode_frame, DecodedFrame, DecodedPlane, Samples};
 #[cfg(feature = "registry")]
 pub use crate::encoder::output_params;
-pub use crate::encoder::{
-    encode_avi, encode_avi_opendml, encode_frame, AviKind, EncodeOptions, PlaneInput,
-    RiffSegmentLimit, SliceMode,
-};
+pub use crate::encoder::{encode_frame, EncodeOptions, PlaneInput, SliceMode};
 pub use crate::error::{Error, Result};
 
 // Framework integration — only when the `registry` feature is on.
