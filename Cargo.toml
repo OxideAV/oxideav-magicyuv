@@ -19,6 +19,11 @@ default = ["registry"]
 # `oxideav-core`'s codec registry. Disable for standalone builds that
 # want the decoder without dragging in the framework.
 registry = ["dep:oxideav-core"]
+# Emit a JSON-Lines trace tape during decode when the env var
+# `OXIDEAV_MAGICYUV_TRACE_FILE` is set. Off by default; round-2
+# Auditor uses this to do `jq`-line-diff lockstep against the
+# Python reference codec's `--trace` output.
+trace = []
 
 [dependencies]
 oxideav-core = { version = "0.1", optional = true }

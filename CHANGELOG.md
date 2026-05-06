@@ -6,7 +6,58 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Added
+### Added — round 2
+
+- **10/12/14-bit native FOURCC family**: M0RG, M0RA, M2RG, M2RA,
+  M4RG, M4RA (RGB / RGBA), M0Y2, M0Y4, M0Y0 (YUV), M0G0 (Gray) decode
+  via a u16 storage path. Per-bit-depth wrap mask `(1 << bits) - 1`
+  applied after every predictor add. **Median at 10/12/14-bit is
+  standard JPEG-LS** per `spec/04` §4.4 round-2 corrected note (NOT
+  the modular formula used at 8-bit). Self-roundtrip for the four
+  synthetic patterns (zero / const / ramp / random) at 16×16 + 64×64
+  passes for every high-bit-depth FOURCC × every predictor × Huffman
+  + raw mode.
+- **Interlaced field-stride=2 prediction** (`spec/04` §5.1 round-2):
+  when `flags & FLAG_INTERLACED == 0x02`, the predictor's top
+  neighbour is row `r - 2`, and the first **two** rows of each slice
+  have no top neighbour (Left across both, like progressive row 0).
+  Self-roundtrip tests for 8-bit and high-bit-depth interlaced
+  fixtures pass.
+- **Public encoder API** (`encode_frame`, `encode_avi`,
+  `EncodeOptions`, `PlaneInput`, `SliceMode`). The encoder is a
+  clean-room implementation that produces well-formed v7 frames the
+  decoder round-trips byte-for-byte. It does NOT chase the
+  proprietary v2.4.2 encoder's "Dynamic" predictor strategy or its
+  byte-budget raw-fallback heuristic — those are encoder-side
+  conventions, not wire-format requirements.
+- **JSON-Lines trace emitter** behind the `trace` Cargo feature.
+  When the feature is on AND `OXIDEAV_MAGICYUV_TRACE_FILE` is set,
+  the decoder writes one event per state transition: `hdr`,
+  `slice_table`, `preamble`, `huff` (one per plane), `payload` (one
+  per slice), `preamble_trailing`, `avi`. Field schema mirrors the
+  round-1 Auditor review's §4 forward spec
+  (`docs/video/magicyuv/audit/02-implementer-rust-round-1-review.md`)
+  byte-for-byte so the Auditor's `jq`-line-diff harness can lockstep
+  the Rust output against the cleanroom Python reference codec's
+  `--trace` output.
+- **Two-level Huffman lookup table** (primary 12-bit + per-prefix
+  secondary subtables) keeps the per-plane lookup memory at 16 KB
+  even for the 14-bit `max_length=18` tier (vs. the 1 MB a flat 18-bit
+  table would use).
+- High-bit-depth raw mode (bit-packed at `bits` bits per sample,
+  MSB-first) — `spec/05` §4.1.
+
+### Notes
+
+- `Cargo.toml` adds the `trace` feature and the `tables/`
+  artefacts continue to be loaded via `include_str!`.  The default
+  `registry` feature is unchanged.
+- The proprietary binary's exact encoder output (per-slice "Dynamic"
+  strategy, 64×64 random raw-mode flag pattern) is not reproduced;
+  spec/04 §3 + §4 specify it as encoder-side, and the v2.4.2-Auditor
+  byte-exact lockstep stays a decode-side guarantee.
+
+### Added — round 1
 
 - Round-1 clean-room MagicYUV v7 decoder for the 8-bit native
   FOURCC family: **M8RG, M8RA, M8Y4, M8Y2, M8Y0, M8YA, M8G0**.

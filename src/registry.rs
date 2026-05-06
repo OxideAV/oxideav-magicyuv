@@ -14,7 +14,7 @@ use oxideav_core::{
     RuntimeContext, VideoFrame, VideoPlane,
 };
 
-use crate::decoder::{decode_frame, DecodedFrame};
+use crate::decoder::{decode_frame, DecodedFrame, Samples};
 use crate::tables::Family;
 
 /// Canonical codec id. `oxideav-meta::register_all` calls
@@ -89,85 +89,108 @@ impl Decoder for MagicYuvDecoder {
     }
 }
 
+fn samples_to_bytes(s: &Samples) -> Vec<u8> {
+    match s {
+        Samples::U8(v) => v.clone(),
+        Samples::U16(v) => {
+            // LE 16-bit container per spec/03 §7.3.
+            let mut out = Vec::with_capacity(v.len() * 2);
+            for &x in v {
+                out.extend_from_slice(&x.to_le_bytes());
+            }
+            out
+        }
+    }
+}
+
+fn samples_byte_stride(plane_width: usize, samples: &Samples) -> usize {
+    match samples {
+        Samples::U8(_) => plane_width,
+        Samples::U16(_) => plane_width * 2,
+    }
+}
+
 fn map_to_video_frame(frame: DecodedFrame, pts: Option<i64>) -> VideoFrame {
-    // Choose a PixelFormat for the frame. For Round-1 8-bit native
-    // FOURCCs we map:
-    //   M8RG → Rgb24 (interleaved); we re-pack from the GBR planes.
-    //   M8RA → Rgba   (interleaved); re-pack from GBRA planes.
-    //   M8Y4 → Yuv444P
-    //   M8Y2 → Yuv422P
-    //   M8Y0 → Yuv420P
-    //   M8YA → Yuva420P? — there's no native YUVA-4:4:4:4 in core's
-    //                       PixelFormat enum yet; round 1 emits the
-    //                       four planes verbatim with PixelFormat
-    //                       fallback to Yuv444P + a separate alpha
-    //                       plane.
-    //   M8G0 → Gray8.
-    //
-    // The mapping deliberately exposes user-facing data in the most
-    // ergonomic core format. Callers needing the raw planar wire
-    // bytes can still call `crate::decode_frame` directly.
-    let _ = frame.record; // record consulted via family below
+    let _ = frame.record;
     let planes = match frame.record.family {
-        Family::Gray => vec![VideoPlane {
-            stride: frame.planes[0].width,
-            data: frame.planes[0].data.clone(),
-        }],
-        Family::Yuv => frame
+        Family::Gray => {
+            let p = &frame.planes[0];
+            vec![VideoPlane {
+                stride: samples_byte_stride(p.width, &p.samples),
+                data: samples_to_bytes(&p.samples),
+            }]
+        }
+        Family::Yuv | Family::Yuva => frame
             .planes
             .iter()
             .map(|p| VideoPlane {
-                stride: p.width,
-                data: p.data.clone(),
-            })
-            .collect(),
-        Family::Yuva => frame
-            .planes
-            .iter()
-            .map(|p| VideoPlane {
-                stride: p.width,
-                data: p.data.clone(),
+                stride: samples_byte_stride(p.width, &p.samples),
+                data: samples_to_bytes(&p.samples),
             })
             .collect(),
         Family::Rgb => {
-            // Pack G,B,R planes into interleaved Rgb24 (R,G,B order).
-            let g = &frame.planes[0].data;
-            let b = &frame.planes[1].data;
-            let r = &frame.planes[2].data;
-            let n = g.len();
-            let mut out = Vec::with_capacity(n * 3);
-            for i in 0..n {
-                out.push(r[i]);
-                out.push(g[i]);
-                out.push(b[i]);
+            // For 8-bit pack to interleaved RGB; for high-bit-depth,
+            // emit per-plane GBR planes verbatim (LE-16-bit) so the
+            // caller has the raw decoded values.
+            if frame.planes[0].samples.is_u8() {
+                let g = frame.planes[0].samples.as_u8().unwrap();
+                let b = frame.planes[1].samples.as_u8().unwrap();
+                let r = frame.planes[2].samples.as_u8().unwrap();
+                let n = g.len();
+                let mut out = Vec::with_capacity(n * 3);
+                for i in 0..n {
+                    out.push(r[i]);
+                    out.push(g[i]);
+                    out.push(b[i]);
+                }
+                vec![VideoPlane {
+                    stride: frame.width as usize * 3,
+                    data: out,
+                }]
+            } else {
+                frame
+                    .planes
+                    .iter()
+                    .map(|p| VideoPlane {
+                        stride: samples_byte_stride(p.width, &p.samples),
+                        data: samples_to_bytes(&p.samples),
+                    })
+                    .collect()
             }
-            vec![VideoPlane {
-                stride: frame.width as usize * 3,
-                data: out,
-            }]
         }
         Family::Rgba => {
-            let g = &frame.planes[0].data;
-            let b = &frame.planes[1].data;
-            let r = &frame.planes[2].data;
-            let a = &frame.planes[3].data;
-            let n = g.len();
-            let mut out = Vec::with_capacity(n * 4);
-            for i in 0..n {
-                out.push(r[i]);
-                out.push(g[i]);
-                out.push(b[i]);
-                out.push(a[i]);
+            if frame.planes[0].samples.is_u8() {
+                let g = frame.planes[0].samples.as_u8().unwrap();
+                let b = frame.planes[1].samples.as_u8().unwrap();
+                let r = frame.planes[2].samples.as_u8().unwrap();
+                let a = frame.planes[3].samples.as_u8().unwrap();
+                let n = g.len();
+                let mut out = Vec::with_capacity(n * 4);
+                for i in 0..n {
+                    out.push(r[i]);
+                    out.push(g[i]);
+                    out.push(b[i]);
+                    out.push(a[i]);
+                }
+                vec![VideoPlane {
+                    stride: frame.width as usize * 4,
+                    data: out,
+                }]
+            } else {
+                frame
+                    .planes
+                    .iter()
+                    .map(|p| VideoPlane {
+                        stride: samples_byte_stride(p.width, &p.samples),
+                        data: samples_to_bytes(&p.samples),
+                    })
+                    .collect()
             }
-            vec![VideoPlane {
-                stride: frame.width as usize * 4,
-                data: out,
-            }]
         }
     };
 
-    let _ = MediaType::Video; // marker — this is a video frame.
-    let _ = PixelFormat::Yuv420P; // marker — concrete format set by stream params upstream.
+    let _ = MediaType::Video;
+    let _ = PixelFormat::Yuv420P;
     VideoFrame { pts, planes }
 }
 
@@ -178,7 +201,7 @@ mod tests {
     use super::*;
     use oxideav_core::{CodecId, CodecParameters, Packet, TimeBase};
 
-    use crate::encoder::{encode_frame, SliceMode};
+    use crate::encoder::{encode_frame, EncodeOptions, PlaneInput, SliceMode};
     use crate::tables::{lookup_round1, PredictorKind};
 
     #[test]
@@ -194,8 +217,6 @@ mod tests {
 
     #[test]
     fn end_to_end_decode_via_registry_m8g0() {
-        // Build a tiny M8G0 (Gray, 8-bit) frame and decode it via the
-        // registered framework decoder.
         let rec = lookup_round1(0x6b).unwrap();
         let pixels: Vec<u8> = (0..(16 * 16)).map(|i| (i & 0xff) as u8).collect();
         let bytes = encode_frame(
@@ -203,10 +224,14 @@ mod tests {
             16,
             16,
             28,
-            vec![pixels.clone()],
-            PredictorKind::Left,
-            SliceMode::Huffman,
-        );
+            vec![PlaneInput::U8(pixels.clone())],
+            EncodeOptions {
+                predictor: PredictorKind::Left,
+                mode: SliceMode::Huffman,
+                interlaced: false,
+            },
+        )
+        .expect("encode");
 
         let mut ctx = RuntimeContext::new();
         register(&mut ctx);

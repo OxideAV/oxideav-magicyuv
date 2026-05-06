@@ -121,8 +121,8 @@ pub fn parse(buf: &[u8]) -> Result<FrameHeader> {
     let width_extra = read_u32_le(&buf[24..28]);
     let slice_height = read_u32_le(&buf[28..32]);
 
-    // Format byte must be in the round-1 supported set.
-    let rec = tables::lookup_round1(format_byte)?;
+    // Format byte must be in the round-2 supported set (CSV).
+    let rec = tables::lookup_round2(format_byte)?;
     // Audit-corrected aux_byte cross-check (spec/01 §3.0). For 8-bit
     // formats this is 0x0c.
     if aux_byte != rec.aux_byte {

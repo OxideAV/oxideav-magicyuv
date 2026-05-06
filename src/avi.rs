@@ -1,22 +1,20 @@
 //! Minimal RIFF/AVI demuxer for MagicYUV per `spec/06`.
 //!
-//! Round 1 scope: walk the standard `RIFF AVI` envelope, locate the
-//! `strf` chunk's BITMAPINFOHEADER + extradata, validate the
+//! Walks the standard `RIFF AVI` envelope, locates the
+//! `strf` chunk's BITMAPINFOHEADER + extradata, validates the
 //! extradata as a v7 MAGY header (it's byte-identical to each
-//! per-frame `00dc` MAGY header per `spec/06` §4.1), and emit the
+//! per-frame `00dc` MAGY header per `spec/06` §4.1), and emits the
 //! `00dc` chunk payloads as decode-ready frames.
 //!
-//! The parser is iterator-style: build it from a byte slice, then
-//! call `.next_frame()` to get each frame's bytes (the unpadded
-//! `00dc` chunk payload). The payload is exactly what
-//! [`crate::decode_frame`] consumes.
-//!
 //! OpenDML 2.0 (`indx` super-index, `RIFF AVIX` continuations) is
-//! out of scope for round 1 per `spec/06` §6.1 — single-RIFF AVI
+//! out of scope for round 1/2 per `spec/06` §6.1 — single-RIFF AVI
 //! files (≤ 1 GB) are handled.
 
 use crate::error::{Error, Result};
 use crate::header;
+
+#[cfg(feature = "trace")]
+use crate::trace::{AviField, Event, Tracer};
 
 /// Parsed header info from a MagicYUV-bearing AVI file.
 pub struct AviInfo {
@@ -41,7 +39,16 @@ pub struct AviReader<'a> {
 impl<'a> AviReader<'a> {
     /// Parse an AVI file's bytes into a frame iterator.
     pub fn open(buf: &'a [u8]) -> Result<Self> {
-        let (info, frames) = parse_riff(buf)?;
+        #[cfg(feature = "trace")]
+        let tracer = Tracer::from_env();
+        #[cfg(not(feature = "trace"))]
+        let tracer: Option<()> = None;
+        let (info, frames) = parse_riff(
+            buf,
+            #[cfg(feature = "trace")]
+            tracer.as_ref(),
+        )?;
+        let _ = tracer;
         Ok(Self {
             frames,
             info,
@@ -65,8 +72,11 @@ impl<'a> AviReader<'a> {
     }
 }
 
-fn parse_riff(buf: &[u8]) -> Result<(AviInfo, Vec<&[u8]>)> {
-    // RIFF(<size>) "AVI " ...
+#[allow(clippy::needless_lifetimes)]
+fn parse_riff<'a>(
+    buf: &'a [u8],
+    #[cfg(feature = "trace")] tracer: Option<&Tracer>,
+) -> Result<(AviInfo, Vec<&'a [u8]>)> {
     if buf.len() < 12 {
         return Err(Error::Truncated {
             what: "RIFF AVI envelope",
@@ -89,12 +99,26 @@ fn parse_riff(buf: &[u8]) -> Result<(AviInfo, Vec<&[u8]>)> {
         });
     }
     let riff_size = read_u32_le(&buf[4..8]) as usize;
+    #[cfg(feature = "trace")]
+    if let Some(t) = tracer {
+        t.emit(Event::Avi {
+            chunk: "RIFF",
+            size: riff_size,
+            extra: &[],
+        });
+    }
     let riff_end = (8 + riff_size).min(buf.len());
     let body = &buf[12..riff_end];
 
     let mut info: Option<AviInfo> = None;
     let mut frames: Vec<&[u8]> = Vec::new();
-    walk_chunks(body, &mut info, &mut frames)?;
+    walk_chunks(
+        body,
+        &mut info,
+        &mut frames,
+        #[cfg(feature = "trace")]
+        tracer,
+    )?;
 
     let info = info.ok_or(Error::Truncated {
         what: "strf chunk (no MAGY extradata)",
@@ -108,6 +132,7 @@ fn walk_chunks<'a>(
     mut buf: &'a [u8],
     info: &mut Option<AviInfo>,
     frames: &mut Vec<&'a [u8]>,
+    #[cfg(feature = "trace")] tracer: Option<&Tracer>,
 ) -> Result<()> {
     while buf.len() >= 8 {
         let id: [u8; 4] = buf[0..4].try_into().unwrap();
@@ -133,32 +158,58 @@ fn walk_chunks<'a>(
             }
             let list_type: [u8; 4] = payload[0..4].try_into().unwrap();
             let list_body = &payload[4..];
-            if &list_type == b"hdrl" || &list_type == b"strl" {
-                walk_chunks(list_body, info, frames)?;
-            } else if &list_type == b"movi" {
-                walk_movi(list_body, frames)?;
-            }
-            // Other LIST types (e.g. 'INFO') are ignored.
-        } else if &id == b"strf" {
-            // Stream format chunk: BITMAPINFOHEADER (40 B) + extradata
-            // (32 B for v7 MAGY).
-            if payload.len() >= 40 + header::HEADER_SIZE {
-                let bih = &payload[..40];
-                let extra = &payload[40..40 + header::HEADER_SIZE];
-                // Validate the MAGY extradata.
-                let _ = header::parse(extra)?;
-                let bi_width = read_u32_le(&bih[4..8]);
-                let bi_height = read_u32_le(&bih[8..12]).abs_signed();
-                let fourcc: [u8; 4] = bih[16..20].try_into().unwrap();
-                *info = Some(AviInfo {
-                    width: bi_width,
-                    height: bi_height,
-                    fourcc,
+            #[cfg(feature = "trace")]
+            if let Some(t) = tracer {
+                let lt = std::str::from_utf8(&list_type).unwrap_or("????");
+                t.emit(Event::Avi {
+                    chunk: "LIST",
+                    size,
+                    extra: &[("list_type", AviField::Str(lt))],
                 });
             }
+            if &list_type == b"hdrl" || &list_type == b"strl" {
+                walk_chunks(
+                    list_body,
+                    info,
+                    frames,
+                    #[cfg(feature = "trace")]
+                    tracer,
+                )?;
+            } else if &list_type == b"movi" {
+                walk_movi(
+                    list_body,
+                    frames,
+                    #[cfg(feature = "trace")]
+                    tracer,
+                )?;
+            }
+        } else if &id == b"strf" && payload.len() >= 40 + header::HEADER_SIZE {
+            let bih = &payload[..40];
+            let extra = &payload[40..40 + header::HEADER_SIZE];
+            let _ = header::parse(extra)?;
+            let bi_width = read_u32_le(&bih[4..8]);
+            let bi_height = read_u32_le(&bih[8..12]).abs_signed();
+            let fourcc: [u8; 4] = bih[16..20].try_into().unwrap();
+            #[cfg(feature = "trace")]
+            if let Some(t) = tracer {
+                let fc = std::str::from_utf8(&fourcc).unwrap_or("????");
+                t.emit(Event::Avi {
+                    chunk: "strf",
+                    size,
+                    extra: &[
+                        ("width", AviField::U32(bi_width)),
+                        ("height", AviField::U32(bi_height)),
+                        ("fourcc", AviField::Str(fc)),
+                    ],
+                });
+            }
+            *info = Some(AviInfo {
+                width: bi_width,
+                height: bi_height,
+                fourcc,
+            });
         }
 
-        // Word-align to even byte boundary.
         let advance = payload_end + (size & 1);
         if advance > buf.len() {
             break;
@@ -168,7 +219,13 @@ fn walk_chunks<'a>(
     Ok(())
 }
 
-fn walk_movi<'a>(mut buf: &'a [u8], frames: &mut Vec<&'a [u8]>) -> Result<()> {
+fn walk_movi<'a>(
+    mut buf: &'a [u8],
+    frames: &mut Vec<&'a [u8]>,
+    #[cfg(feature = "trace")] tracer: Option<&Tracer>,
+) -> Result<()> {
+    #[cfg(feature = "trace")]
+    let mut frame_index = 0usize;
     while buf.len() >= 8 {
         let id: [u8; 4] = buf[0..4].try_into().unwrap();
         let size = read_u32_le(&buf[4..8]) as usize;
@@ -180,11 +237,23 @@ fn walk_movi<'a>(mut buf: &'a [u8], frames: &mut Vec<&'a [u8]>) -> Result<()> {
             });
         }
         let payload = &buf[8..8 + size];
-        // Per spec/06 §2.1, video frame chunks have FOURCC
-        // <sn>dc — for stream 0 that's "00dc". We accept any
-        // <NN>dc.
         if id[2] == b'd' && id[3] == b'c' {
+            #[cfg(feature = "trace")]
+            if let Some(t) = tracer {
+                t.emit(Event::Avi {
+                    chunk: "00dc",
+                    size,
+                    extra: &[
+                        ("frame_index", AviField::USize(frame_index)),
+                        ("payload_size", AviField::USize(payload.len())),
+                    ],
+                });
+            }
             frames.push(payload);
+            #[cfg(feature = "trace")]
+            {
+                frame_index += 1;
+            }
         }
         let advance = 8 + size + (size & 1);
         if advance > buf.len() {
@@ -206,10 +275,6 @@ trait AbsSigned {
 }
 impl AbsSigned for u32 {
     fn abs_signed(self) -> u32 {
-        // Treat self as i32 and return its absolute value (cap at
-        // i32::MAX → u32). biHeight is documented signed; positive
-        // for compressed video per spec/06 §3.4 but we tolerate
-        // negative.
         let s = self as i32;
         s.unsigned_abs()
     }
@@ -219,73 +284,8 @@ impl AbsSigned for u32 {
 mod tests {
     use super::*;
     use crate::decoder::decode_frame;
-    use crate::encoder::{encode_frame, SliceMode};
+    use crate::encoder::{encode_avi, encode_frame, EncodeOptions, PlaneInput, SliceMode};
     use crate::tables::{lookup_round1, PredictorKind};
-
-    /// Synthesise a minimal RIFF AVI file containing one MAGY frame.
-    /// Used to exercise [`AviReader::open`] end-to-end.
-    fn synth_avi(frame_bytes: &[u8], fourcc: [u8; 4], width: u32, height: u32) -> Vec<u8> {
-        // Build strf payload: 40 B BITMAPINFOHEADER + 32 B extradata
-        // (the extradata is the first 32 bytes of frame_bytes per
-        // spec/06 §4.1).
-        let mut bih = Vec::new();
-        bih.extend_from_slice(&72u32.to_le_bytes()); // biSize = 72
-        bih.extend_from_slice(&width.to_le_bytes());
-        bih.extend_from_slice(&height.to_le_bytes());
-        bih.extend_from_slice(&1u16.to_le_bytes()); // biPlanes
-        bih.extend_from_slice(&24u16.to_le_bytes()); // biBitCount
-        bih.extend_from_slice(&fourcc); // biCompression
-        bih.extend_from_slice(&(frame_bytes.len() as u32).to_le_bytes()); // biSizeImage
-        bih.extend_from_slice(&0u32.to_le_bytes()); // biXPelsPerMeter
-        bih.extend_from_slice(&0u32.to_le_bytes()); // biYPelsPerMeter
-        bih.extend_from_slice(&0u32.to_le_bytes()); // biClrUsed
-        bih.extend_from_slice(&0u32.to_le_bytes()); // biClrImportant
-        let mut strf_payload = bih;
-        strf_payload.extend_from_slice(&frame_bytes[..32]);
-
-        // Build the "strl" LIST: type tag + strf chunk.
-        let mut strl_payload = Vec::new();
-        strl_payload.extend_from_slice(b"strl");
-        strl_payload.extend_from_slice(b"strf");
-        strl_payload.extend_from_slice(&(strf_payload.len() as u32).to_le_bytes());
-        strl_payload.extend_from_slice(&strf_payload);
-        if strf_payload.len() % 2 == 1 {
-            strl_payload.push(0);
-        }
-
-        // Build the "hdrl" LIST: type tag + strl LIST chunk.
-        let mut hdrl_payload = Vec::new();
-        hdrl_payload.extend_from_slice(b"hdrl");
-        hdrl_payload.extend_from_slice(b"LIST");
-        hdrl_payload.extend_from_slice(&(strl_payload.len() as u32).to_le_bytes());
-        hdrl_payload.extend_from_slice(&strl_payload);
-
-        // Build the "movi" LIST: type tag + 00dc chunk.
-        let mut movi_payload = Vec::new();
-        movi_payload.extend_from_slice(b"movi");
-        movi_payload.extend_from_slice(b"00dc");
-        movi_payload.extend_from_slice(&(frame_bytes.len() as u32).to_le_bytes());
-        movi_payload.extend_from_slice(frame_bytes);
-        if frame_bytes.len() % 2 == 1 {
-            movi_payload.push(0);
-        }
-
-        // RIFF body: "AVI " + LIST(hdrl) + LIST(movi).
-        let mut riff_body = Vec::new();
-        riff_body.extend_from_slice(b"AVI ");
-        riff_body.extend_from_slice(b"LIST");
-        riff_body.extend_from_slice(&(hdrl_payload.len() as u32).to_le_bytes());
-        riff_body.extend_from_slice(&hdrl_payload);
-        riff_body.extend_from_slice(b"LIST");
-        riff_body.extend_from_slice(&(movi_payload.len() as u32).to_le_bytes());
-        riff_body.extend_from_slice(&movi_payload);
-
-        let mut out = Vec::new();
-        out.extend_from_slice(b"RIFF");
-        out.extend_from_slice(&(riff_body.len() as u32).to_le_bytes());
-        out.extend_from_slice(&riff_body);
-        out
-    }
 
     #[test]
     fn avi_walks_one_frame_m8g0() {
@@ -296,11 +296,15 @@ mod tests {
             16,
             16,
             28,
-            vec![pixels.clone()],
-            PredictorKind::Gradient,
-            SliceMode::Huffman,
-        );
-        let avi = synth_avi(&frame_bytes, *b"M8G0", 16, 16);
+            vec![PlaneInput::U8(pixels.clone())],
+            EncodeOptions {
+                predictor: PredictorKind::Gradient,
+                mode: SliceMode::Huffman,
+                interlaced: false,
+            },
+        )
+        .unwrap();
+        let avi = encode_avi(rec, 16, 16, std::slice::from_ref(&frame_bytes));
         let mut reader = AviReader::open(&avi).expect("avi parse");
         assert_eq!(reader.info.width, 16);
         assert_eq!(reader.info.height, 16);
@@ -308,7 +312,7 @@ mod tests {
         assert_eq!(reader.frame_count(), 1);
         let frame = reader.next_frame().expect("frame 0");
         let dec = decode_frame(frame).expect("decode frame 0");
-        assert_eq!(dec.planes[0].data, pixels);
+        assert_eq!(dec.planes[0].samples.as_u8().unwrap(), &pixels[..]);
         assert!(reader.next_frame().is_none());
     }
 }

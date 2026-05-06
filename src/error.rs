@@ -91,6 +91,24 @@ pub enum Error {
         /// Slice index inside the frame.
         slice_index: usize,
     },
+    /// Header dimensions don't divide evenly by the FOURCC's chroma
+    /// subsampling factor (`spec/03` §8.2). Round-2 conservative
+    /// rejection — the encoder currently disallows odd dimensions.
+    OddDimensionForSubsampling {
+        /// `width` or `height`.
+        what: &'static str,
+        /// Header value.
+        got: u32,
+        /// Subsampling factor (2 for 4:2:x, 4:2:0).
+        factor: u32,
+    },
+    /// The encoder API was called with a planes vector whose lengths
+    /// don't match the per-FOURCC plane geometry.
+    EncoderInputMismatch {
+        plane: usize,
+        expected: usize,
+        got: usize,
+    },
 }
 
 impl fmt::Display for Error {
@@ -149,6 +167,18 @@ impl fmt::Display for Error {
             Self::SlicePrefixMissing { slice_index } => write!(
                 f,
                 "oxideav-magicyuv: slice {slice_index} has no 2-byte prefix (spec/04 §1)"
+            ),
+            Self::OddDimensionForSubsampling { what, got, factor } => write!(
+                f,
+                "oxideav-magicyuv: {what} {got} is not divisible by chroma subsampling factor {factor} (spec/03 §8.2)"
+            ),
+            Self::EncoderInputMismatch {
+                plane,
+                expected,
+                got,
+            } => write!(
+                f,
+                "oxideav-magicyuv: encoder plane {plane} length {got} != expected {expected}"
             ),
         }
     }

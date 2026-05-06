@@ -82,6 +82,62 @@ pub fn lookup_round1(format_byte: u8) -> Result<FourccRecord> {
     Ok(rec)
 }
 
+/// Look up a record across the round-2 supported set (8-bit + 10/12/14
+/// bit native FOURCCs from `tables/00-fourcc-table.csv`). Returns
+/// `Error::UnsupportedFormatByte` for bytes not present in the CSV.
+pub fn lookup_round2(format_byte: u8) -> Result<FourccRecord> {
+    lookup(format_byte).ok_or(Error::UnsupportedFormatByte(format_byte))
+}
+
+impl FourccRecord {
+    /// `max_huffman_code_length` for this FOURCC's bit-depth tier
+    /// (`spec/05` §1.1: 12/14/16/18 for 8/10/12/14-bit).
+    pub fn max_huffman_length(&self) -> u8 {
+        match self.bit_depth {
+            8 => 12,
+            10 => 14,
+            12 => 16,
+            14 => 18,
+            _ => 12,
+        }
+    }
+
+    /// Per-bit-depth wrap mask. `(1 << bit_depth) - 1`.
+    pub fn sample_mask(&self) -> u32 {
+        (1u32 << self.bit_depth) - 1
+    }
+
+    /// `true` if this FOURCC stores samples in a 2-byte container
+    /// (10/12/14-bit). The 8-bit family is 1-byte container.
+    pub fn is_high_bit_depth(&self) -> bool {
+        self.bit_depth > 8
+    }
+
+    /// Subsampling label string (`"4:4:4"`, `"4:2:2"`, `"4:2:0"`,
+    /// `"4:0:0"`, `"n/a"`) for trace events.
+    pub fn subsampling_label(&self) -> &'static str {
+        match (self.family, self.sub_x, self.sub_y) {
+            (Family::Gray, _, _) => "4:0:0",
+            (Family::Yuv, 1, 1) => "4:4:4",
+            (Family::Yuv, 2, 1) => "4:2:2",
+            (Family::Yuv, 2, 2) => "4:2:0",
+            (Family::Yuva, _, _) => "4:4:4:4",
+            _ => "n/a",
+        }
+    }
+
+    /// Family label string for trace events.
+    pub fn family_label(&self) -> &'static str {
+        match self.family {
+            Family::Rgb => "RGB",
+            Family::Rgba => "RGBA",
+            Family::Yuv => "YUV",
+            Family::Yuva => "YUVA",
+            Family::Gray => "Gray",
+        }
+    }
+}
+
 /// Borrow the parsed-once FOURCC table.
 pub fn fourcc_table() -> &'static [FourccRecord] {
     use std::sync::OnceLock;

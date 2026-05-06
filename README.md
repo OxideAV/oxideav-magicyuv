@@ -5,12 +5,14 @@ Pure-Rust MagicYUV lossless video codec for the
 
 ## Status
 
-**Round 1 — clean-room rebuild.** Decodes the 8-bit native
-FOURCC family of MagicYUV v7 streams: **M8RG, M8RA, M8Y4, M8Y2,
-M8Y0, M8YA, M8G0**. The 10-/12-/14-bit FOURCCs (M0/M2/M4) are
-spec-feasible but Validator-unverified at byte-exactness — they're
-deferred to a later round and currently surface as
-`Error::UnsupportedFormatByte`.
+**Round 2 — clean-room rebuild.** Decodes the full native FOURCC
+set: 8-bit (M8RG, M8RA, M8Y4, M8Y2, M8Y0, M8YA, M8G0) and 10/12/14-bit
+(M0RG, M0RA, M2RG, M2RA, M4RG, M4RA, M0Y2, M0Y4, M0Y0, M0G0).
+Honours `flags & FLAG_INTERLACED` for field-stride=2 prediction
+(`spec/04` §5.1).  A public encoder API (`encode_frame`,
+`encode_avi`) emits wire-format frames the decoder round-trips
+byte-for-byte. A `trace` Cargo feature surfaces a JSONL trace tape
+for the Auditor's lockstep harness.
 
 The implementation is built against the strict-isolation clean-room
 workspace at
@@ -29,7 +31,8 @@ binary, no Python reference source, no `old` branch.
 | 32-byte v7 header      | spec/01 §3 (audit-corrected aux_byte / slice_height) |
 | Slice table + preamble | spec/02 §5..§7                        |
 | Plane-major plane order| spec/03 §4..§6 (RGB wire order audit-corrected) |
-| Per-slice predictors   | spec/04 §4 (Left, Gradient, Median; modular 8-bit Median) |
+| Per-slice predictors   | spec/04 §4 (Left, Gradient, Median; modular 8-bit Median + standard JPEG-LS at 10/12/14-bit) |
+| Interlaced field-stride| spec/04 §5.1 round-2 (top neighbour = row r-2; first 2 rows raw) |
 | Per-plane Huffman      | spec/05 §1.1 (RLE descriptor)         |
 | Canonical-code build   | spec/05 §2.0 (longest-length-first cumulative — **NOT** RFC 1951; auditor round 2 correction) |
 | Raw-mode fallback      | spec/05 §4.1                           |
@@ -38,6 +41,9 @@ binary, no Python reference source, no `old` branch.
 ## Public API
 
 - [`decode_frame`] — decode a single MAGY-prefixed frame's bytes.
+  Returns one [`DecodedPlane`] per native plane; sample storage is
+  `u8` for 8-bit FOURCCs and `u16` for 10/12/14-bit FOURCCs.
+- [`encode_frame`] / [`encode_avi`] — public encoder API.
 - [`avi::AviReader`] — walk an AVI file's `00dc` chunks for end-to-end
   decode.
 - [`header::parse`] — standalone v7 header parser, also re-used for
@@ -50,8 +56,11 @@ binary, no Python reference source, no `old` branch.
 
 - **`registry`** (default): wire the crate into `oxideav-core`'s
   codec registry. Standalone builds (`--no-default-features`)
-  drop the `oxideav-core` dependency entirely and expose only the
-  pure-Rust decoder API.
+  drop the `oxideav-core` dependency entirely.
+- **`trace`** (off): emit JSONL trace events to the path in
+  `OXIDEAV_MAGICYUV_TRACE_FILE` during decode. Used by the round-2
+  Auditor's `jq`-line-diff lockstep harness against the cleanroom
+  Python reference codec's `--trace` output.
 
 ## Why clean-room
 
