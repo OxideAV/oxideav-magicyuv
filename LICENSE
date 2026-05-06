@@ -1,3 +1,35 @@
+NOTICE — clean-room methodology contested (current `master` only)
+
+The implementation on the current `master` branch was derived from a trace
+document whose authoring methodology has been challenged as not satisfying
+clean-room separation. The complaint, the project owner's response, and the
+remediation plan are recorded in issue #3:
+
+    https://github.com/OxideAV/oxideav-magicyuv/issues/3
+
+References:
+
+  * The contested trace document was deleted from the docs repo at
+    OxideAV/docs commit 937a346:
+      https://github.com/OxideAV/docs/commit/937a346
+  * A new clean-room workspace (Specifier / Extractor / Auditor /
+    Implementer roles, with explicit allow-list and forbidden-input list
+    per role; FFmpeg source excluded under any path) is in place at:
+      https://github.com/OxideAV/docs/tree/master/video/magicyuv
+  * The forbidden-input list also covers oxideav-core commit 9a23e86, whose
+    message used FFmpeg-internal identifier names ("AV_PIX_FMT_GBRP*LE
+    family") in the commit text:
+      https://github.com/OxideAV/oxideav-core/commit/9a23e86
+
+Plan: once the clean-room rounds complete and a fresh implementation derived
+solely from the new spec is ready, the current `master` branch will be
+renamed to `old/master` for archival and a freshly-orphaned `master` will
+ship the replacement implementation. The MIT licence below applies cleanly
+to that replacement; for any artifact in the current branch, the
+contestation status should be assessed against the issue #3 thread.
+
+================================================================================
+
 MIT License
 
 Copyright (c) 2026 Karpelès Lab Inc.
