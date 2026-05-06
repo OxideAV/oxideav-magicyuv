@@ -1,0 +1,17 @@
+[package]
+name = "oxideav-magicyuv"
+version = "0.0.2"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+repository = "https://github.com/OxideAV/oxideav-magicyuv"
+authors = ["Mark Karpeles"]
+description = "Pure-Rust MagicYUV lossless decoder for the oxideav framework"
+
+readme = "README.md"
+homepage = "https://github.com/OxideAV/oxideav-magicyuv"
+keywords = ["multimedia", "video", "magicyuv", "lossless", "codec"]
+categories = ["multimedia::encoding", "multimedia::video"]
+
+[dependencies]
+oxideav-core = "0.1"

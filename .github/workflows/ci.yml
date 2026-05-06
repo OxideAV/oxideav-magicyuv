@@ -1,0 +1,16 @@
+name: CI
+
+# Thin shim around the OxideAV org-level reusable workflow. See
+# https://github.com/OxideAV/.github for the actual job definitions and
+# the input surface. Miri runs by default per the org-wide policy.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  ci:
+    uses: OxideAV/.github/.github/workflows/crate-ci.yml@master
+    secrets: inherit
