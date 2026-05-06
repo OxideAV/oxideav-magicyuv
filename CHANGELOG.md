@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/OxideAV/oxideav-magicyuv/compare/v0.0.2...v0.0.3) - 2026-05-06
+
+### Other
+
+- prepend contestation notice (issue #3) + clean-room rebuild plan
+- drop committed Cargo.lock + relax oxideav-core to "0.1"
+- pure-Rust 8/10-bit MagicYUV encoder + decoder horizontal tiles + 10-bit decode
+
 ### Added
 
 - **Encoder.** Pure-Rust `Frame -> Packet` encoder mirroring the
