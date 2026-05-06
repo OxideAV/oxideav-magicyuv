@@ -1,0 +1,58 @@
+# MagicYUV v7 native FOURCC ↔ format_byte ↔ aux_byte ↔ pixel-layout table
+#
+# Source: spec/01-file-header-and-fourccs.md §4.1 (table at lines 413..431).
+# aux_byte values audit-confirmed in audit/00-report.md §3.C (auditor round 1
+# `probe10.exe` ICCompressGetFormat extradata captures, all 14 native FOURCCs).
+# Family identification per spec/03-pixel-plane-mapping.md §3..§7
+# (TImgProcBackend RTTI block at file 0x256a00..0x256d40 in
+# reference/binaries/system32/magicyuv.dll, SHA-256
+# 2036e284cc07a2cb4d4b6b6cb04a1d24c0f97a0041c134fd669ee079b768902c).
+#
+# format_byte = byte at MAGY-header offset +0x09. The decoder looks this byte
+# up in a 26-entry property table indexed by (format_byte - 0x65) per
+# spec/01 §4.1. The "fast-path mask" 0x19bf03 at decoder VMA 0x69bae47a
+# selects format_bytes {0x65, 0x66, 0x6d, 0x6e, 0x6f, 0x70, 0x71, 0x72,
+# 0x74, 0x75, 0x78, 0x79} (the RGB family + 4 reserved bytes).
+#
+# aux_byte = byte at MAGY-header offset +0x0a; semantically equal to the
+# 4th template parameter of the matching HuffCoderT specialisation
+# (see spec/05 §1.5). 12 for 8-bit, 14 for 10-bit, 16 for 12-bit, 18 for
+# 14-bit. A decoder that hard-codes aux_byte=12 will reject valid 10/12/14-bit
+# streams (rejection check at decoder VMA 0x69bae3a8).
+#
+# bit_depth: significant bits per sample (matches HuffCoderT 1st template
+# parameter). Storage is 1 byte per sample for bit_depth=8, 2 bytes for
+# bit_depth in {10,12,14} (per spec/03 §7).
+#
+# planes: number of planes carried in slice payload. RGB = 3 (G,B,R), RGBA =
+# 4 (G,B,R,A), YUV 4:0:0 / Gray = 1 (Y), YUV 4:2:x / 4:4:x = 3 (Y,U,V),
+# YUVA 4:4:4:4 = 4 (Y,U,V,A). Plane order per spec/03 §4..§6.
+#
+# bpp: bits per pixel (a vendor convention; equals
+#   bit_depth * planes_packed_for_image - sometimes packed differently for
+#   sub-sampled formats). This column is the value the encoder writes into
+#   BITMAPINFOHEADER.biBitCount (per spec/06 §3.2).
+#
+# alpha: 1 if the format carries an explicit alpha plane, else 0.
+#
+# subsampling: chroma subsampling for YUV formats; "n/a" for RGB/Gray.
+#
+# Columns: format_byte,fourcc,bit_depth,planes,bpp,alpha,aux_byte,family,subsampling,description
+format_byte,fourcc,bit_depth,planes,bpp,alpha,aux_byte,family,subsampling,description
+0x65,M8RG,8,3,24,0,0x0c,RGB,n/a,RGB 8-bit
+0x66,M8RA,8,4,32,1,0x0c,RGBA,n/a,RGBA 8-bit
+0x67,M8Y4,8,3,24,0,0x0c,YUV,4:4:4,YUV 4:4:4 8-bit
+0x68,M8Y2,8,3,24,0,0x0c,YUV,4:2:2,YUV 4:2:2 8-bit
+0x69,M8Y0,8,3,24,0,0x0c,YUV,4:2:0,YUV 4:2:0 8-bit
+0x6a,M8YA,8,4,32,1,0x0c,YUVA,4:4:4:4,YUVA 4:4:4:4 8-bit
+0x6b,M8G0,8,1,24,0,0x0c,Gray,n/a,Gray 8-bit
+0x6c,M0Y2,10,3,20,0,0x0e,YUV,4:2:2,YUV 4:2:2 10-bit
+0x6d,M0RG,10,3,30,0,0x0e,RGB,n/a,RGB 10-bit
+0x6e,M0RA,10,4,40,1,0x0e,RGBA,n/a,RGBA 10-bit
+0x6f,M2RG,12,3,36,0,0x10,RGB,n/a,RGB 12-bit
+0x70,M2RA,12,4,48,1,0x10,RGBA,n/a,RGBA 12-bit
+0x71,M4RG,14,3,42,0,0x12,RGB,n/a,RGB 14-bit
+0x72,M4RA,14,4,56,1,0x12,RGBA,n/a,RGBA 14-bit
+0x73,M0G0,10,1,10,0,0x0e,Gray,n/a,Gray 10-bit
+0x76,M0Y4,10,3,30,0,0x0e,YUV,4:4:4,YUV 4:4:4 10-bit
+0x7b,M0Y0,10,3,15,0,0x0e,YUV,4:2:0,YUV 4:2:0 10-bit

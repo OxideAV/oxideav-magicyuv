@@ -13,5 +13,12 @@ homepage = "https://github.com/OxideAV/oxideav-magicyuv"
 keywords = ["multimedia", "video", "magicyuv", "lossless", "codec"]
 categories = ["multimedia::encoding", "multimedia::video"]
 
+[features]
+default = ["registry"]
+# Wire the crate's `Decoder` impl + `register(ctx)` entry point into
+# `oxideav-core`'s codec registry. Disable for standalone builds that
+# want the decoder without dragging in the framework.
+registry = ["dep:oxideav-core"]
+
 [dependencies]
-oxideav-core = "0.1"
+oxideav-core = { version = "0.1", optional = true }

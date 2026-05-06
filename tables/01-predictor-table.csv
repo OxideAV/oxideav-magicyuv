@@ -1,0 +1,54 @@
+# MagicYUV v7 per-slice predictor enumeration
+#
+# Source: spec/04-prediction-modes.md §1.2 (table at lines 94..98) and §4.2..§4.4.
+# Decoder dispatch at magicyuv.dll!0x69b95acd..0x69b95aed (predictor_id
+# evaluator) per spec/04 §1.2. Median formula (§4.4) implemented by the
+# cmov chain at 0x69bb6a80..0x69bb6c2f.
+#
+# Binary: reference/binaries/system32/magicyuv.dll, SHA-256
+# 2036e284cc07a2cb4d4b6b6cb04a1d24c0f97a0041c134fd669ee079b768902c.
+#
+# predictor_id is the byte at slice payload offset +1 (per spec/04 §1).
+# Values 0x00 and ≥0x04 are not produced by the v2.4.2 encoder and SHOULD be
+# treated as malformed input (spec/04 §1.2).
+#
+# Notation in the formula column:
+#   pixel[x-1]              = pixel to the left  (within the same row)
+#   pixel[x-stride]         = pixel directly above
+#   pixel[x-stride-1]       = pixel diagonally up-left
+#   left, top, top_left     = abbreviations for the above three
+#   MED(a, b, c)            = MagicYUV's median-edge-detect predictor —
+#                             *not* standard JPEG-LS.  The gradient term
+#                             is computed in modular arithmetic *before*
+#                             clipping:
+#                                 g = (a + b - c) & ((1 << bit_depth) - 1)
+#                                 MED = clip(g, min(a, b), max(a, b))
+#                             Validation round 1 (audit/01-validation-report.md
+#                             §5.7) caught the v2.4.2 cmov chain at
+#                             magicyuv.dll!0x69bb6a80..0x69bb6c2f doing the
+#                             "(top - top_left) & 0xff + left" trick that
+#                             differs from JPEG-LS when raw gradient lies
+#                             outside [0, 2**bit_depth).  See spec/04 §4.4.
+#   wraparound              = result is reduced mod (1 << bit_depth)
+#                             (per spec/04 §4.5; 8-bit uses & 0xff,
+#                             10-bit uses & 0x3ff, etc.)
+#
+# All formulas produce the *predicted pixel value*; the wire residual is
+# (actual_pixel - predicted_pixel) mod (1 << bit_depth). At decode,
+# reconstructed_pixel = (predicted_pixel + residual) mod (1 << bit_depth).
+#
+# Notes:
+# - "Dynamic" (vendor label) is an encoder strategy that picks one of
+#   {Left, Gradient, Median} per-slice; it is NOT a wire-format predictor ID.
+#   See spec/04 §3 (Dynamic encoder strategy) and the codec_variant clamp at
+#   magicyuv.dll!0x69ba9060.
+# - First-column-of-row fall-back rule for Gradient and Median is currently
+#   "use top" (the natural per-row-running-sum behaviour). Spec/04 §8 question
+#   1 flags this as not directly observable in v2.4.2 fixtures; deferred to
+#   Implementer integration testing. See spec/04 §4.2 / §4.3 / §4.4.
+#
+# Columns: predictor_id,name,formula,decoder_kernel_anchor,notes
+predictor_id,name,formula,decoder_kernel_anchor,notes
+0x01,Left,pred = pixel[x-1] (wraparound),spec/04 §4.2; kernel per Backend at vtable +0x10,first-column fall-back: pred = top
+0x02,Gradient,pred = (pixel[x-1] + pixel[x-stride] - pixel[x-stride-1]) (wraparound),spec/04 §4.3; kernel per Backend at vtable +0x18,first-column fall-back: pred = top
+0x03,Median,pred = clip(left + top - top_left, min(left, top), max(left, top)) (wraparound),spec/04 §4.4; cmov chain at 0x69bb6a80..0x69bb6c2f,JPEG-LS / Paeth-like; first-column fall-back: pred = top
