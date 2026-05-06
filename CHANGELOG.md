@@ -6,6 +6,18 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/OxideAV/oxideav-magicyuv/compare/v0.0.2...v0.0.3) - 2026-05-06
+
+### Other
+
+- remove AVI carriage from oxideav-magicyuv
+- fill output_params().tag with the active FourCC
+- declare 17 native v7 FourCCs via CodecInfo::tags
+- Round 3 — OpenDML 2.0 super-index + huff.used schema fix
+- Round 2 — high-bit-depth + interlaced + encoder + trace tape
+- Round 1 — 8-bit MagicYUV v7 decoder
+- Round 0 — clean-room rebuild scaffold (orphan master)
+
 ### Removed
 
 - `avi::AviReader`, `avi::AviKind`, `avi::RiffSegmentLimit`,
