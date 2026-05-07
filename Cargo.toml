@@ -27,3 +27,18 @@ trace = []
 
 [dependencies]
 oxideav-core = { version = "0.1", optional = true }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "decode"
+harness = false
+
+[[bench]]
+name = "encode"
+harness = false
+
+[[bench]]
+name = "roundtrip"
+harness = false

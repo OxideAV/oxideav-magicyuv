@@ -6,6 +6,18 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Criterion bench harness (`benches/decode.rs`, `benches/encode.rs`,
+  `benches/roundtrip.rs`) covering the dominant FOURCCs (M8RG, M8Y0,
+  M8G0, M0RG) at 720p / 1080p plus a 256×256 Median scenario.
+  Inputs are synthesised on-the-fly via `encode_frame` so the benches
+  ship without binary fixtures.
+- `BENCHMARKS.md` baseline document with hot-path attribution
+  (Huffman decode ~70-75 %, predictor ~25 %).
+- `examples/quick_bench.rs` flat-loop helper for the
+  measure-tweak-remeasure inner loop during optimization rounds.
+
 ## [0.0.3](https://github.com/OxideAV/oxideav-magicyuv/compare/v0.0.2...v0.0.3) - 2026-05-06
 
 ### Other
