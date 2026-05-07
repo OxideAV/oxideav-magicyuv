@@ -54,7 +54,7 @@ impl<'a> BitReader<'a> {
 
     /// Drop `n` bits from the top of the accumulator and refill from
     /// `data`.
-    #[inline]
+    #[inline(always)]
     pub fn consume(&mut self, n: u32) {
         debug_assert!(n <= 32);
         self.acc <<= n;
@@ -75,8 +75,48 @@ impl<'a> BitReader<'a> {
 
     /// Make sure ≥ 32 bits are buffered, advancing the byte cursor.
     /// At EOF the buffer is implicitly extended with zero bytes.
-    #[inline]
+    ///
+    /// Round-3 perf: the hot Huffman-decode path calls this on every
+    /// symbol. The fast path `pos + 8 ≤ data.len()` reads 8 bytes
+    /// big-endian into a u64 in one go and OR-merges the unread bits
+    /// into the accumulator — same observable bit stream as the
+    /// byte-by-byte loop, but ≈ 4× fewer loads + branches per call.
+    /// The slow path falls through to the original byte-loop logic
+    /// near EOF, where misaligned reads aren't safe.
+    #[inline(always)]
     fn refill(&mut self) {
+        // Fast path: at least 8 unread bytes ahead AND room for ≥ 8
+        // bits in `acc` (`self.fill <= 56`). We pull 8 bytes
+        // big-endian as a single u64 load, shift it right by `fill`
+        // so its top byte lines up at the first empty bit of `acc`,
+        // and OR it in. Number of bytes successfully merged is
+        // `(64 - fill) / 8` — the rest are kept for the next refill
+        // by advancing `pos` by exactly that many.
+        //
+        // OR-overlap correctness: when `fill` isn't a multiple of 8,
+        // some leftover bits of the partially-merged byte land at the
+        // bottom of `acc`. On the next refill those same bits at the
+        // same data offset are re-OR-ed in — bit-identical, so the
+        // OR is idempotent and the observable stream is unchanged.
+        if self.fill <= 56 && self.pos + 8 <= self.data.len() {
+            let arr: [u8; 8] = self.data[self.pos..self.pos + 8]
+                .try_into()
+                .expect("8-byte window bounds-checked above");
+            let next = u64::from_be_bytes(arr);
+            // `next >> fill` lines up `next[63..56]` at
+            // `acc[(63-fill)..(56-fill)]` — the top of the empty
+            // region. The shift is in [0, 56], well within u64's
+            // shift range so no overflow check fires.
+            self.acc |= next >> self.fill;
+            let bytes = (64 - self.fill) / 8;
+            self.pos += bytes as usize;
+            self.fill += bytes * 8;
+            return;
+        }
+        // Slow path: ≤ 7 bytes left, or we already have > 56 bits.
+        // Same byte-by-byte loop as before — preserves the exact
+        // EOF-pad-with-zero semantics that integration tests
+        // (and the trace lockstep) rely on.
         while self.fill <= 56 {
             let byte = if self.pos < self.data.len() {
                 self.data[self.pos]
@@ -85,13 +125,9 @@ impl<'a> BitReader<'a> {
             };
             self.acc |= (byte as u64) << (56 - self.fill);
             self.fill += 8;
-            // pos advances even past EOF so position() reflects the
-            // last in-bounds index plus one.
             if self.pos < self.data.len() {
                 self.pos += 1;
             } else {
-                // Stop trying to refill once we're past the end; we
-                // don't want pos to grow unboundedly.
                 break;
             }
         }

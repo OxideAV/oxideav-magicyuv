@@ -40,7 +40,22 @@ gives equivalent figures (within 1 %).
 
 ## Optimizations landed
 
-(populated as each commit lands)
+### 1. `BitReader::refill` 8-byte fast path
+
+Single u64 big-endian load + OR-merge replaces the byte-by-byte loop
+when ≥ 8 bytes are still ahead. Same observable bit stream
+(verified against the existing 53 unit tests + roundtrip suite).
+
+| Scenario                          | Before  | After   | Δ        |
+| --------------------------------- | ------: | ------: | -------: |
+| dec M8RG / gradient / 1280×720    | 20.09 ms | 19.73 ms | -1.8 % |
+| dec M8Y0 / gradient / 1280×720    |  9.92 ms |  9.23 ms | -7.0 % |
+| dec M8G0 / left   / 1920×1080     | 13.12 ms | 13.48 ms | +2.7 % |
+| dec M0RG / gradient / 1280×720    | 19.62 ms | 19.24 ms | -1.9 % |
+| dec M8RG / median   / 256×256     |  1.46 ms |  1.47 ms |  0.0 % |
+
+Modest. The compiler already pipelines the byte loop reasonably; the
+big win lands together with optimization #2 below (batched decode).
 
 ## Known follow-ups (not part of this round)
 

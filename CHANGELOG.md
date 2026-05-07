@@ -18,6 +18,17 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `examples/quick_bench.rs` flat-loop helper for the
   measure-tweak-remeasure inner loop during optimization rounds.
 
+### Changed
+
+- `bitreader::BitReader::refill` grew an 8-byte fast path that issues a
+  single big-endian u64 load when the cursor has at least 8 bytes
+  ahead, then OR-merges the next bytes into the accumulator in one
+  shift. Same observable bit stream as the per-byte loop (verified by
+  the existing tests + the trace lockstep), with ≈ 4× fewer per-symbol
+  loads in the Huffman hot path. Slow path (near-EOF, < 8 bytes left)
+  retains the byte-loop with the documented zero-pad-past-end
+  behaviour.
+
 ## [0.0.3](https://github.com/OxideAV/oxideav-magicyuv/compare/v0.0.2...v0.0.3) - 2026-05-06
 
 ### Other
