@@ -421,9 +421,12 @@ fn decode_eight_bit(
             let bits = &payload[2..];
             let mut br = BitReader::new(bits);
             let table = &huff_tables[plane];
-            for px in buf.iter_mut() {
-                *px = table.decode(&mut br) as u8;
-            }
+            // Inline batch helper — folds peek+consume into a single
+            // tight loop so the compiler keeps BitReader state in
+            // registers across iterations. Same observable bit stream
+            // as the per-symbol `decode` call (kept as the slow
+            // fallback inside `decode_into_u8`).
+            table.decode_into_u8(&mut br, buf);
         }
 
         #[cfg(feature = "trace")]
@@ -541,9 +544,7 @@ fn decode_high_bit_depth(
             mode_str = "huffman";
             let mut br = BitReader::new(&payload[2..]);
             let table = &huff_tables[plane];
-            for px in buf.iter_mut() {
-                *px = (table.decode(&mut br) as u16) & mask;
-            }
+            table.decode_into_u16(&mut br, buf, mask);
         }
 
         #[cfg(feature = "trace")]

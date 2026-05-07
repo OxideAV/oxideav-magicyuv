@@ -28,6 +28,14 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   loads in the Huffman hot path. Slow path (near-EOF, < 8 bytes left)
   retains the byte-loop with the documented zero-pad-past-end
   behaviour.
+- `huffman::HuffmanTable::decode_into_u8` / `decode_into_u16` batch
+  helpers — fold the per-symbol `peek_bits` + `consume` calls inline
+  so the BitReader state (`acc`, `fill`, `pos`) stays in registers
+  across the whole slice. The 8-bit path also short-circuits the
+  primary-table-only case (`max_len ≤ PRIMARY_BITS = 12`) to skip
+  the two-level dispatch entirely. The decoder's two slice loops
+  (`decoder::decode_eight_bit`, `decoder::decode_high_bit_depth`)
+  call the batch helper instead of the per-pixel `decode`.
 
 ## [0.0.3](https://github.com/OxideAV/oxideav-magicyuv/compare/v0.0.2...v0.0.3) - 2026-05-06
 

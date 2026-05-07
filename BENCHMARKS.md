@@ -57,6 +57,26 @@ when ≥ 8 bytes are still ahead. Same observable bit stream
 Modest. The compiler already pipelines the byte loop reasonably; the
 big win lands together with optimization #2 below (batched decode).
 
+### 2. `HuffmanTable::decode_into_u{8,16}` batched decode
+
+Folds the per-symbol `peek_bits` + table lookup + `consume` into a
+single tight loop so the BitReader state (`acc`, `fill`, `pos`) stays
+in registers across the whole slice. The 8-bit path additionally
+short-circuits the primary-table-only case (`max_len ≤ 12`) so the
+two-level dispatch + `secondary` indirection vanishes from the hot
+loop on every native 8-bit FOURCC.
+
+Numbers below are cumulative on top of optimization #1 (i.e. they
+compare to the round-3 baseline, not to opt-1-only).
+
+| Scenario                          | Baseline | After 1+2 | Δ        |
+| --------------------------------- | -------: | --------: | -------: |
+| dec M8RG / gradient / 1280×720    | 20.09 ms | 16.73 ms  | -16.7 % |
+| dec M8Y0 / gradient / 1280×720    |  9.92 ms |  8.19 ms  | -17.4 % |
+| dec M8G0 / left   / 1920×1080     | 13.12 ms | 11.54 ms  | -12.0 % |
+| dec M0RG / gradient / 1280×720    | 19.62 ms | 17.82 ms  |  -9.2 % |
+| dec M8RG / median   / 256×256     |  1.46 ms |  1.34 ms  |  -8.2 % |
+
 ## Known follow-ups (not part of this round)
 
 - Encoder Huffman tree builder (`encoder::canonical_huffman_lengths` →

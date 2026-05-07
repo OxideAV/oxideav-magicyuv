@@ -300,7 +300,7 @@ impl HuffmanTable {
     /// `[0, N)`. The caller is expected to keep the symbol count
     /// equal to plane-height-of-slice × plane-width per `spec/05`
     /// §3.3 and stop reading at exactly that count.
-    #[inline]
+    #[inline(always)]
     pub fn decode(&self, br: &mut BitReader<'_>) -> u32 {
         if self.max_len == 0 {
             return 0;
@@ -320,6 +320,63 @@ impl HuffmanTable {
             br.consume(l_in_sub as u32);
             sym
         }
+    }
+
+    /// Decode `out.len()` symbols into `out` as `u8`. Hot-path helper
+    /// for the 8-bit decoder loop — folds peek/consume + table lookup
+    /// inline so the compiler keeps the BitReader state (`acc`, `fill`,
+    /// `pos`) in registers across iterations.
+    ///
+    /// Returns early with `false` if `max_len == 0` (degenerate
+    /// all-unused descriptor — no progress can be made; the caller
+    /// has already validated this case is unreachable). The 8-bit
+    /// alphabet always has `max_len ≤ 12 = PRIMARY_BITS`, so the
+    /// secondary table is empty and this loop only takes the
+    /// single-level fast path.
+    #[inline]
+    pub fn decode_into_u8(&self, br: &mut BitReader<'_>, out: &mut [u8]) -> bool {
+        if self.max_len == 0 {
+            return false;
+        }
+        let primary_bits = self.primary_bits as u32;
+        let primary = self.primary.as_slice();
+        // 8-bit FOURCCs always have max_len ≤ 12 → single-level.
+        // 10/12/14-bit alphabets go through the generic `decode` path
+        // below; they still benefit from the `#[inline(always)]` on
+        // `decode` itself.
+        if self.max_len <= self.primary_bits {
+            for px in out.iter_mut() {
+                let key = br.peek_bits(primary_bits) as usize;
+                // SAFETY-equivalent: `primary.len() == 1 << primary_bits`,
+                // and `key` is masked to `primary_bits` bits, so
+                // `primary[key]` is always in-range. We write it as a
+                // bounds-checked index but the optimiser elides the
+                // check in practice.
+                let (sym, len) = primary[key];
+                br.consume(len as u32);
+                *px = sym as u8;
+            }
+        } else {
+            for px in out.iter_mut() {
+                *px = self.decode(br) as u8;
+            }
+        }
+        true
+    }
+
+    /// Decode `out.len()` symbols into `out` as `u16`, mask-ANDing each
+    /// to `mask`. Mirrors [`Self::decode_into_u8`] for the 10/12/14-bit
+    /// path, where `max_len` may exceed `PRIMARY_BITS = 12` and so the
+    /// two-level lookup runs.
+    #[inline]
+    pub fn decode_into_u16(&self, br: &mut BitReader<'_>, out: &mut [u16], mask: u16) -> bool {
+        if self.max_len == 0 {
+            return false;
+        }
+        for px in out.iter_mut() {
+            *px = (self.decode(br) as u16) & mask;
+        }
+        true
     }
 
     /// Borrow the per-symbol length array (debug / cross-validation).
