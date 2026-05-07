@@ -44,6 +44,13 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   index `c` is provably `< width = slice.len()`), nearly halving
   decoder wall-time on every native FOURCC. The arithmetic — Left,
   Gradient, modular-Median, JPEG-LS-Median — is byte-identical.
+- `encoder::encode_predictor_u{8,16}` mirror the decoder's row-pair
+  `split_at_mut` shape so the encoder side picks up the same bounds-
+  check elimination. Encoder wall-time drops 3-7 % on Gradient /
+  10-bit; the encoder hot-path moves to the bit-writer + Huffman
+  tree builder.
+- `bitreader::BitReader::peek_bits` becomes `#[inline(always)]` so the
+  Huffman batch decoder body stays a flat tight loop after inlining.
 
 ## [0.0.3](https://github.com/OxideAV/oxideav-magicyuv/compare/v0.0.2...v0.0.3) - 2026-05-06
 

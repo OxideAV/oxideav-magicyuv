@@ -43,7 +43,7 @@ impl<'a> BitReader<'a> {
 
     /// Top `n` bits of the accumulator as the low `n` bits of a u32.
     /// `n` must be ≤ 32.
-    #[inline]
+    #[inline(always)]
     pub fn peek_bits(&self, n: u32) -> u32 {
         debug_assert!(n <= 32);
         if n == 0 {

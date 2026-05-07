@@ -339,6 +339,7 @@ impl HuffmanTable {
             return false;
         }
         let primary_bits = self.primary_bits as u32;
+        // Snapshot the primary table; its length is `1 << primary_bits`.
         let primary = self.primary.as_slice();
         // 8-bit FOURCCs always have max_len ≤ 12 → single-level.
         // 10/12/14-bit alphabets go through the generic `decode` path
@@ -347,11 +348,6 @@ impl HuffmanTable {
         if self.max_len <= self.primary_bits {
             for px in out.iter_mut() {
                 let key = br.peek_bits(primary_bits) as usize;
-                // SAFETY-equivalent: `primary.len() == 1 << primary_bits`,
-                // and `key` is masked to `primary_bits` bits, so
-                // `primary[key]` is always in-range. We write it as a
-                // bounds-checked index but the optimiser elides the
-                // check in practice.
                 let (sym, len) = primary[key];
                 br.consume(len as u32);
                 *px = sym as u8;

@@ -368,52 +368,62 @@ fn encode_predictor_u8(
     }
     let fs = field_stride.0 as usize;
     let header_rows = fs.min(rows);
+    // Round-3 perf: same row-pair `split_at_mut` shape as the
+    // decoder's `predict::apply_u8_with_stride` — let LLVM elide the
+    // bounds check on every `cur[c]` / `prev[c]` access. Iterate
+    // bottom-up because each row's residual depends on the
+    // already-still-pixel-valued previous row.
     match kind {
         PredictorKind::Left => {
             for r in (0..rows).rev() {
-                let row_off = r * width;
-                for c in (1..width).rev() {
-                    data[row_off + c] = data[row_off + c].wrapping_sub(data[row_off + c - 1]);
-                }
                 if r >= header_rows {
-                    let prev0 = data[(r - fs) * width];
-                    data[row_off] = data[row_off].wrapping_sub(prev0);
+                    let (head, tail) = data.split_at_mut(r * width);
+                    let prev = &head[(r - fs) * width..(r - fs) * width + width];
+                    let cur = &mut tail[..width];
+                    for c in (1..width).rev() {
+                        cur[c] = cur[c].wrapping_sub(cur[c - 1]);
+                    }
+                    cur[0] = cur[0].wrapping_sub(prev[0]);
+                } else {
+                    let cur = &mut data[r * width..(r + 1) * width];
+                    for c in (1..width).rev() {
+                        cur[c] = cur[c].wrapping_sub(cur[c - 1]);
+                    }
                 }
             }
         }
         PredictorKind::Gradient => {
             for r in (0..rows).rev() {
-                let row_off = r * width;
-                if r < header_rows {
+                if r >= header_rows {
+                    let (head, tail) = data.split_at_mut(r * width);
+                    let prev = &head[(r - fs) * width..(r - fs) * width + width];
+                    let cur = &mut tail[..width];
                     for c in (1..width).rev() {
-                        data[row_off + c] = data[row_off + c].wrapping_sub(data[row_off + c - 1]);
-                    }
-                } else {
-                    let prev_off = (r - fs) * width;
-                    for c in (1..width).rev() {
-                        let left = data[row_off + c - 1];
-                        let top = data[prev_off + c];
-                        let top_left = data[prev_off + c - 1];
+                        let left = cur[c - 1];
+                        let top = prev[c];
+                        let top_left = prev[c - 1];
                         let pred = left.wrapping_add(top).wrapping_sub(top_left);
-                        data[row_off + c] = data[row_off + c].wrapping_sub(pred);
+                        cur[c] = cur[c].wrapping_sub(pred);
                     }
-                    data[row_off] = data[row_off].wrapping_sub(data[prev_off]);
+                    cur[0] = cur[0].wrapping_sub(prev[0]);
+                } else {
+                    let cur = &mut data[r * width..(r + 1) * width];
+                    for c in (1..width).rev() {
+                        cur[c] = cur[c].wrapping_sub(cur[c - 1]);
+                    }
                 }
             }
         }
         PredictorKind::Median => {
             for r in (0..rows).rev() {
-                let row_off = r * width;
-                if r < header_rows {
+                if r >= header_rows {
+                    let (head, tail) = data.split_at_mut(r * width);
+                    let prev = &head[(r - fs) * width..(r - fs) * width + width];
+                    let cur = &mut tail[..width];
                     for c in (1..width).rev() {
-                        data[row_off + c] = data[row_off + c].wrapping_sub(data[row_off + c - 1]);
-                    }
-                } else {
-                    let prev_off = (r - fs) * width;
-                    for c in (1..width).rev() {
-                        let left = data[row_off + c - 1];
-                        let top = data[prev_off + c];
-                        let top_left = data[prev_off + c - 1];
+                        let left = cur[c - 1];
+                        let top = prev[c];
+                        let top_left = prev[c - 1];
                         let gradient = left.wrapping_add(top).wrapping_sub(top_left);
                         let lo = left.min(top);
                         let hi = left.max(top);
@@ -424,9 +434,14 @@ fn encode_predictor_u8(
                         } else {
                             gradient
                         };
-                        data[row_off + c] = data[row_off + c].wrapping_sub(pred);
+                        cur[c] = cur[c].wrapping_sub(pred);
                     }
-                    data[row_off] = data[row_off].wrapping_sub(data[prev_off]);
+                    cur[0] = cur[0].wrapping_sub(prev[0]);
+                } else {
+                    let cur = &mut data[r * width..(r + 1) * width];
+                    for c in (1..width).rev() {
+                        cur[c] = cur[c].wrapping_sub(cur[c - 1]);
+                    }
                 }
             }
         }
@@ -615,55 +630,58 @@ fn encode_predictor_u16(
     }
     let fs = field_stride.0 as usize;
     let header_rows = fs.min(rows);
+    // See `encode_predictor_u8` for the row-pair split rationale.
     match kind {
         PredictorKind::Left => {
             for r in (0..rows).rev() {
-                let row_off = r * width;
-                for c in (1..width).rev() {
-                    data[row_off + c] =
-                        (data[row_off + c].wrapping_sub(data[row_off + c - 1])) & mask;
-                }
                 if r >= header_rows {
-                    let prev0 = data[(r - fs) * width];
-                    data[row_off] = (data[row_off].wrapping_sub(prev0)) & mask;
+                    let (head, tail) = data.split_at_mut(r * width);
+                    let prev = &head[(r - fs) * width..(r - fs) * width + width];
+                    let cur = &mut tail[..width];
+                    for c in (1..width).rev() {
+                        cur[c] = cur[c].wrapping_sub(cur[c - 1]) & mask;
+                    }
+                    cur[0] = cur[0].wrapping_sub(prev[0]) & mask;
+                } else {
+                    let cur = &mut data[r * width..(r + 1) * width];
+                    for c in (1..width).rev() {
+                        cur[c] = cur[c].wrapping_sub(cur[c - 1]) & mask;
+                    }
                 }
             }
         }
         PredictorKind::Gradient => {
             for r in (0..rows).rev() {
-                let row_off = r * width;
-                if r < header_rows {
+                if r >= header_rows {
+                    let (head, tail) = data.split_at_mut(r * width);
+                    let prev = &head[(r - fs) * width..(r - fs) * width + width];
+                    let cur = &mut tail[..width];
                     for c in (1..width).rev() {
-                        data[row_off + c] =
-                            (data[row_off + c].wrapping_sub(data[row_off + c - 1])) & mask;
-                    }
-                } else {
-                    let prev_off = (r - fs) * width;
-                    for c in (1..width).rev() {
-                        let left = data[row_off + c - 1];
-                        let top = data[prev_off + c];
-                        let top_left = data[prev_off + c - 1];
+                        let left = cur[c - 1];
+                        let top = prev[c];
+                        let top_left = prev[c - 1];
                         let pred = left.wrapping_add(top).wrapping_sub(top_left);
-                        data[row_off + c] = (data[row_off + c].wrapping_sub(pred)) & mask;
+                        cur[c] = cur[c].wrapping_sub(pred) & mask;
                     }
-                    data[row_off] = (data[row_off].wrapping_sub(data[prev_off])) & mask;
+                    cur[0] = cur[0].wrapping_sub(prev[0]) & mask;
+                } else {
+                    let cur = &mut data[r * width..(r + 1) * width];
+                    for c in (1..width).rev() {
+                        cur[c] = cur[c].wrapping_sub(cur[c - 1]) & mask;
+                    }
                 }
             }
         }
         PredictorKind::Median => {
             for r in (0..rows).rev() {
-                let row_off = r * width;
-                if r < header_rows {
+                if r >= header_rows {
+                    let (head, tail) = data.split_at_mut(r * width);
+                    let prev = &head[(r - fs) * width..(r - fs) * width + width];
+                    let cur = &mut tail[..width];
                     for c in (1..width).rev() {
-                        data[row_off + c] =
-                            (data[row_off + c].wrapping_sub(data[row_off + c - 1])) & mask;
-                    }
-                } else {
-                    let prev_off = (r - fs) * width;
-                    for c in (1..width).rev() {
-                        let left = data[row_off + c - 1];
-                        let top = data[prev_off + c];
-                        let top_left = data[prev_off + c - 1];
+                        let left = cur[c - 1];
+                        let top = prev[c];
+                        let top_left = prev[c - 1];
                         // Standard JPEG-LS Median (10/12/14-bit).
                         let lo = left.min(top);
                         let hi = left.max(top);
@@ -677,9 +695,14 @@ fn encode_predictor_u16(
                                 .wrapping_sub(top_left as i32);
                             (r32 as u16) & mask
                         };
-                        data[row_off + c] = (data[row_off + c].wrapping_sub(pred)) & mask;
+                        cur[c] = cur[c].wrapping_sub(pred) & mask;
                     }
-                    data[row_off] = (data[row_off].wrapping_sub(data[prev_off])) & mask;
+                    cur[0] = cur[0].wrapping_sub(prev[0]) & mask;
+                } else {
+                    let cur = &mut data[r * width..(r + 1) * width];
+                    for c in (1..width).rev() {
+                        cur[c] = cur[c].wrapping_sub(cur[c - 1]) & mask;
+                    }
                 }
             }
         }

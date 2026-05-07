@@ -95,6 +95,26 @@ Cumulative on top of opt 1+2 (compared to round-3 baseline):
 | dec M0RG / gradient / 1280×720    | 19.62 ms  |   11.14 ms  | -43.2 % |
 | dec M8RG / median   / 256×256     |  1.46 ms  |    0.84 ms  | -42.5 % |
 
+### 4. Encoder predictor row-pair + `peek_bits` inline-always
+
+Mirrors opt 3 on the encoder side (`encode_predictor_u{8,16}` use
+the same `split_at_mut` shape). Also marks
+`bitreader::BitReader::peek_bits` `#[inline(always)]` so the
+Huffman batch decoder body stays a flat tight loop after inlining.
+
+| Scenario                          | Baseline  | After 1-4 | Δ        |
+| --------------------------------- | --------: | --------: | -------: |
+| enc M8RG / gradient / 1280×720    | 20.65 ms  | 19.14 ms  |  -7.3 % |
+| enc M8Y0 / gradient / 1280×720    | 11.79 ms  | 11.19 ms  |  -5.1 % |
+| enc M8G0 / left   / 1920×1080     | 14.41 ms  | 14.37 ms  |  -0.3 % |
+| enc M0RG / gradient / 1280×720    | 26.87 ms  | 25.94 ms  |  -3.5 % |
+
+Decoder figures are unchanged from opt 3; the encoder picks up
+3-7 % on the predictor-bound scenarios. The remaining encoder cost
+is dominated by the per-bit `BitWriter::write` + `canonical_huffman_lengths`
+heap-build, which are deferred to the next round (see "Round-N+1
+candidates" below).
+
 ## Known follow-ups (not part of this round)
 
 - Encoder Huffman tree builder (`encoder::canonical_huffman_lengths` →
