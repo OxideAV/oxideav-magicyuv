@@ -77,6 +77,24 @@ compare to the round-3 baseline, not to opt-1-only).
 | dec M0RG / gradient / 1280×720    | 19.62 ms | 17.82 ms  |  -9.2 % |
 | dec M8RG / median   / 256×256     |  1.46 ms |  1.34 ms  |  -8.2 % |
 
+### 3. Predictor inner loops via `split_at_mut` row pair
+
+`apply_u{8,16}_with_stride` now splits `data` into the previous-row
+`&[u_]` slice and the current-row `&mut [u_]` slice once per row. The
+optimiser can then elide the bounds check on every `cur[c]` /
+`prev[c]` access in the c-loop — `c` is provably `< width =
+slice.len()`. Same arithmetic, same observable output.
+
+Cumulative on top of opt 1+2 (compared to round-3 baseline):
+
+| Scenario                          | Baseline  | After 1+2+3 | Δ        |
+| --------------------------------- | --------: | ----------: | -------: |
+| dec M8RG / gradient / 1280×720    | 20.09 ms  |   10.97 ms  | -45.4 % |
+| dec M8Y0 / gradient / 1280×720    |  9.92 ms  |    4.85 ms  | -51.1 % |
+| dec M8G0 / left   / 1920×1080     | 13.12 ms  |    6.82 ms  | -48.0 % |
+| dec M0RG / gradient / 1280×720    | 19.62 ms  |   11.14 ms  | -43.2 % |
+| dec M8RG / median   / 256×256     |  1.46 ms  |    0.84 ms  | -42.5 % |
+
 ## Known follow-ups (not part of this round)
 
 - Encoder Huffman tree builder (`encoder::canonical_huffman_lengths` →

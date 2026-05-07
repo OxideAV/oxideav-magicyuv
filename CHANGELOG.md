@@ -36,6 +36,14 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the two-level dispatch entirely. The decoder's two slice loops
   (`decoder::decode_eight_bit`, `decoder::decode_high_bit_depth`)
   call the batch helper instead of the per-pixel `decode`.
+- `predict::apply_u{8,16}_with_stride` inner loops use
+  `data.split_at_mut(r * width)` once per row to expose the previous
+  row as an immutable `&[u8]` / `&[u16]` slice and the current row as
+  a mutable `&mut [u8]` / `&mut [u16]` of fixed length `width`.
+  This lets the optimiser elide per-element bounds checks (the
+  index `c` is provably `< width = slice.len()`), nearly halving
+  decoder wall-time on every native FOURCC. The arithmetic — Left,
+  Gradient, modular-Median, JPEG-LS-Median — is byte-identical.
 
 ## [0.0.3](https://github.com/OxideAV/oxideav-magicyuv/compare/v0.0.2...v0.0.3) - 2026-05-06
 
