@@ -142,13 +142,29 @@ Encoder figures (cumulative, vs round-3 baseline):
 | M0RG / gradient / 1280×720 / 10-bit  |  -41.3 % |  -39.1 % |
 | M8RG / median   / 256×256            |  -39.7 % |    n/a   |
 
-## Known follow-ups (not part of this round)
+## Round-N+1 candidates
 
-- Encoder Huffman tree builder (`encoder::canonical_huffman_lengths` →
-  `enforce_length_cap`) has degenerate behaviour on highly-skewed
-  histograms (e.g. Median predictor at ≥ 1024×1024 with smooth-gradient
-  inputs). Symptoms: per-frame encode wall-time blows up from low
-  milliseconds to many minutes. The decoder is unaffected; the spec-
-  compliant streams produced by Gradient/Left at the same sizes decode
-  identically. Fix is encoder-side (length-cap algorithm + length-limited
-  Package-Merge), tracked separately.
+- **Encoder `canonical_huffman_lengths` → `enforce_length_cap`** —
+  has degenerate behaviour on highly-skewed histograms (e.g. Median
+  predictor at ≥ 1024×1024 with smooth-gradient inputs). Per-frame
+  encode wall-time blows up from low ms to many minutes. The decoder
+  is unaffected; spec-compliant streams produced by Gradient/Left at
+  the same sizes decode identically. Fix needs the length-limited
+  Package-Merge algorithm.
+- **Decoder primary-table layout** — `Vec<(u32, u8)>` packs each
+  entry into 8 bytes (5 used, 3 padding). Switching to
+  `Vec<u16>` (6 bits length, 10 bits symbol — fits 8-bit alphabet)
+  halves the working-set and may move the table into L1 hot for
+  smaller frames.
+- **Predictor SIMD (Left only)** — Left has the simplest dependency
+  chain (only `cur[c-1]`); a `wrapping_add` prefix-scan over u8x16
+  using `core::simd` could give another 2-3× on Gray (Left at
+  1080p is the simplest predictor in our coverage).
+- **`vec![0u8; w*h]` per decode** — every `decode_frame` call
+  allocates fresh plane buffers. A `decode_into(&mut DecodedFrame)`
+  variant that re-uses caller-owned `Vec`s would avoid the per-frame
+  malloc on streaming scenarios.
+- **`HuffmanTable::build`** itself is on the cold path but takes
+  ~2-5 % of `decode_frame` for small frames (256×256 / smaller). A
+  one-shot `(symbol, length, code)` construction that skips the
+  intermediate `code` and `start` Vecs would help that quantile.
