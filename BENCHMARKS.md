@@ -142,6 +142,14 @@ Encoder figures (cumulative, vs round-3 baseline):
 | M0RG / gradient / 1280×720 / 10-bit  |  -41.3 % |  -39.1 % |
 | M8RG / median   / 256×256            |  -39.7 % |    n/a   |
 
+## Trace-feature lockstep
+
+The `--features trace` JSONL emitter is bit-identical before and
+after this round (verified by MD5 of the tape on a 32×16 M8RG
+gradient frame: `5744c8060e6a3bccd53e1abf05ad6846` on both
+`f8624ad` baseline and `d98b090` post-opt-5). All 56 tests pass
+under `--features trace`.
+
 ## Round-N+1 candidates
 
 - **Encoder `canonical_huffman_lengths` → `enforce_length_cap`** —
