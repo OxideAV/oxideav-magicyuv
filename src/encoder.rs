@@ -320,9 +320,18 @@ fn encode_descriptor(lengths: &[u8]) -> Vec<u8> {
 }
 
 /// MSB-first bit writer (mirrors decoder's BitReader).
+///
+/// Round-3 perf: keeps a 64-bit accumulator with the next-to-emit
+/// bits at the high end. Each `write(code, len)` shifts the code
+/// into the empty low bits of the accumulator; whenever ≥ 8 bits
+/// fill the high end we drain whole bytes (the typical Huffman
+/// case at 8-bit gives `len ≤ 12`, so 1-2 bytes drain per call).
+/// Same observable byte stream as the per-bit loop, but with the
+/// inner `for i in (0..len).rev()` replaced by a couple of shifts.
 pub(crate) struct BitWriter {
     bytes: Vec<u8>,
-    cur: u8,
+    /// Bit accumulator; valid bits are the high `bits_used` bits.
+    acc: u64,
     bits_used: u32,
 }
 
@@ -330,25 +339,43 @@ impl BitWriter {
     pub(crate) fn new() -> Self {
         Self {
             bytes: Vec::new(),
-            cur: 0,
+            acc: 0,
             bits_used: 0,
         }
     }
+    /// Append `len` bits (low-aligned in `code`, MSB-first on the wire)
+    /// to the bitstream. `len ≤ 32`. Caller must ensure
+    /// `code < (1 << len)` (not asserted in release).
+    #[inline(always)]
     pub(crate) fn write(&mut self, code: u32, len: u8) {
-        for i in (0..len).rev() {
-            let bit = ((code >> i) & 1) as u8;
-            self.cur |= bit << (7 - self.bits_used);
-            self.bits_used += 1;
-            if self.bits_used == 8 {
-                self.bytes.push(self.cur);
-                self.cur = 0;
-                self.bits_used = 0;
-            }
+        if len == 0 {
+            return;
+        }
+        debug_assert!(len <= 32);
+        debug_assert!(self.bits_used <= 32);
+        // Place `code` so its top bit lines up at acc[63 - bits_used].
+        // Shift amount is `64 - bits_used - len`, which is in [0, 64].
+        // (When `bits_used + len == 64` we fully fill the accumulator
+        // and must drain immediately; a shift by 0 is the no-op case.)
+        let shift = 64 - self.bits_used - (len as u32);
+        self.acc |= (code as u64) << shift;
+        self.bits_used += len as u32;
+        // Drain whole bytes from the high end while we have ≥ 8.
+        while self.bits_used >= 8 {
+            let byte = (self.acc >> 56) as u8;
+            self.bytes.push(byte);
+            self.acc <<= 8;
+            self.bits_used -= 8;
         }
     }
     pub(crate) fn finish(mut self) -> Vec<u8> {
         if self.bits_used > 0 {
-            self.bytes.push(self.cur);
+            // `bits_used` is in [1, 7] here; the remaining bits are
+            // the high `bits_used` bits of `acc`. Same MSB-first
+            // wire convention as the per-bit code: shift down by 56
+            // so they land in the low byte's top bits.
+            let byte = (self.acc >> 56) as u8;
+            self.bytes.push(byte);
         }
         self.bytes
     }

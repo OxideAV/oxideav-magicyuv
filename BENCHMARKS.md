@@ -115,6 +115,33 @@ is dominated by the per-bit `BitWriter::write` + `canonical_huffman_lengths`
 heap-build, which are deferred to the next round (see "Round-N+1
 candidates" below).
 
+### 5. `BitWriter` 64-bit accumulator with whole-byte drain
+
+The encoder's `BitWriter::write(code, len)` was a `for i in
+(0..len).rev() { … }` per-bit loop. Replaces it with a single
+shift + OR into a 64-bit accumulator, then drains whole bytes
+while the accumulator holds ≥ 8 bits. Same observable byte stream
+(verified by the 53 unit tests + the encode→decode round-trip).
+
+Encoder figures (cumulative, vs round-3 baseline):
+
+| Scenario                          | Baseline  | After 1-5 | Δ        |
+| --------------------------------- | --------: | --------: | -------: |
+| enc M8RG / gradient / 1280×720    | 20.65 ms  | 11.73 ms  | -43.2 % |
+| enc M8Y0 / gradient / 1280×720    | 11.79 ms  |  6.76 ms  | -42.7 % |
+| enc M8G0 / left   / 1920×1080     | 14.41 ms  |  8.11 ms  | -43.7 % |
+| enc M0RG / gradient / 1280×720    | 26.87 ms  | 16.37 ms  | -39.1 % |
+
+## Final cumulative deltas
+
+| Scenario                             | Decode Δ | Encode Δ |
+| ------------------------------------ | -------: | -------: |
+| M8RG / gradient / 1280×720           |  -42.2 % |  -43.2 % |
+| M8Y0 / gradient / 1280×720           |  -47.4 % |  -42.7 % |
+| M8G0 / left   / 1920×1080            |  -44.4 % |  -43.7 % |
+| M0RG / gradient / 1280×720 / 10-bit  |  -41.3 % |  -39.1 % |
+| M8RG / median   / 256×256            |  -39.7 % |    n/a   |
+
 ## Known follow-ups (not part of this round)
 
 - Encoder Huffman tree builder (`encoder::canonical_huffman_lengths` →

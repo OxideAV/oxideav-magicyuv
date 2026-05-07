@@ -51,6 +51,12 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   tree builder.
 - `bitreader::BitReader::peek_bits` becomes `#[inline(always)]` so the
   Huffman batch decoder body stays a flat tight loop after inlining.
+- `encoder::BitWriter::write` rewritten to use a 64-bit accumulator
+  with a whole-byte drain. Replaces the `for i in (0..len).rev()`
+  per-bit loop with a single shift + OR. Drains 1-2 whole bytes per
+  call on typical Huffman alphabets. Identical observable byte
+  stream (verified by the 53 unit tests + the encode→decode
+  round-trip suite).
 
 ## [0.0.3](https://github.com/OxideAV/oxideav-magicyuv/compare/v0.0.2...v0.0.3) - 2026-05-06
 
