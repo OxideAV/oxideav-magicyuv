@@ -6,6 +6,19 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/OxideAV/oxideav-magicyuv/compare/v0.0.3...v0.0.4) - 2026-05-07
+
+### Other
+
+- note trace lockstep MD5 unchanged
+- round-N+1 candidates list
+- u64-accumulator BitWriter, whole-byte drain
+- encoder + bitreader: row-pair predictor split + peek_bits inline-always
+- row-pair split_at_mut for bounds-check elimination
+- batch decode_into_u{8,16} for the slice hot loop
+- 8-byte fast-path refill for the Huffman hot loop
+- add criterion harness + baseline doc
+
 ### Added
 
 - Criterion bench harness (`benches/decode.rs`, `benches/encode.rs`,
