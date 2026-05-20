@@ -72,9 +72,8 @@ fn run_encode(format_byte: u8, width: u32, height: u32, predictor: PredictorKind
     let rec = tables::lookup(format_byte).expect("FOURCC in CSV");
     let planes = make_planes(rec, width, height);
     let opts = EncodeOptions {
-        predictor,
         mode: SliceMode::Huffman,
-        interlaced: false,
+        ..EncodeOptions::fixed(predictor)
     };
     let _ = encode_frame(rec, width, height, 28, planes, opts).expect("encode");
 }

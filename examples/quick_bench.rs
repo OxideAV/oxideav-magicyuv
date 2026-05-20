@@ -73,9 +73,8 @@ fn time_decode(name: &str, format_byte: u8, w: u32, h: u32, predictor: Predictor
     let rec = tables::lookup(format_byte).unwrap();
     let planes = make_planes(rec, w, h);
     let opts = EncodeOptions {
-        predictor,
         mode: SliceMode::Huffman,
-        interlaced: false,
+        ..EncodeOptions::fixed(predictor)
     };
     let t_enc = Instant::now();
     let frame = encode_frame(rec, w, h, 28, planes, opts).unwrap();
@@ -104,9 +103,8 @@ fn time_encode(name: &str, format_byte: u8, w: u32, h: u32, predictor: Predictor
     std::io::stdout().flush().ok();
     let rec = tables::lookup(format_byte).unwrap();
     let opts = EncodeOptions {
-        predictor,
         mode: SliceMode::Huffman,
-        interlaced: false,
+        ..EncodeOptions::fixed(predictor)
     };
     let _ = encode_frame(rec, w, h, 28, make_planes(rec, w, h), opts).unwrap();
 

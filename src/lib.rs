@@ -71,7 +71,7 @@ pub(crate) mod trace;
 pub use crate::decoder::{decode_frame, DecodedFrame, DecodedPlane, Samples};
 #[cfg(feature = "registry")]
 pub use crate::encoder::output_params;
-pub use crate::encoder::{encode_frame, EncodeOptions, PlaneInput, SliceMode};
+pub use crate::encoder::{encode_frame, EncodeOptions, PlaneInput, PredictorStrategy, SliceMode};
 pub use crate::error::{Error, Result};
 
 // Framework integration — only when the `registry` feature is on.

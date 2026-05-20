@@ -1,10 +1,6 @@
 //! Public MagicYUV v7 frame encoder.
 //!
-//! This is a **clean-room** encoder written from `spec/01..05`. It
-//! does NOT chase the proprietary v2.4.2 encoder's exact byte output
-//! (notably its "Dynamic" predictor strategy and its byte-budget raw
-//! fallback heuristic) — those are encoder-side conventions, not
-//! wire-format requirements.  What it does guarantee is that every
+//! This is a **clean-room** encoder written from `spec/01..05`. Every
 //! emitted frame is a well-formed v7 stream that round-trips through
 //! [`crate::decode_frame`] byte-for-byte.
 //!
@@ -19,7 +15,21 @@
 //!   cumulative algorithm of spec/05 §2.0 — same algorithm the
 //!   decoder uses, so the resulting (sym, code, length) triples are
 //!   self-consistent.
-//! - One predictor per slice (caller picks Left / Gradient / Median).
+//! - Per-slice predictor selection. Caller picks one of:
+//!   - **Fixed** Left / Gradient / Median (spec/04 §1.2, §4).
+//!   - **Dynamic** (spec/04 §3): the encoder evaluates all three
+//!     predictors per slice, sums absolute (signed) residuals, and
+//!     writes the minimiser into the slice's `predictor_id` byte. On
+//!     the wire `predictor_id ∈ {0x01, 0x02, 0x03}` only; `0x04` never
+//!     appears (spec/04 §3.1 and the v2.4.2 encoder dispatch evidence
+//!     at `magicyuv.dll!0x69b96970..0x69b96ac9`).
+//! - Per-slice Huffman / Raw mode selection. Caller picks one of:
+//!   - **Huffman** (`slice_flags = 0x00`) — always Huffman.
+//!   - **Raw** (`slice_flags = 0x01`) — always raw.
+//!   - **Auto** (spec/05 §6.2): the encoder compares each slice's
+//!     Huffman size to its raw size (`(pixels * bits + 7) / 8` per
+//!     spec/05 §4.1) and picks the smaller, emitting `slice_flags`
+//!     `0x00` or `0x01` per slice.
 //! - Huffman OR raw-mode payloads. Raw mode at 8-bit is byte-per-
 //!   sample; at 10/12/14-bit it is bit-packed at `bits` bits per
 //!   sample (`spec/05` §4.1).
@@ -27,41 +37,111 @@
 //!   family is RGB / RGBA per spec/03 §4 audit-corrected note.
 //! - Interlaced field-stride=2 prediction per spec/04 §5.1.
 //!
-//! Out of scope: the proprietary "Dynamic" strategy (a strict
-//! min-residual-sum picker), byte-budget raw-fallback heuristics,
-//! cross-plane optimisations.  The caller passes the predictor and
-//! mode explicitly.
+//! Out of scope: cross-plane optimisations and the proprietary
+//! v2.4.2 encoder's exact byte-for-byte output (e.g. the residual-
+//! evaluation cost function may differ in the byte count it rounds
+//! against — the spec only fixes "minimum residual sum" as the
+//! selection criterion, not which norm). What is guaranteed is
+//! spec-conformance: Dynamic emits per-slice `predictor_id ∈ {1,2,3}`
+//! by minimum residual; Auto emits per-slice `slice_flags ∈ {0,1}` by
+//! smaller-payload comparison; both produce frames the decoder
+//! round-trips byte-for-byte.
 
 use crate::error::{Error, Result};
 use crate::header::{FLAG_INTERLACED, HEADER_SIZE, MAGY_MAGIC};
 use crate::predict::FieldStride;
 use crate::tables::{Family, FourccRecord, PredictorKind};
 
-/// Per-slice mode the encoder offers.
+/// Per-slice Huffman / raw mode the encoder offers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SliceMode {
-    /// Huffman-coded residuals (`slice_flags = 0x00`).
+    /// Huffman-coded residuals (`slice_flags = 0x00`) for every slice.
     Huffman,
-    /// Raw post-prediction residuals (`slice_flags = 0x01`).
+    /// Raw post-prediction residuals (`slice_flags = 0x01`) for every slice.
     Raw,
+    /// **Auto** per-slice Huffman / raw selection (spec/05 §6.2).
+    ///
+    /// The encoder builds the per-plane Huffman table once (from the
+    /// residual histogram across every slice of the plane), then for
+    /// each slice independently chooses whichever of
+    /// `(huffman_size, raw_size)` is smaller, writing the corresponding
+    /// `slice_flags` byte (`0x00` or `0x01`). The raw size is
+    /// `(slice_pixels * bits + 7) / 8` per spec/05 §4.1 (1 byte per
+    /// sample at 8-bit; bit-packed at 10/12/14-bit). The proprietary
+    /// v2.4.2 encoder uses the same per-slice fallback (its `Adaptive
+    /// coding` toggle became always-on in v1.2 per spec/05 §6).
+    Auto,
+}
+
+/// Per-slice predictor strategy the encoder offers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PredictorStrategy {
+    /// Use the named predictor on every slice
+    /// (spec/04 §1.2 — fixed `predictor_id`).
+    Fixed(PredictorKind),
+    /// **Dynamic** per-slice predictor selection (spec/04 §3).
+    ///
+    /// For each slice the encoder evaluates all three predictors
+    /// (Left, Gradient, Median), sums the residuals per the spec's
+    /// "smallest residual sum" criterion (here: sum of absolute
+    /// signed residuals, which is monotone with subsequent Huffman
+    /// cost), and writes whichever predictor minimised the sum into
+    /// that slice's `predictor_id` byte. On the wire,
+    /// `predictor_id ∈ {0x01, 0x02, 0x03}` — `0x04` never appears
+    /// (spec/04 §3.1, §7 open-question 5).
+    Dynamic,
 }
 
 /// High-level encode options.
 #[derive(Debug, Clone, Copy)]
 pub struct EncodeOptions {
-    pub predictor: PredictorKind,
+    /// Per-slice predictor strategy.
+    ///
+    /// Default: [`PredictorStrategy::Fixed`] [`PredictorKind::Gradient`]
+    /// (the v2.4.2 encoder's `CompMethod=2` setting per spec/04 §3.3).
+    pub strategy: PredictorStrategy,
+    /// Per-slice Huffman / raw mode.
     pub mode: SliceMode,
     /// Set the header `flags & FLAG_INTERLACED` bit and emit
     /// field-stride=2 prediction per `spec/04` §5.1.
     pub interlaced: bool,
+    /// **Deprecated, kept for source compatibility.** When `strategy`
+    /// is `Fixed(_)`, this field is ignored. Callers should set
+    /// `strategy = PredictorStrategy::Fixed(predictor)` instead.
+    pub predictor: PredictorKind,
 }
 
 impl Default for EncodeOptions {
     fn default() -> Self {
         Self {
-            predictor: PredictorKind::Gradient,
+            strategy: PredictorStrategy::Fixed(PredictorKind::Gradient),
             mode: SliceMode::Huffman,
             interlaced: false,
+            predictor: PredictorKind::Gradient,
+        }
+    }
+}
+
+impl EncodeOptions {
+    /// Helper: build an options value driving the Dynamic predictor
+    /// strategy + Auto Huffman/raw fallback — the spec/04 §3 + spec/05
+    /// §6.2 always-on adaptive combination.
+    pub fn dynamic_auto() -> Self {
+        Self {
+            strategy: PredictorStrategy::Dynamic,
+            mode: SliceMode::Auto,
+            interlaced: false,
+            predictor: PredictorKind::Gradient,
+        }
+    }
+
+    /// Helper: shorthand for `Fixed(p)` with the given predictor.
+    pub fn fixed(p: PredictorKind) -> Self {
+        Self {
+            strategy: PredictorStrategy::Fixed(p),
+            mode: SliceMode::Huffman,
+            interlaced: false,
+            predictor: p,
         }
     }
 }
@@ -536,8 +616,20 @@ fn encode_frame_u8(
         _ => planes,
     };
 
-    // Build per-plane residuals via predictor-encode.
+    // Per-slice predictor decision and residual production. Under
+    // `PredictorStrategy::Fixed(p)` every slice uses `p`; under
+    // `PredictorStrategy::Dynamic` the encoder evaluates all three
+    // predictors per slice and writes whichever produced the smallest
+    // residual sum (per spec/04 §3.1 algorithm).
+    //
+    // `plane_resid[p]` holds the concatenated residuals for every slice
+    // of plane `p` (in slice order), produced with that slice's chosen
+    // predictor. `slice_predictors[s]` records the predictor that wrote
+    // the residuals for global slice `s = plane * slices_per_plane +
+    // in_plane_idx`.
     let mut plane_resid: Vec<Vec<u8>> = Vec::with_capacity(num_planes);
+    let mut slice_predictors: Vec<PredictorKind> = vec![PredictorKind::Left; total_slices];
+    let strategy = options.strategy;
     for p in 0..num_planes {
         let (pw, ph, plane_slice_height) = plane_dims[p];
         let mut residuals: Vec<u8> = Vec::with_capacity(pw * ph);
@@ -546,8 +638,10 @@ fn encode_frame_u8(
             let row_start = s * plane_slice_height;
             let row_end = ((s + 1) * plane_slice_height).min(ph);
             let slice_rows = row_end - row_start;
-            let mut block: Vec<u8> = plane_data[row_start * pw..row_end * pw].to_vec();
-            encode_predictor_u8(options.predictor, &mut block, slice_rows, pw, field_stride);
+            let src = &plane_data[row_start * pw..row_end * pw];
+            let (chosen, block) =
+                build_slice_residuals_u8(strategy, src, slice_rows, pw, field_stride);
+            slice_predictors[p * slices_per_plane + s] = chosen;
             residuals.extend_from_slice(&block);
         }
         plane_resid.push(residuals);
@@ -569,7 +663,7 @@ fn encode_frame_u8(
         .collect();
 
     let mut slice_payloads: Vec<Vec<u8>> = Vec::with_capacity(total_slices);
-    for s in 0..total_slices {
+    for (s, &pred_kind) in slice_predictors.iter().enumerate() {
         let plane = s / slices_per_plane;
         let in_plane_idx = s % slices_per_plane;
         let (pw, ph, plane_slice_height) = plane_dims[plane];
@@ -578,25 +672,15 @@ fn encode_frame_u8(
         let _ = row_end;
 
         let res_block = &plane_resid[plane][row_start * pw..row_end * pw];
+        let pred_id: u8 = predictor_id_byte(pred_kind);
 
-        let mut payload = Vec::new();
+        // Choose per-slice Huffman vs raw flags.
+        let mut huff_buf: Option<Vec<u8>> = None;
+        let raw_size = res_block.len(); // 1 byte per sample at 8-bit
         let flags: u8 = match options.mode {
             SliceMode::Huffman => 0x00,
             SliceMode::Raw => 0x01,
-        };
-        let pred_id: u8 = match options.predictor {
-            PredictorKind::Left => 0x01,
-            PredictorKind::Gradient => 0x02,
-            PredictorKind::Median => 0x03,
-        };
-        payload.push(flags);
-        payload.push(pred_id);
-
-        match options.mode {
-            SliceMode::Raw => {
-                payload.extend_from_slice(res_block);
-            }
-            SliceMode::Huffman => {
+            SliceMode::Auto => {
                 let huff = &plane_huffs[plane];
                 let mut bw = BitWriter::new();
                 for &sym in res_block {
@@ -604,8 +688,33 @@ fn encode_frame_u8(
                     let code = huff.codes[sym as usize];
                     bw.write(code, len);
                 }
-                payload.extend(bw.finish());
+                let bytes = bw.finish();
+                if bytes.len() <= raw_size {
+                    huff_buf = Some(bytes);
+                    0x00
+                } else {
+                    0x01
+                }
             }
+        };
+
+        let mut payload = Vec::new();
+        payload.push(flags);
+        payload.push(pred_id);
+
+        if flags & 0x01 != 0 {
+            payload.extend_from_slice(res_block);
+        } else if let Some(buf) = huff_buf {
+            payload.extend(buf);
+        } else {
+            let huff = &plane_huffs[plane];
+            let mut bw = BitWriter::new();
+            for &sym in res_block {
+                let len = huff.lengths[sym as usize];
+                let code = huff.codes[sym as usize];
+                bw.write(code, len);
+            }
+            payload.extend(bw.finish());
         }
         slice_payloads.push(payload);
     }
@@ -621,6 +730,72 @@ fn encode_frame_u8(
         &plane_huffs,
         &slice_payloads,
     ))
+}
+
+fn predictor_id_byte(k: PredictorKind) -> u8 {
+    match k {
+        PredictorKind::Left => 0x01,
+        PredictorKind::Gradient => 0x02,
+        PredictorKind::Median => 0x03,
+    }
+}
+
+/// Compute the residual block for one slice of a `u8` plane, picking
+/// the predictor per `strategy`. Returns `(chosen_predictor, residuals)`.
+///
+/// For `Fixed(p)` we just apply `p`. For `Dynamic` we evaluate Left,
+/// Gradient, and Median, sum the absolute (signed) residual byte
+/// values, and pick the minimiser (ties broken by predictor-id
+/// ascending — i.e. Left, then Gradient, then Median — matching
+/// spec/04 §3.1's "lowest residual sum" criterion).
+fn build_slice_residuals_u8(
+    strategy: PredictorStrategy,
+    src: &[u8],
+    rows: usize,
+    width: usize,
+    field_stride: FieldStride,
+) -> (PredictorKind, Vec<u8>) {
+    match strategy {
+        PredictorStrategy::Fixed(p) => {
+            let mut block = src.to_vec();
+            encode_predictor_u8(p, &mut block, rows, width, field_stride);
+            (p, block)
+        }
+        PredictorStrategy::Dynamic => {
+            let mut best_kind = PredictorKind::Left;
+            let mut best_block: Vec<u8> = Vec::new();
+            let mut best_score: u64 = u64::MAX;
+            for &kind in &[
+                PredictorKind::Left,
+                PredictorKind::Gradient,
+                PredictorKind::Median,
+            ] {
+                let mut block = src.to_vec();
+                encode_predictor_u8(kind, &mut block, rows, width, field_stride);
+                let score = abs_signed_sum_u8(&block);
+                if score < best_score {
+                    best_score = score;
+                    best_kind = kind;
+                    best_block = block;
+                }
+            }
+            (best_kind, best_block)
+        }
+    }
+}
+
+/// Sum of |signed| residuals interpreting each byte as `i8`. Equivalent
+/// to `sum of min(b, 256 - b)` over the unsigned bytes. Spec/04 §3.1
+/// fixes the selector as "smallest residual sum"; the L1 norm over the
+/// signed residuals (rather than the raw bytes) is the only sum that
+/// preserves the natural "near-zero residual is good" ordering.
+fn abs_signed_sum_u8(block: &[u8]) -> u64 {
+    let mut s: u64 = 0;
+    for &b in block {
+        let signed = b as i8;
+        s += signed.unsigned_abs() as u64;
+    }
+    s
 }
 
 fn apply_rgb_decorrelation_u8(planes: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
@@ -804,6 +979,8 @@ fn encode_frame_u16(
     };
 
     let mut plane_resid: Vec<Vec<u16>> = Vec::with_capacity(num_planes);
+    let mut slice_predictors: Vec<PredictorKind> = vec![PredictorKind::Left; total_slices];
+    let strategy = options.strategy;
     for p in 0..num_planes {
         let (pw, ph, plane_slice_height) = plane_dims[p];
         let mut residuals: Vec<u16> = Vec::with_capacity(pw * ph);
@@ -812,15 +989,10 @@ fn encode_frame_u16(
             let row_start = s * plane_slice_height;
             let row_end = ((s + 1) * plane_slice_height).min(ph);
             let slice_rows = row_end - row_start;
-            let mut block: Vec<u16> = plane_data[row_start * pw..row_end * pw].to_vec();
-            encode_predictor_u16(
-                options.predictor,
-                &mut block,
-                slice_rows,
-                pw,
-                mask,
-                field_stride,
-            );
+            let src = &plane_data[row_start * pw..row_end * pw];
+            let (chosen, block) =
+                build_slice_residuals_u16(strategy, src, slice_rows, pw, mask, bits, field_stride);
+            slice_predictors[p * slices_per_plane + s] = chosen;
             residuals.extend_from_slice(&block);
         }
         plane_resid.push(residuals);
@@ -842,7 +1014,7 @@ fn encode_frame_u16(
         .collect();
 
     let mut slice_payloads: Vec<Vec<u8>> = Vec::with_capacity(total_slices);
-    for s in 0..total_slices {
+    for (s, &pred_kind) in slice_predictors.iter().enumerate() {
         let plane = s / slices_per_plane;
         let in_plane_idx = s % slices_per_plane;
         let (pw, ph, plane_slice_height) = plane_dims[plane];
@@ -851,30 +1023,17 @@ fn encode_frame_u16(
         let row_end = ((in_plane_idx + 1) * plane_slice_height).min(plane_dims[plane].1);
 
         let res_block = &plane_resid[plane][row_start * pw..row_end * pw];
+        let pred_id: u8 = predictor_id_byte(pred_kind);
 
-        let mut payload = Vec::new();
+        // Per-slice mode selection. Raw size at bit-depth `bits` is
+        // `(pixels * bits + 7) / 8` bytes (spec/05 §4.1).
+        let raw_bits = res_block.len() * bits as usize;
+        let raw_size = raw_bits.div_ceil(8);
+        let mut huff_buf: Option<Vec<u8>> = None;
         let flags: u8 = match options.mode {
             SliceMode::Huffman => 0x00,
             SliceMode::Raw => 0x01,
-        };
-        let pred_id: u8 = match options.predictor {
-            PredictorKind::Left => 0x01,
-            PredictorKind::Gradient => 0x02,
-            PredictorKind::Median => 0x03,
-        };
-        payload.push(flags);
-        payload.push(pred_id);
-
-        match options.mode {
-            SliceMode::Raw => {
-                // Bit-pack at `bits` bits MSB-first.
-                let mut bw = BitWriter::new();
-                for &sym in res_block {
-                    bw.write(sym as u32, bits);
-                }
-                payload.extend(bw.finish());
-            }
-            SliceMode::Huffman => {
+            SliceMode::Auto => {
                 let huff = &plane_huffs[plane];
                 let mut bw = BitWriter::new();
                 for &sym in res_block {
@@ -882,8 +1041,38 @@ fn encode_frame_u16(
                     let code = huff.codes[sym as usize];
                     bw.write(code, len);
                 }
-                payload.extend(bw.finish());
+                let bytes = bw.finish();
+                if bytes.len() <= raw_size {
+                    huff_buf = Some(bytes);
+                    0x00
+                } else {
+                    0x01
+                }
             }
+        };
+
+        let mut payload = Vec::new();
+        payload.push(flags);
+        payload.push(pred_id);
+
+        if flags & 0x01 != 0 {
+            // Bit-pack at `bits` bits MSB-first.
+            let mut bw = BitWriter::new();
+            for &sym in res_block {
+                bw.write(sym as u32, bits);
+            }
+            payload.extend(bw.finish());
+        } else if let Some(buf) = huff_buf {
+            payload.extend(buf);
+        } else {
+            let huff = &plane_huffs[plane];
+            let mut bw = BitWriter::new();
+            for &sym in res_block {
+                let len = huff.lengths[sym as usize];
+                let code = huff.codes[sym as usize];
+                bw.write(code, len);
+            }
+            payload.extend(bw.finish());
         }
         slice_payloads.push(payload);
     }
@@ -899,6 +1088,67 @@ fn encode_frame_u16(
         &plane_huffs,
         &slice_payloads,
     ))
+}
+
+/// `u16` analogue of [`build_slice_residuals_u8`]: pick a predictor
+/// (per `strategy`) and emit its residuals. For Dynamic, the score is
+/// `sum |signed(residual)|` interpreting each residual as a signed
+/// value in the `bits`-bit window — equivalent to
+/// `min(r, (1 << bits) - r)`. Same monotone-with-Huffman-cost
+/// rationale as the u8 case.
+#[allow(clippy::too_many_arguments)]
+fn build_slice_residuals_u16(
+    strategy: PredictorStrategy,
+    src: &[u16],
+    rows: usize,
+    width: usize,
+    mask: u16,
+    bits: u8,
+    field_stride: FieldStride,
+) -> (PredictorKind, Vec<u16>) {
+    match strategy {
+        PredictorStrategy::Fixed(p) => {
+            let mut block = src.to_vec();
+            encode_predictor_u16(p, &mut block, rows, width, mask, field_stride);
+            (p, block)
+        }
+        PredictorStrategy::Dynamic => {
+            let mut best_kind = PredictorKind::Left;
+            let mut best_block: Vec<u16> = Vec::new();
+            let mut best_score: u64 = u64::MAX;
+            let half = 1u32 << (bits - 1);
+            for &kind in &[
+                PredictorKind::Left,
+                PredictorKind::Gradient,
+                PredictorKind::Median,
+            ] {
+                let mut block = src.to_vec();
+                encode_predictor_u16(kind, &mut block, rows, width, mask, field_stride);
+                let score = abs_signed_sum_u16(&block, half);
+                if score < best_score {
+                    best_score = score;
+                    best_kind = kind;
+                    best_block = block;
+                }
+            }
+            (best_kind, best_block)
+        }
+    }
+}
+
+/// `sum_b min(b, (1 << bits) - b)` — the abs-signed L1 norm of the
+/// residual interpreted as a signed value in the `bits`-bit window.
+/// `half = 1 << (bits-1)`; a residual ≥ half wraps to the negative
+/// side, where its magnitude is `(1 << bits) - r`.
+fn abs_signed_sum_u16(block: &[u16], half: u32) -> u64 {
+    let two_bits = 2u32 * half;
+    let mut s: u64 = 0;
+    for &b in block {
+        let v = b as u32;
+        let mag = if v >= half { two_bits - v } else { v };
+        s += mag as u64;
+    }
+    s
 }
 
 fn apply_rgb_decorrelation_u16(planes: Vec<Vec<u16>>, mask: u16) -> Vec<Vec<u16>> {

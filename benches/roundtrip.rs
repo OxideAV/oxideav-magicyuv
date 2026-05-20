@@ -49,9 +49,8 @@ fn run_roundtrip(format_byte: u8, width: u32, height: u32, predictor: PredictorK
     let rec = tables::lookup(format_byte).expect("FOURCC in CSV");
     let planes = make_planes(rec, width, height);
     let opts = EncodeOptions {
-        predictor,
         mode: SliceMode::Huffman,
-        interlaced: false,
+        ..EncodeOptions::fixed(predictor)
     };
     let frame = encode_frame(rec, width, height, 28, planes, opts).expect("encode");
     let _ = decode_frame(&frame).expect("decode");

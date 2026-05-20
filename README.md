@@ -10,7 +10,14 @@ M8Y4, M8Y2, M8Y0, M8YA, M8G0) and 10/12/14-bit (M0RG, M0RA, M2RG,
 M2RA, M4RG, M4RA, M0Y2, M0Y4, M0Y0, M0G0). Honours
 `flags & FLAG_INTERLACED` for field-stride=2 prediction (`spec/04`
 §5.1). The public encoder API (`encode_frame`) emits wire-format
-frames the decoder round-trips byte-for-byte. A `trace` Cargo feature
+frames the decoder round-trips byte-for-byte. Encoder strategies:
+**fixed** Left / Gradient / Median (`PredictorStrategy::Fixed`),
+**Dynamic** per-slice predictor selection by minimum residual L1
+norm (`PredictorStrategy::Dynamic`, spec/04 §3), and per-slice
+Huffman / raw fallback (`SliceMode::Auto`, spec/05 §6.2 —
+`(pixels * bits + 7) / 8` byte-budget). `EncodeOptions::dynamic_auto()`
+combines both for the spec/04 §3 + spec/05 §6.2 always-on
+configuration the v2.4.2 encoder ships with. A `trace` Cargo feature
 surfaces a JSONL trace tape for the Auditor's lockstep harness; the
 `huff.used` field is a per-symbol `{length, code}` map per the
 audit/02 §4.2 forward spec.

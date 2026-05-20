@@ -21,6 +21,47 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`PredictorStrategy::Dynamic`** — encoder spec/04 §3 strategy.
+  When set on `EncodeOptions.strategy`, the encoder evaluates all
+  three predictors (Left, Gradient, Median) on every slice, sums the
+  signed-L1-norm of the post-prediction residuals, and writes
+  whichever predictor produced the smaller sum into that slice's
+  `predictor_id` byte. The wire format is unchanged
+  (`predictor_id ∈ {0x01, 0x02, 0x03}` per slice); only the encoder's
+  selection logic differs. Matches the v2.4.2 encoder dispatch at
+  `magicyuv.dll!0x69b96970..0x69b96ac9` (spec/04 §3.1 evidence).
+- **`SliceMode::Auto`** — per-slice raw fallback per spec/05 §6.2.
+  When set on `EncodeOptions.mode`, the encoder builds the per-plane
+  Huffman table once over all of the plane's residuals, then for each
+  slice independently picks whichever of `(huffman_size, raw_size)`
+  is smaller and writes the corresponding `slice_flags` byte
+  (`0x00` or `0x01`). Raw size is `(slice_pixels * bits + 7) / 8`
+  bytes per spec/05 §4.1. Matches the v2.4.2 "Adaptive coding"
+  toggle that became always-on in v1.2.
+- **`EncodeOptions::dynamic_auto()`** and
+  **`EncodeOptions::fixed(p)`** builder helpers for the two common
+  configurations (the spec/04 §3 + spec/05 §6.2 always-on combination
+  and the fixed-predictor / fixed-Huffman case respectively).
+- New `PredictorStrategy` enum (`Fixed(PredictorKind)` + `Dynamic`)
+  re-exported at the crate root.
+- 8 new lib tests covering the round-78 surface:
+  `dynamic_strategy_round_trips_every_8bit_fourcc` (Dynamic across
+  the seven 8-bit FOURCCs × 6 patterns = 42 byte-exact frames),
+  `dynamic_strategy_round_trips_high_bit_depth` (4 high-bit-depth
+  FOURCCs × 4 patterns = 16 byte-exact frames),
+  `dynamic_picks_left_for_horizontal_ramp` (predictor-ID sanity
+  check), `dynamic_varies_predictor_across_slices_with_mixed_content`
+  (asserts Dynamic picks ≥ 2 distinct predictor IDs for an M8RG
+  frame whose planes favour different predictors — mirrors the
+  spec/04 §3.2 behavioural-confirmation pattern), `auto_mode_round_trips_8bit`
+  (Auto across all 8-bit FOURCCs × 6 patterns), `auto_mode_picks_huffman_for_all_zero`
+  (degenerate all-zero input gets `slice_flags = 0x00` everywhere),
+  `auto_mode_falls_back_to_raw_on_random_input` (Auto is ≤ both
+  fixed Raw and fixed Huffman on high-entropy data),
+  `dynamic_plus_auto_round_trips_combined` (the always-on
+  combination per `EncodeOptions::dynamic_auto()`), and
+  `dynamic_is_no_larger_than_worst_fixed_on_mixed_content`
+  (Dynamic dominates the worst fixed-predictor frame size).
 - Criterion bench harness (`benches/decode.rs`, `benches/encode.rs`,
   `benches/roundtrip.rs`) covering the dominant FOURCCs (M8RG, M8Y0,
   M8G0, M0RG) at 720p / 1080p plus a 256×256 Median scenario.

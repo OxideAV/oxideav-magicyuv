@@ -233,7 +233,7 @@ mod tests {
     use super::*;
     use oxideav_core::{CodecId, CodecParameters, Packet, TimeBase};
 
-    use crate::encoder::{encode_frame, EncodeOptions, PlaneInput, SliceMode};
+    use crate::encoder::{encode_frame, EncodeOptions, PlaneInput};
     use crate::tables::{lookup_round1, PredictorKind};
 
     #[test]
@@ -356,11 +356,7 @@ mod tests {
             16,
             28,
             vec![PlaneInput::U8(pixels.clone())],
-            EncodeOptions {
-                predictor: PredictorKind::Left,
-                mode: SliceMode::Huffman,
-                interlaced: false,
-            },
+            EncodeOptions::fixed(PredictorKind::Left),
         )
         .expect("encode");
 
