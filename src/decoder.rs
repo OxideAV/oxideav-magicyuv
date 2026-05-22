@@ -304,12 +304,15 @@ pub fn decode_frame(bytes: &[u8]) -> Result<DecodedFrame> {
 
     // Any preamble bytes after the last descriptor: emit a
     // preamble_trailing trace event so the Auditor's jq-line-diff
-    // catches encoder/decoder mismatches.
+    // catches encoder/decoder mismatches. Per `spec/05` §10 Q6 +
+    // `audit/00` §8.8 the canonical schema carries `extra_bytes` as
+    // an integer count, matching the Python ref's
+    // `len(preamble) - cursor` emission at `frame.py:514`.
     #[cfg(feature = "trace")]
     if let Some(t) = &tracer {
         if desc_pos < preamble.len() {
             t.emit(Event::PreambleTrailing {
-                extra_bytes: &preamble[desc_pos..],
+                extra_bytes: preamble.len() - desc_pos,
             });
         }
     }

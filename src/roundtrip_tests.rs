@@ -770,6 +770,119 @@ fn trace_huff_used_field_is_per_symbol_map() {
 
 #[cfg(feature = "trace")]
 #[test]
+fn trace_preamble_trailing_emits_integer_extra_bytes() {
+    use std::io::Read;
+    let _g = trace_lock();
+    // Per `spec/05 §10 Q6` audit-corrected note + `audit/00 §8.8`
+    // canonicalisation table + `audit/04 §2.3` divergence note, the
+    // `preamble_trailing` event's `extra_bytes` field MUST be a JSON
+    // integer (the byte count of unconsumed trailing preamble), NOT a
+    // hex byte-string. The Python reference codec emits
+    // `tracer.event("preamble_trailing", extra_bytes=
+    // len(preamble) - cursor)` at `frame.py:514`; the Rust crate
+    // must match so a strict `jq -S -c '.'` line-diff is empty.
+    //
+    // v2.4.2 never emits trailing preamble bytes (the count is always
+    // zero and the event never fires on vendor streams), so we
+    // synthesise a frame with padding inserted between the last
+    // Huffman descriptor and the first slice payload, then update the
+    // slice-table entries by the padding length. The decoder's
+    // descriptor parser stops at the last descriptor byte; the
+    // remaining bytes in the preamble region (defined by
+    // `entry[1] + table_off`) become the trailing-bytes.
+    let rec = lookup_round1(0x6b).unwrap(); // M8G0 — single plane.
+    let pixels: Vec<u8> = (0..(16 * 16)).map(|i| (i & 0xff) as u8).collect();
+    let bytes = encode_frame(
+        rec,
+        16,
+        16,
+        28,
+        vec![PlaneInput::U8(pixels)],
+        EncodeOptions::fixed(PredictorKind::Gradient),
+    )
+    .unwrap();
+
+    // Slice table starts at offset 0x20 (32). For a single-plane 16×16
+    // frame with `slice_height=28 ≥ 16`, `total_slices = 1` so the
+    // table is `(1 + 1) = 2` u32 LE entries (8 bytes).
+    //
+    // `entry[0]` and `entry[1]` are both the preamble-end (= first
+    // slice offset) per `assemble_frame`. To inject padding, we
+    // insert `pad_len` zero bytes immediately after the last
+    // descriptor byte but before the first slice's payload, then
+    // bump `entry[1]` (and every entry after it) by `pad_len`.
+    let pad_len: usize = 7;
+    let table_off: usize = 32;
+    let total_slices: usize = 1;
+    // Original first-slice file-offset (table_off + entries[1]).
+    let entry1 = u32::from_le_bytes(bytes[table_off + 4..table_off + 8].try_into().unwrap());
+    let first_payload_off = (entry1 as usize) + table_off;
+    // Synthesise the patched buffer: prefix + pad_len zeros + suffix.
+    let mut patched = Vec::with_capacity(bytes.len() + pad_len);
+    patched.extend_from_slice(&bytes[..first_payload_off]);
+    patched.extend(std::iter::repeat_n(0u8, pad_len));
+    patched.extend_from_slice(&bytes[first_payload_off..]);
+    // Bump entry[1] (the only slice-end entry for a single-slice
+    // frame) by pad_len. entry[0] (preamble-end indicator) is
+    // structurally identical to entry[1] in our assembler, so bump
+    // it too so the decoder reads exactly `pad_len` trailing bytes.
+    for i in 1..=total_slices {
+        let off = table_off + 4 * i;
+        let v = u32::from_le_bytes(patched[off..off + 4].try_into().unwrap()) + pad_len as u32;
+        patched[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    let path = std::env::temp_dir().join(format!(
+        "magicyuv-trace-pt-{}-{}.jsonl",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_file(&path);
+    std::env::set_var("OXIDEAV_MAGICYUV_TRACE_FILE", &path);
+    let _ = decode_frame(&patched).expect("decode patched frame");
+    std::env::remove_var("OXIDEAV_MAGICYUV_TRACE_FILE");
+
+    let mut s = String::new();
+    std::fs::File::open(&path)
+        .unwrap()
+        .read_to_string(&mut s)
+        .unwrap();
+    let _ = std::fs::remove_file(&path);
+
+    // Find the preamble_trailing event line.
+    let pt_line = s
+        .lines()
+        .find(|l| l.contains("\"kind\":\"preamble_trailing\""))
+        .expect("preamble_trailing event must fire when extra bytes present");
+
+    // Strict schema: the line must contain `"extra_bytes":<int>` where
+    // <int> equals our padding length, and MUST NOT contain a hex
+    // byte-string form like `"extra_bytes":"00…"`.
+    let needle = format!("\"extra_bytes\":{pad_len}");
+    assert!(
+        pt_line.contains(&needle),
+        "expected `\"extra_bytes\":<int>` (count) per spec/05 §10 Q6 canonical schema; got: {pt_line}"
+    );
+    assert!(
+        !pt_line.contains("\"extra_bytes\":\""),
+        "extra_bytes MUST be a JSON integer, not a hex string (spec/05 §10 Q6); got: {pt_line}"
+    );
+    // The exact line must canonicalise (via `jq -S -c '.'`) to
+    // `{"extra_bytes":<n>,"kind":"preamble_trailing"}`. We assert the
+    // canonical-form equality directly without invoking jq so the test
+    // doesn't depend on jq being installed.
+    let expected = format!("{{\"kind\":\"preamble_trailing\",\"extra_bytes\":{pad_len}}}");
+    assert_eq!(
+        pt_line, expected,
+        "preamble_trailing line must be exactly the canonical schema"
+    );
+}
+
+#[cfg(feature = "trace")]
+#[test]
 fn trace_omits_when_env_var_unset() {
     let _g = trace_lock();
     let rec = lookup_round1(0x6b).unwrap();

@@ -120,7 +120,17 @@ pub(crate) enum Event<'a> {
         n_pixels: usize,
     },
     PreambleTrailing {
-        extra_bytes: &'a [u8],
+        /// Count of unconsumed trailing bytes between the last
+        /// per-plane Huffman descriptor and `entry[1] + table_off`.
+        /// Per `spec/05` §10 Q6 audit-corrected note + `audit/00` §6
+        /// (table at §8.8), the canonical schema is
+        /// `extra_bytes: integer`, matching the Python reference's
+        /// `tracer.event("preamble_trailing", extra_bytes=
+        /// len(preamble) - cursor)`. The optional diagnostic `bytes`
+        /// (hex) field is omitted to keep the strict
+        /// `jq -S -c '.'` line-diff with the Python ref empty when
+        /// the event fires.
+        extra_bytes: usize,
     },
 }
 
@@ -265,8 +275,15 @@ impl<'a> Event<'a> {
                 out.push('}');
             }
             Event::PreambleTrailing { extra_bytes } => {
+                // `spec/05` §10 Q6 canonical schema: `extra_bytes`
+                // is an integer count, not a hex byte-string. This
+                // matches the Python ref's `frame.py:514` emission
+                // (`extra_bytes=len(preamble) - cursor`) so the
+                // Auditor's strict jq-line-diff is empty even when
+                // the event fires (which v2.4.2 never produces, but
+                // third-party encoders can — see `audit/04 §2.3`).
                 out.push_str("{\"kind\":\"preamble_trailing\"");
-                push_hex_field(out, "extra_bytes", extra_bytes);
+                push_int_field(out, "extra_bytes", *extra_bytes as u64);
                 out.push('}');
             }
         }

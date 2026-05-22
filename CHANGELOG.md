@@ -6,6 +6,23 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **`trace`: `preamble_trailing.extra_bytes` is now a JSON integer.**
+  The event's `extra_bytes` field is emitted as an integer count
+  (`len(preamble) - cursor`) rather than a hex byte-string, matching
+  the Python reference codec at `frame.py:514` per the
+  `spec/05 §10 Q6` audit-corrected canonical schema +
+  `audit/00 §8.8` resolution table (latent observation noted at
+  `audit/04 §2.3`). v2.4.2 streams never produce trailing preamble
+  bytes so the event remains zero-impact on the existing 4-fixture
+  strict `jq -S -c '.'` trace lockstep. A new lib test
+  (`trace_preamble_trailing_emits_integer_extra_bytes`) constructs
+  a synthesised frame with 7 trailing bytes inserted into the
+  preamble region (adjusting the slice-table entries accordingly)
+  and asserts the canonical-form emission
+  `{"kind":"preamble_trailing","extra_bytes":7}`.
+
 ## [0.0.4](https://github.com/OxideAV/oxideav-magicyuv/compare/v0.0.3...v0.0.4) - 2026-05-07
 
 ### Other

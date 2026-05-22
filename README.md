@@ -20,7 +20,10 @@ combines both for the spec/04 §3 + spec/05 §6.2 always-on
 configuration the v2.4.2 encoder ships with. A `trace` Cargo feature
 surfaces a JSONL trace tape for the Auditor's lockstep harness; the
 `huff.used` field is a per-symbol `{length, code}` map per the
-audit/02 §4.2 forward spec.
+audit/02 §4.2 forward spec, and `preamble_trailing.extra_bytes` is
+emitted as a JSON integer count per the spec/05 §10 Q6 +
+audit/00 §8.8 canonical schema (matching the Python ref's
+`frame.py:514`).
 
 The implementation is built against the strict-isolation clean-room
 workspace at
