@@ -152,13 +152,17 @@ under `--features trace`.
 
 ## Round-N+1 candidates
 
-- **Encoder `canonical_huffman_lengths` → `enforce_length_cap`** —
-  has degenerate behaviour on highly-skewed histograms (e.g. Median
-  predictor at ≥ 1024×1024 with smooth-gradient inputs). Per-frame
-  encode wall-time blows up from low ms to many minutes. The decoder
-  is unaffected; spec-compliant streams produced by Gradient/Left at
-  the same sizes decode identically. Fix needs the length-limited
-  Package-Merge algorithm.
+- ~~**Encoder `canonical_huffman_lengths` → `enforce_length_cap`**~~
+  *(resolved — package-merge limiter)* — the prior `enforce_length_cap`
+  "steal-a-bit" heuristic both spun for millions of iterations on
+  highly-skewed (Fibonacci / near-geometric) residual histograms and
+  left an *invalid* over-long code (Kraft sum ≪ 1). It is replaced by
+  the length-limited **Package-Merge** algorithm (Larmore & Hirschberg
+  1990), which is only invoked when the unbounded-optimal tree exceeds
+  the per-bit-depth cap (12 / 14 / 16 / 18, spec/05 §1) and produces an
+  optimal *length-limited* prefix code with Kraft sum exactly 1.0
+  (spec/05 §1.3). The common (non-binding) path keeps the plain
+  canonical lengths byte-for-byte, so the trace lockstep is unchanged.
 - **Decoder primary-table layout** — `Vec<(u32, u8)>` packs each
   entry into 8 bytes (5 used, 3 padding). Switching to
   `Vec<u16>` (6 bits length, 10 bits symbol — fits 8-bit alphabet)

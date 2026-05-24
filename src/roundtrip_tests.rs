@@ -1425,3 +1425,140 @@ fn dynamic_is_no_larger_than_worst_fixed_on_mixed_content() {
         bytes_med.len()
     );
 }
+
+// ───────────────── round-124: length-limited Huffman (package-merge) ─────────────────
+//
+// The encoder caps every per-plane Huffman code length at `max_length`
+// (8-bit → 12, spec/05 §1, table in §1.1) and every emitted descriptor
+// must decode to a *complete* code with Kraft sum exactly 1.0
+// (spec/05 §1.3). A residual histogram with a near-geometric /
+// Fibonacci-like shape drives the unbounded-optimal Huffman tree well
+// past depth 12; the prior `enforce_length_cap` "steal-a-bit" heuristic
+// both spun for millions of iterations and produced an *invalid*
+// (Kraft ≪ 1) over-long code on such inputs. The package-merge limiter
+// replacing it must produce a frame that round-trips byte-exact.
+
+/// Build a Gray (M8G0) plane whose *Left*-predicted residuals form a
+/// deeply-skewed histogram: each row holds a single dominant value
+/// plus a steeply-decaying ramp, integrated so the per-pixel left
+/// difference reproduces a Fibonacci-weighted symbol mix. The exact
+/// residuals don't matter — only that the optimal tree would exceed
+/// depth 12, forcing the length-limited path.
+fn skewed_gray_plane(w: usize, h: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; w * h];
+    // Per-row, walk a small set of residual symbols with frequencies
+    // that decay geometrically, integrating into pixel values via a
+    // running sum so Left prediction recovers those residuals.
+    for r in 0..h {
+        let mut running: u8 = (r as u8).wrapping_mul(37);
+        buf[r * w] = running; // first column is raw under Left.
+        for c in 1..w {
+            // Map the column index into a heavily front-loaded symbol:
+            // most columns reuse a tiny set of residuals, a few use
+            // large unique ones. This yields a long-tailed histogram.
+            let bucket = (c.trailing_zeros() as u8).min(31);
+            let resid = match bucket {
+                0 => 1u8,
+                1 => 2,
+                2 => 3,
+                b => 5u8.wrapping_add(b.wrapping_mul(17)),
+            };
+            running = running.wrapping_add(resid);
+            buf[r * w + c] = running;
+        }
+    }
+    buf
+}
+
+#[test]
+fn skewed_histogram_round_trips_left_8bit() {
+    // 256×256 Gray — large enough that the residual histogram is rich
+    // and the (pre-fix) cap loop would have stalled.
+    let rec = lookup_round1(0x6b).unwrap(); // M8G0
+    let plane = skewed_gray_plane(256, 256);
+    let planes_in = vec![PlaneInput::U8(plane)];
+    let bytes = encode_frame(
+        rec,
+        256,
+        256,
+        64,
+        planes_in.clone(),
+        EncodeOptions::fixed(PredictorKind::Left),
+    )
+    .expect("skewed M8G0 Left encode must not stall or fail");
+    let dec = decode_frame(&bytes).expect("skewed M8G0 Left decode");
+    assert!(
+        samples_eq_planes(&planes_in, &dec.planes),
+        "skewed M8G0 Left: plane mismatch"
+    );
+}
+
+#[test]
+fn skewed_histogram_round_trips_dynamic_auto_rgb() {
+    // Same skewed shape across all three RGB planes, exercised through
+    // the always-on Dynamic + Auto configuration the v2.4.2 encoder
+    // ships with (spec/04 §3 + spec/05 §6.2).
+    let rec = lookup(0x65).unwrap(); // M8RG
+    let g = skewed_gray_plane(192, 128);
+    let b = skewed_gray_plane(192, 128);
+    let r = skewed_gray_plane(192, 128);
+    let planes_in = vec![PlaneInput::U8(g), PlaneInput::U8(b), PlaneInput::U8(r)];
+    let bytes = encode_frame(
+        rec,
+        192,
+        128,
+        64,
+        planes_in.clone(),
+        EncodeOptions::dynamic_auto(),
+    )
+    .expect("skewed M8RG dynamic+auto encode must not stall or fail");
+    let dec = decode_frame(&bytes).expect("skewed M8RG dynamic+auto decode");
+    assert!(
+        samples_eq_planes(&planes_in, &dec.planes),
+        "skewed M8RG dynamic+auto: plane mismatch"
+    );
+}
+
+#[test]
+fn skewed_histogram_round_trips_median_10bit() {
+    // 10-bit RGB (M0RG, cap = 14). A skewed u16 residual histogram over
+    // the 1024-symbol alphabet, Median-predicted, must still cap to ≤ 14
+    // and round-trip.
+    let rec = lookup_round2(0x6d).unwrap(); // M0RG
+    let mask = rec.sample_mask() as u16;
+    let (w, h) = (160usize, 96usize);
+    let mk = || {
+        let mut buf = vec![0u16; w * h];
+        for row in 0..h {
+            let mut running: u16 = ((row as u16).wrapping_mul(101)) & mask;
+            buf[row * w] = running;
+            for col in 1..w {
+                let bucket = (col.trailing_zeros() as u16).min(31);
+                let resid = match bucket {
+                    0 => 1u16,
+                    1 => 2,
+                    2 => 4,
+                    bk => 7u16.wrapping_add(bk.wrapping_mul(53)),
+                };
+                running = running.wrapping_add(resid) & mask;
+                buf[row * w + col] = running;
+            }
+        }
+        PlaneInput::U16(buf)
+    };
+    let planes_in = vec![mk(), mk(), mk()];
+    let bytes = encode_frame(
+        rec,
+        w as u32,
+        h as u32,
+        48,
+        planes_in.clone(),
+        EncodeOptions::fixed(PredictorKind::Median),
+    )
+    .expect("skewed M0RG Median encode must not stall or fail");
+    let dec = decode_frame(&bytes).expect("skewed M0RG Median decode");
+    assert!(
+        samples_eq_planes(&planes_in, &dec.planes),
+        "skewed M0RG Median: plane mismatch"
+    );
+}

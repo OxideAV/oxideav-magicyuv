@@ -6,6 +6,29 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Encoder Huffman length cap now uses length-limited Package-Merge.**
+  The per-plane code-length builder capped lengths at `max_length`
+  (8-bit → 12, 10 → 14, 12 → 16, 14 → 18; spec/05 §1 table) with a
+  naive `enforce_length_cap` "steal-a-bit" heuristic. On a deeply
+  skewed residual histogram (a Fibonacci / near-geometric shape, e.g.
+  a smooth-gradient plane after Median prediction) that heuristic both
+  looped for millions of iterations *and* produced an **invalid**
+  over-long code whose Kraft sum was far below 1 — a stream the
+  decoder's canonical-code constructor (spec/05 §2.0.3) would reject.
+  It is replaced by the **Package-Merge** algorithm (Larmore &
+  Hirschberg, 1990), which produces an *optimal length-limited* prefix
+  code with Kraft sum exactly 1.0 (spec/05 §1.3) and runs in
+  milliseconds. The limiter is only invoked when the unbounded-optimal
+  tree exceeds the cap; the common (non-binding) path keeps the plain
+  canonical lengths byte-for-byte, so existing encoded streams and the
+  `trace` lockstep tape are unchanged. New unit tests assert the
+  capped code is complete (Kraft = 1) and prefix-free for Fibonacci /
+  geometric / dominant / uniform histograms at 8- and 10-bit; new
+  roundtrip tests encode→decode skewed M8G0 (Left), M8RG
+  (Dynamic+Auto), and M0RG (Median) frames byte-exact.
+
 ### Changed
 
 - **`trace`: `preamble_trailing.extra_bytes` is now a JSON integer.**
