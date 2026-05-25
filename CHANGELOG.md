@@ -6,6 +6,42 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`decode_into(&[u8], &mut DecodedFrame)` streaming entry point.**
+  The existing [`decode_frame`] always allocates fresh per-plane
+  `Vec`s (one per plane in `plane_bufs`, one per output `DecodedPlane`,
+  plus a working copy of the G plane inside the RGB inter-plane
+  decorrelation reversal — 4-7 `Vec` allocations per frame). The new
+  `decode_into` decodes into a caller-owned `DecodedFrame`, re-using
+  the per-plane `Samples::U8` / `Samples::U16` inner-`Vec` storage
+  when the frame geometry matches the previous call. Buffer life-cycle:
+    - First call (or geometry change): plane Vecs are resized to fit
+      (or re-allocated when previously of the wrong `Samples` variant).
+    - Subsequent calls (same geometry): `Vec::clear` + `resize` keeps
+      the existing allocation — `as_ptr()` + `capacity()` are stable
+      across iterations.
+  RGB inter-plane decorrelation reversal (both 8-bit and high-bit
+  paths) is rewritten to use disjoint `split_at_mut` borrows of
+  `[B', G, R']`, so the prior `wire_planes[1].clone()` working copy of
+  the G plane is gone — `decode_frame` itself picks up the same
+  allocation reduction. `decode_frame` is now a one-line wrapper
+  around `decode_into(bytes, &mut DecodedFrame::empty())`. New unit
+  tests `decode_into_matches_decode_frame_rgb_8bit`,
+  `decode_into_matches_decode_frame_rgb_10bit`,
+  `decode_into_reuses_plane_storage_when_geometry_matches` (asserts
+  `Vec::as_ptr` + `Vec::capacity` survive a second decode unchanged),
+  `decode_into_handles_geometry_change`, and
+  `decode_into_handles_bit_depth_change` cover the new API. Public
+  helpers `FrameHeader::placeholder()` and `FourccRecord::placeholder()`
+  are added to seed the `DecodedFrame::empty()` slot before the first
+  decode populates it. Measured win on
+  `examples/quick_bench`'s RGB-family 1280×720 gradient scenario is
+  -2 % … -9 % decode-side (varies with thermal / page-cache state;
+  pure-malloc savings are larger as a fraction at smaller frame
+  sizes); other family scenarios are within ±2 % (allocation-bound is
+  a small fraction of their total decode work).
+
 ### Changed
 
 - **Decoder Huffman primary table is now a packed `Vec<u32>`** (low 8

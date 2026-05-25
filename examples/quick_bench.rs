@@ -6,7 +6,10 @@
 use std::time::Instant;
 
 use oxideav_magicyuv::tables::{Family, FourccRecord, PredictorKind};
-use oxideav_magicyuv::{decode_frame, encode_frame, tables, EncodeOptions, PlaneInput, SliceMode};
+use oxideav_magicyuv::{
+    decode_frame, decode_into, encode_frame, tables, DecodedFrame, EncodeOptions, PlaneInput,
+    SliceMode,
+};
 
 fn xorshift_byte(state: &mut u32) -> u8 {
     *state ^= *state << 13;
@@ -89,9 +92,22 @@ fn time_decode(name: &str, format_byte: u8, w: u32, h: u32, predictor: Predictor
     }
     let elapsed = t.elapsed().as_secs_f64();
     let per_iter_ms = elapsed * 1000.0 / iters as f64;
+
+    // Streaming-reuse variant: one DecodedFrame, N decode_into calls.
+    let mut dst = DecodedFrame::empty();
+    decode_into(&frame, &mut dst).unwrap(); // warmup + alloc plane buffers
+    let t2 = Instant::now();
+    for _ in 0..iters {
+        decode_into(std::hint::black_box(&frame), &mut dst).unwrap();
+        std::hint::black_box(&dst);
+    }
+    let per_iter_ms_into = t2.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+    let delta = (per_iter_ms - per_iter_ms_into) / per_iter_ms * 100.0;
     println!(
-        "{:7.2} ms/iter  frame_bytes={}  (one-shot encode {:.1}ms)",
+        "{:7.2} ms/iter  into={:7.2} ({:+5.1}%)  frame_bytes={}  (one-shot encode {:.1}ms)",
         per_iter_ms,
+        per_iter_ms_into,
+        -delta,
         frame.len(),
         enc_ms
     );
@@ -164,6 +180,25 @@ fn main() {
             256,
             PredictorKind::Median,
             30,
+        );
+        // Small-frame streaming scenario — malloc overhead is a
+        // larger fraction of total work here, so `decode_into`
+        // shines.
+        time_decode(
+            "M8RG/gradient/128x128",
+            0x65,
+            128,
+            128,
+            PredictorKind::Gradient,
+            200,
+        );
+        time_decode(
+            "M0RG/gradient/128x128/10bit",
+            0x6d,
+            128,
+            128,
+            PredictorKind::Gradient,
+            200,
         );
     }
     if pick == "all" || pick == "encode" {

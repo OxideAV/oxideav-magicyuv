@@ -60,6 +60,24 @@ impl FourccRecord {
     pub fn is_8bit(&self) -> bool {
         self.bit_depth == 8
     }
+
+    /// A zero-initialised record, used as a placeholder slot in
+    /// [`crate::decoder::DecodedFrame::empty`] before the first decode
+    /// populates it. The first [`crate::decoder::decode_into`] call
+    /// overwrites it with the parsed value.
+    pub fn placeholder() -> Self {
+        Self {
+            format_byte: 0,
+            fourcc: *b"????",
+            bit_depth: 0,
+            planes: 0,
+            alpha: false,
+            aux_byte: 0,
+            family: Family::Gray,
+            sub_x: 1,
+            sub_y: 1,
+        }
+    }
 }
 
 /// Look up a record by `format_byte`. Returns `None` if no

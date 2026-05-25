@@ -1562,3 +1562,204 @@ fn skewed_histogram_round_trips_median_10bit() {
         "skewed M0RG Median: plane mismatch"
     );
 }
+
+/// `decode_into` must produce byte-identical planes to `decode_frame`
+/// across the full predictor set for an RGB-family 8-bit FOURCC (the
+/// path that exercises the RGB inter-plane decorrelation reversal —
+/// the most allocation-heavy code path).
+#[test]
+fn decode_into_matches_decode_frame_rgb_8bit() {
+    use crate::decoder::{decode_into, DecodedFrame};
+    let rec = lookup(0x65).expect("M8RG"); // RGB 8-bit, 3 planes
+    let w = 64u32;
+    let h = 32u32;
+    let mut dst = DecodedFrame::empty();
+    for &pred in &[
+        PredictorKind::Left,
+        PredictorKind::Gradient,
+        PredictorKind::Median,
+    ] {
+        for &pattern in &[0u8, 3, 7] {
+            let planes_in = make_planes_u8(rec, w, h, pattern);
+            let bytes = encode_frame(rec, w, h, 28, planes_in.clone(), EncodeOptions::fixed(pred))
+                .expect("encode");
+            let one_shot = decode_frame(&bytes).expect("decode_frame");
+            decode_into(&bytes, &mut dst).expect("decode_into");
+            assert_eq!(dst.width, one_shot.width);
+            assert_eq!(dst.height, one_shot.height);
+            assert_eq!(dst.planes.len(), one_shot.planes.len());
+            for (a, b) in dst.planes.iter().zip(one_shot.planes.iter()) {
+                assert_eq!(a.width, b.width);
+                assert_eq!(a.height, b.height);
+                assert_eq!(a.bit_depth, b.bit_depth);
+                assert_eq!(
+                    a.samples, b.samples,
+                    "decode_into vs decode_frame mismatch (pred={pred:?}, pattern={pattern})"
+                );
+            }
+        }
+    }
+}
+
+/// Same parity check on a 10-bit RGB FOURCC — verifies the high-bit
+/// path (`Samples::U16` storage + `apply_u16_with_stride`) reuses
+/// buffers correctly and produces identical samples.
+#[test]
+fn decode_into_matches_decode_frame_rgb_10bit() {
+    use crate::decoder::{decode_into, DecodedFrame};
+    let rec = lookup(0x6d).expect("M0RG"); // RGB 10-bit, 3 planes
+    let w = 32u32;
+    let h = 16u32;
+    let mut dst = DecodedFrame::empty();
+    for &pred in &[
+        PredictorKind::Left,
+        PredictorKind::Gradient,
+        PredictorKind::Median,
+    ] {
+        let planes_in = make_planes_u16(rec, w, h, 3);
+        let bytes = encode_frame(rec, w, h, 16, planes_in.clone(), EncodeOptions::fixed(pred))
+            .expect("encode");
+        let one_shot = decode_frame(&bytes).expect("decode_frame");
+        decode_into(&bytes, &mut dst).expect("decode_into");
+        assert_eq!(dst.planes.len(), one_shot.planes.len());
+        for (a, b) in dst.planes.iter().zip(one_shot.planes.iter()) {
+            assert_eq!(
+                a.samples, b.samples,
+                "decode_into vs decode_frame mismatch (10-bit pred={pred:?})"
+            );
+        }
+    }
+}
+
+/// The streaming-reuse promise: when consecutive `decode_into` calls
+/// see the same geometry, the per-plane `Vec<u8>` storage is re-used
+/// in place — no fresh allocation, no capacity growth. We verify by
+/// snapshotting `Vec::as_ptr` + `Vec::capacity` after the first
+/// decode and asserting they survive a second decode unchanged.
+#[test]
+fn decode_into_reuses_plane_storage_when_geometry_matches() {
+    use crate::decoder::{decode_into, DecodedFrame, Samples};
+    let rec = lookup(0x6b).expect("M8G0"); // Gray 8-bit, 1 plane
+    let w = 64u32;
+    let h = 64u32;
+    let planes_in = make_planes_u8(rec, w, h, 5);
+    let bytes = encode_frame(
+        rec,
+        w,
+        h,
+        28,
+        planes_in,
+        EncodeOptions::fixed(PredictorKind::Left),
+    )
+    .expect("encode");
+    let mut dst = DecodedFrame::empty();
+    decode_into(&bytes, &mut dst).expect("first decode_into");
+    // Snapshot the first plane's allocation identity.
+    let (ptr0, cap0) = match &dst.planes[0].samples {
+        Samples::U8(v) => (v.as_ptr(), v.capacity()),
+        _ => unreachable!("M8G0 is 8-bit"),
+    };
+    decode_into(&bytes, &mut dst).expect("second decode_into");
+    let (ptr1, cap1) = match &dst.planes[0].samples {
+        Samples::U8(v) => (v.as_ptr(), v.capacity()),
+        _ => unreachable!("M8G0 is 8-bit"),
+    };
+    assert_eq!(ptr0, ptr1, "plane Vec was reallocated on reuse");
+    assert_eq!(cap0, cap1, "plane Vec capacity changed on reuse");
+}
+
+/// Geometry change between consecutive `decode_into` calls must still
+/// produce a correct decode (the plane Vec is resized in place but
+/// the output samples are exact).
+#[test]
+fn decode_into_handles_geometry_change() {
+    use crate::decoder::{decode_into, DecodedFrame};
+    let rec = lookup(0x65).expect("M8RG");
+    let mut dst = DecodedFrame::empty();
+    // First frame: 64×32.
+    let planes_a = make_planes_u8(rec, 64, 32, 1);
+    let bytes_a = encode_frame(
+        rec,
+        64,
+        32,
+        28,
+        planes_a.clone(),
+        EncodeOptions::fixed(PredictorKind::Gradient),
+    )
+    .expect("encode-a");
+    decode_into(&bytes_a, &mut dst).expect("decode_into-a");
+    assert_eq!(dst.width, 64);
+    assert_eq!(dst.height, 32);
+    assert!(samples_eq_planes(&planes_a, &dst.planes));
+    // Second frame: 32×16 (smaller) — Vecs are truncated.
+    let planes_b = make_planes_u8(rec, 32, 16, 2);
+    let bytes_b = encode_frame(
+        rec,
+        32,
+        16,
+        28,
+        planes_b.clone(),
+        EncodeOptions::fixed(PredictorKind::Median),
+    )
+    .expect("encode-b");
+    decode_into(&bytes_b, &mut dst).expect("decode_into-b");
+    assert_eq!(dst.width, 32);
+    assert_eq!(dst.height, 16);
+    assert!(samples_eq_planes(&planes_b, &dst.planes));
+    // Third frame: 96×48 (larger) — Vecs grow.
+    let planes_c = make_planes_u8(rec, 96, 48, 3);
+    let bytes_c = encode_frame(
+        rec,
+        96,
+        48,
+        28,
+        planes_c.clone(),
+        EncodeOptions::fixed(PredictorKind::Left),
+    )
+    .expect("encode-c");
+    decode_into(&bytes_c, &mut dst).expect("decode_into-c");
+    assert_eq!(dst.width, 96);
+    assert_eq!(dst.height, 48);
+    assert!(samples_eq_planes(&planes_c, &dst.planes));
+}
+
+/// Format-byte change between consecutive `decode_into` calls (e.g.
+/// switching from 8-bit Gray to 10-bit RGB) must drop the U8 storage
+/// and produce a correct U16 decode. Mirrors the inverse direction
+/// too.
+#[test]
+fn decode_into_handles_bit_depth_change() {
+    use crate::decoder::{decode_into, DecodedFrame};
+    let mut dst = DecodedFrame::empty();
+    // 8-bit Gray first.
+    let rec_8 = lookup(0x6b).expect("M8G0");
+    let planes_8 = make_planes_u8(rec_8, 32, 32, 4);
+    let bytes_8 = encode_frame(
+        rec_8,
+        32,
+        32,
+        28,
+        planes_8.clone(),
+        EncodeOptions::fixed(PredictorKind::Left),
+    )
+    .expect("encode-8");
+    decode_into(&bytes_8, &mut dst).expect("decode_into-8");
+    assert!(samples_eq_planes(&planes_8, &dst.planes));
+    // Now 10-bit RGB into the same dst.
+    let rec_10 = lookup(0x6d).expect("M0RG");
+    let planes_10 = make_planes_u16(rec_10, 32, 16, 5);
+    let bytes_10 = encode_frame(
+        rec_10,
+        32,
+        16,
+        16,
+        planes_10.clone(),
+        EncodeOptions::fixed(PredictorKind::Gradient),
+    )
+    .expect("encode-10");
+    decode_into(&bytes_10, &mut dst).expect("decode_into-10");
+    assert!(samples_eq_planes(&planes_10, &dst.planes));
+    // And back to 8-bit Gray.
+    decode_into(&bytes_8, &mut dst).expect("decode_into-8 round 2");
+    assert!(samples_eq_planes(&planes_8, &dst.planes));
+}

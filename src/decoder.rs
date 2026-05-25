@@ -34,6 +34,14 @@ struct PlaneGeom {
 }
 
 /// Result of decoding one v7 frame.
+///
+/// On the streaming path callers can re-use a single `DecodedFrame`
+/// across frames via [`decode_into`] — the plane buffers (`Samples::U8`
+/// / `Samples::U16` inner `Vec`s) are re-used in place when the
+/// frame geometry matches the previous call, avoiding 4-7 per-frame
+/// `Vec` allocations (one per plane + the RGB-decorrelation working
+/// copy). Use [`DecodedFrame::default`] (or
+/// [`DecodedFrame::empty`]) to seed an empty target for the first call.
 pub struct DecodedFrame {
     /// Frame width (luma plane width).
     pub width: u32,
@@ -45,6 +53,28 @@ pub struct DecodedFrame {
     pub header: FrameHeader,
     /// FOURCC record (family, subsampling, bit depth, …).
     pub record: FourccRecord,
+}
+
+impl DecodedFrame {
+    /// An empty frame placeholder, valid as the target slot for the
+    /// first [`decode_into`] call. The fields are populated on the
+    /// first decode; subsequent decodes re-use the per-plane storage
+    /// when geometry matches.
+    pub fn empty() -> Self {
+        Self {
+            width: 0,
+            height: 0,
+            planes: Vec::new(),
+            header: FrameHeader::placeholder(),
+            record: FourccRecord::placeholder(),
+        }
+    }
+}
+
+impl Default for DecodedFrame {
+    fn default() -> Self {
+        Self::empty()
+    }
 }
 
 /// One reconstructed plane.
@@ -111,8 +141,33 @@ impl DecodedPlane {
     }
 }
 
-/// Decode a complete v7 MAGY frame from `bytes`.
+/// Decode a complete v7 MAGY frame from `bytes`, allocating fresh
+/// per-plane buffers. Convenience wrapper around [`decode_into`] for
+/// one-shot callers.
 pub fn decode_frame(bytes: &[u8]) -> Result<DecodedFrame> {
+    let mut dst = DecodedFrame::empty();
+    decode_into(bytes, &mut dst)?;
+    Ok(dst)
+}
+
+/// Decode a complete v7 MAGY frame from `bytes` into `dst`, re-using
+/// `dst`'s per-plane buffers (`Samples::U8` / `Samples::U16` inner
+/// `Vec`s) when the geometry matches. Designed for the streaming hot
+/// path where one [`DecodedFrame`] instance is decoded into across
+/// many frames: each call avoids the 4-7 per-frame `Vec` allocations
+/// that [`decode_frame`] performs (one per plane in `plane_bufs` +
+/// one per output [`DecodedPlane`] + the working copy of the G plane
+/// used by RGB inter-plane decorrelation reversal).
+///
+/// On dimension / format-byte change the affected buffers are
+/// resized in place via [`Vec::resize`]; the underlying allocation is
+/// kept when the new size fits the existing capacity.
+///
+/// On error `dst` is left in an unspecified-but-valid state — its
+/// plane buffers may carry partially-decoded residuals; callers
+/// should treat the value as "needs re-decode" after any `Err`
+/// return.
+pub fn decode_into(bytes: &[u8], dst: &mut DecodedFrame) -> Result<()> {
     if bytes.len() < header::HEADER_SIZE {
         return Err(Error::Truncated {
             what: "MAGY frame",
@@ -344,6 +399,7 @@ pub fn decode_frame(bytes: &[u8]) -> Result<DecodedFrame> {
             #[cfg(feature = "trace")]
             tracer.as_ref(),
             hdr,
+            dst,
         )
     } else {
         decode_eight_bit(
@@ -359,8 +415,51 @@ pub fn decode_frame(bytes: &[u8]) -> Result<DecodedFrame> {
             #[cfg(feature = "trace")]
             tracer.as_ref(),
             hdr,
+            dst,
         )
     }
+}
+
+/// Pull the existing per-plane `Vec<u8>` storage out of `dst` so it
+/// can be re-used in place; returns a Vec of (resized-to-fit) buffers
+/// matching `plane_geoms`. Any plane that was previously high-bit-depth
+/// — or any size mismatch — is replaced with a fresh allocation; the
+/// reuse path costs nothing extra for the non-streaming case.
+fn take_plane_bufs_u8(dst: &mut DecodedFrame, plane_geoms: &[PlaneGeom]) -> Vec<Vec<u8>> {
+    let mut pool: Vec<Vec<u8>> = dst
+        .planes
+        .drain(..)
+        .map(|p| match p.samples {
+            Samples::U8(v) => v,
+            Samples::U16(_) => Vec::new(),
+        })
+        .collect();
+    pool.resize_with(plane_geoms.len(), Vec::new);
+    for (buf, g) in pool.iter_mut().zip(plane_geoms.iter()) {
+        let needed = g.width * g.height;
+        buf.clear();
+        buf.resize(needed, 0u8);
+    }
+    pool
+}
+
+/// 16-bit analogue of [`take_plane_bufs_u8`].
+fn take_plane_bufs_u16(dst: &mut DecodedFrame, plane_geoms: &[PlaneGeom]) -> Vec<Vec<u16>> {
+    let mut pool: Vec<Vec<u16>> = dst
+        .planes
+        .drain(..)
+        .map(|p| match p.samples {
+            Samples::U16(v) => v,
+            Samples::U8(_) => Vec::new(),
+        })
+        .collect();
+    pool.resize_with(plane_geoms.len(), Vec::new);
+    for (buf, g) in pool.iter_mut().zip(plane_geoms.iter()) {
+        let needed = g.width * g.height;
+        buf.clear();
+        buf.resize(needed, 0u16);
+    }
+    pool
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -376,12 +475,12 @@ fn decode_eight_bit(
     field_stride: FieldStride,
     #[cfg(feature = "trace")] tracer: Option<&Tracer>,
     hdr: FrameHeader,
-) -> Result<DecodedFrame> {
+    dst: &mut DecodedFrame,
+) -> Result<()> {
     let _num_planes = rec.planes as usize;
-    let mut plane_bufs: Vec<Vec<u8>> = plane_geoms
-        .iter()
-        .map(|g| vec![0u8; g.width * g.height])
-        .collect();
+    // Re-use existing per-plane storage when geometry matches; only
+    // size-mismatched (or previously-U16) slots allocate.
+    let mut plane_bufs: Vec<Vec<u8>> = take_plane_bufs_u8(dst, plane_geoms);
 
     for s in 0..total_slices {
         let plane = s / slices_per_plane;
@@ -468,13 +567,12 @@ fn decode_eight_bit(
             .collect(),
     };
 
-    Ok(DecodedFrame {
-        width: hdr.width,
-        height: hdr.height,
-        planes: final_planes,
-        header: hdr,
-        record: rec,
-    })
+    dst.width = hdr.width;
+    dst.height = hdr.height;
+    dst.planes = final_planes;
+    dst.header = hdr;
+    dst.record = rec;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -490,15 +588,13 @@ fn decode_high_bit_depth(
     field_stride: FieldStride,
     #[cfg(feature = "trace")] tracer: Option<&Tracer>,
     hdr: FrameHeader,
-) -> Result<DecodedFrame> {
+    dst: &mut DecodedFrame,
+) -> Result<()> {
     let _num_planes = rec.planes as usize;
     let bits = rec.bit_depth;
     let mask = rec.sample_mask() as u16;
 
-    let mut plane_bufs: Vec<Vec<u16>> = plane_geoms
-        .iter()
-        .map(|g| vec![0u16; g.width * g.height])
-        .collect();
+    let mut plane_bufs: Vec<Vec<u16>> = take_plane_bufs_u16(dst, plane_geoms);
 
     for s in 0..total_slices {
         let plane = s / slices_per_plane;
@@ -588,13 +684,12 @@ fn decode_high_bit_depth(
             .collect(),
     };
 
-    Ok(DecodedFrame {
-        width: hdr.width,
-        height: hdr.height,
-        planes: final_planes,
-        header: hdr,
-        record: rec,
-    })
+    dst.width = hdr.width;
+    dst.height = hdr.height;
+    dst.planes = final_planes;
+    dst.header = hdr;
+    dst.record = rec;
+    Ok(())
 }
 
 fn plane_geom(
@@ -626,14 +721,22 @@ fn reverse_rgb_decorrelation_u8(
     debug_assert!(matches!(rec.family, Family::Rgb | Family::Rgba));
     debug_assert!(wire_planes.len() == geoms.len());
     debug_assert!(wire_planes.len() >= 3);
-    let g = wire_planes[1].clone();
-    let b_prime = &mut wire_planes[0];
-    for (b, &gv) in b_prime.iter_mut().zip(g.iter()) {
-        *b = b.wrapping_add(gv);
-    }
-    let r_prime = &mut wire_planes[2];
-    for (r, &gv) in r_prime.iter_mut().zip(g.iter()) {
-        *r = r.wrapping_add(gv);
+    // Borrow B', G, R' simultaneously via disjoint slice splits — no
+    // intermediate clone of G. `wire_planes` has at least 3 entries;
+    // optional A sits in index 3.
+    {
+        let (b_slice, rest) = wire_planes.split_at_mut(1); // [B'] | [G, R', ...]
+        let (g_slice, rest2) = rest.split_at_mut(1); //         [G]  | [R', ...]
+        let (r_slice, _) = rest2.split_at_mut(1); //              [R'] | [..]
+        let b_prime = &mut b_slice[0];
+        let g_plane = &g_slice[0];
+        let r_prime = &mut r_slice[0];
+        for (b, &gv) in b_prime.iter_mut().zip(g_plane.iter()) {
+            *b = b.wrapping_add(gv);
+        }
+        for (r, &gv) in r_prime.iter_mut().zip(g_plane.iter()) {
+            *r = r.wrapping_add(gv);
+        }
     }
     let mut iter = wire_planes.into_iter();
     let b = iter.next().unwrap();
@@ -679,14 +782,21 @@ fn reverse_rgb_decorrelation_u16(
     debug_assert!(matches!(rec.family, Family::Rgb | Family::Rgba));
     debug_assert!(wire_planes.len() == geoms.len());
     debug_assert!(wire_planes.len() >= 3);
-    let g = wire_planes[1].clone();
-    let b_prime = &mut wire_planes[0];
-    for (b, &gv) in b_prime.iter_mut().zip(g.iter()) {
-        *b = b.wrapping_add(gv) & mask;
-    }
-    let r_prime = &mut wire_planes[2];
-    for (r, &gv) in r_prime.iter_mut().zip(g.iter()) {
-        *r = r.wrapping_add(gv) & mask;
+    // Same disjoint-split trick as the u8 path — borrow B', G, R' at
+    // once and avoid the working copy of G.
+    {
+        let (b_slice, rest) = wire_planes.split_at_mut(1);
+        let (g_slice, rest2) = rest.split_at_mut(1);
+        let (r_slice, _) = rest2.split_at_mut(1);
+        let b_prime = &mut b_slice[0];
+        let g_plane = &g_slice[0];
+        let r_prime = &mut r_slice[0];
+        for (b, &gv) in b_prime.iter_mut().zip(g_plane.iter()) {
+            *b = b.wrapping_add(gv) & mask;
+        }
+        for (r, &gv) in r_prime.iter_mut().zip(g_plane.iter()) {
+            *r = r.wrapping_add(gv) & mask;
+        }
     }
     let bd = rec.bit_depth;
     let mut iter = wire_planes.into_iter();

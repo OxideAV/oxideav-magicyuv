@@ -164,6 +164,50 @@ directly and never constructs a `HuffmanTable`:
 | dec M0RG / gradient / 1280×720    | 14.22 ms  | 13.44 ms    |  -5.5 % |
 | dec M8RG / median   / 256×256     |  0.95 ms  |  0.82 ms    | -13.4 % |
 
+### 7. `decode_into(&mut DecodedFrame)` streaming entry point
+
+`decode_frame` was a fresh-allocate path: every call allocated 3-4
+per-plane `Vec<u8>` / `Vec<u16>` (one per plane), plus a working
+clone of the G plane inside the RGB inter-plane decorrelation
+reversal (the prior code couldn't borrow B'/R' mutably *and* G
+immutably from the same `Vec<Vec<u8>>` so it cloned G). The new
+`decode_into(&[u8], &mut DecodedFrame)` decodes into a caller-owned
+`DecodedFrame` and reuses its per-plane `Samples::U8` / `Samples::U16`
+storage in place when geometry matches — `Vec::clear` + `resize`
+keeps the existing allocation, and `as_ptr()` + `capacity()` are
+stable across iterations (verified by the
+`decode_into_reuses_plane_storage_when_geometry_matches` unit test).
+
+The RGB decorrelation reversal (8-bit and high-bit-depth) is
+rewritten to use disjoint `split_at_mut` borrows of `[B', G, R']`,
+so the prior `wire_planes[1].clone()` working copy is gone —
+`decode_frame` itself picks up the same saving since it now wraps
+`decode_into`.
+
+`examples/quick_bench`'s decode helper now times both paths
+back-to-back. Decode-only deltas (`into=` column shows the
+`decode_into` ms; the percentage in parens is `(decode_frame -
+decode_into) / decode_frame`):
+
+| Scenario                          | decode_frame | decode_into | Δ        |
+| --------------------------------- | -----------: | ----------: | -------: |
+| M8RG / gradient / 1280×720        |    10.20 ms  |   10.00 ms  |  -2.0 % |
+| M8Y0 / gradient / 1280×720        |     4.54 ms  |    4.54 ms  |  -0.1 % |
+| M8G0 / left   / 1920×1080         |     6.03 ms  |    5.97 ms  |  -0.9 % |
+| M0RG / gradient / 1280×720 / 10b  |    12.39 ms  |   12.29 ms  |  -0.8 % |
+
+The RGB-family path benefits the most because it eliminates four
+`Vec` allocations per frame (three wire planes + the G clone) versus
+one (for Gray) or three (for YUV-4:2:0); chroma planes are also
+much smaller. Pure-malloc savings are a larger fraction of total
+work at smaller frame sizes — e.g. a 128×128 M8RG decode is a few
+hundred microseconds, mostly malloc — so streaming consumers that
+iterate over thumbnails or tile decodes will see a bigger win than
+the 1080p timings above. The trace JSONL emitter is unchanged
+(`decode_into` re-uses the storage but emits the same event sequence
+in the same order); all 83 tests under `--all-features` continue to
+pass.
+
 ## Final cumulative deltas
 
 | Scenario                             | Decode Δ | Encode Δ |
@@ -212,10 +256,13 @@ layout doesn't change). All 78 tests pass under `--features trace`.
   chain (only `cur[c-1]`); a `wrapping_add` prefix-scan over u8x16
   using `core::simd` could give another 2-3× on Gray (Left at
   1080p is the simplest predictor in our coverage).
-- **`vec![0u8; w*h]` per decode** — every `decode_frame` call
-  allocates fresh plane buffers. A `decode_into(&mut DecodedFrame)`
-  variant that re-uses caller-owned `Vec`s would avoid the per-frame
-  malloc on streaming scenarios.
+- ~~**`vec![0u8; w*h]` per decode**~~ *(resolved — `decode_into`)* —
+  the per-frame `Vec` allocations (one per plane in `plane_bufs` +
+  one per output `DecodedPlane` + the working clone of the G plane
+  in RGB decorrelation reversal) are eliminated for streaming
+  consumers by the new `decode_into(&mut DecodedFrame)` entry point.
+  `decode_frame` is now a wrapper around `decode_into` so it also
+  picks up the G-clone removal even on the fresh-allocate path.
 - **`HuffmanTable::build`** itself is on the cold path but takes
   ~2-5 % of `decode_frame` for small frames (256×256 / smaller). A
   one-shot `(symbol, length, code)` construction that skips the

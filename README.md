@@ -58,6 +58,12 @@ AVI is a container, not a codec — its demux/mux (single-RIFF AVI 1.0
 - [`decode_frame`] — decode a single MAGY-prefixed frame's bytes.
   Returns one [`DecodedPlane`] per native plane; sample storage is
   `u8` for 8-bit FOURCCs and `u16` for 10/12/14-bit FOURCCs.
+- [`decode_into`] — streaming variant. Decodes into a caller-owned
+  `DecodedFrame`, re-using the per-plane `Vec` storage from the
+  previous call when geometry matches. Skips 4-7 `Vec` allocations
+  per frame (one per plane + the prior working copy of the G plane
+  used in RGB inter-plane decorrelation reversal — that working
+  copy is also gone from `decode_frame` itself now).
 - [`encode_frame`] — encode one frame from per-plane pixel buffers.
 - [`header::parse`] — standalone v7 header parser.
 - [`Error`], [`Result`] — crate-local error type.

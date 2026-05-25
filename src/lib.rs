@@ -33,6 +33,10 @@
 //!
 //! - [`decode_frame`] — decode one MAGY-prefixed frame's bytes into
 //!   per-plane buffers.
+//! - [`decode_into`] — streaming variant that decodes into a
+//!   caller-owned [`DecodedFrame`], re-using the per-plane storage
+//!   from the previous decode when geometry matches (avoids 4-7
+//!   `Vec` allocations per frame).
 //! - [`encode_frame`] — encode one frame from per-plane pixel buffers.
 //! - [`Error`] / [`Result`] — crate-local error type.
 //!
@@ -68,7 +72,7 @@ pub mod tables;
 #[cfg(feature = "trace")]
 pub(crate) mod trace;
 
-pub use crate::decoder::{decode_frame, DecodedFrame, DecodedPlane, Samples};
+pub use crate::decoder::{decode_frame, decode_into, DecodedFrame, DecodedPlane, Samples};
 #[cfg(feature = "registry")]
 pub use crate::encoder::output_params;
 pub use crate::encoder::{encode_frame, EncodeOptions, PlaneInput, PredictorStrategy, SliceMode};

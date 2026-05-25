@@ -75,6 +75,24 @@ pub struct FrameHeader {
 }
 
 impl FrameHeader {
+    /// A zero-initialised header, used as a placeholder slot in
+    /// [`crate::decoder::DecodedFrame::empty`] before the first decode
+    /// populates it.
+    pub fn placeholder() -> Self {
+        Self {
+            format_byte: 0,
+            aux_byte: 0,
+            codec_variant: 0,
+            flags: 0,
+            width: 0,
+            height: 0,
+            width_extra: 0,
+            slice_height: 0,
+        }
+    }
+}
+
+impl FrameHeader {
     /// `true` if the header advertises interlaced field-stride
     /// prediction (`spec/04` §5.1 round-2 note). Round 1 surfaces
     /// the bit but the predictor's interlaced row-stride is
