@@ -83,6 +83,26 @@ AVI is a container, not a codec — its demux/mux (single-RIFF AVI 1.0
   Auditor's `jq`-line-diff lockstep harness against the cleanroom
   Python reference codec's `--trace` output.
 
+## Fuzzing
+
+A [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz) harness lives
+under [`fuzz/`](fuzz/). The `decode_magicyuv` target drives
+`decode_frame` on an arbitrary byte buffer, exercising the whole
+header → slice-table → preamble → per-plane Huffman → raw / Huffman
+slice payload → Left / Gradient / Median predictor inverse →
+RGB-decorrelation-reversal chain; the contract under test is that decode
+always *returns* a `Result` and never panics / overflows / indexes OOB.
+A header pre-screen skips declared rasters above a 16 MiB cap so a
+valid-but-enormous frame (a resource request, not a logic bug) doesn't
+register as an OOM false positive. The seed corpus is a spread of valid
+frames across every FOURCC family / bit-depth tier × encode mode
+(Huffman / raw / Dynamic+Auto / interlaced). Latest local baseline:
+~980 k exec in 60 s, zero crashes. CI runs it daily via `fuzz.yml`.
+
+```sh
+cd fuzz && cargo +nightly fuzz run decode_magicyuv -- -max_total_time=60
+```
+
 ## Why clean-room
 
 MagicYUV is a closed-source commercial codec by Pavel Zlatev / "ignus"

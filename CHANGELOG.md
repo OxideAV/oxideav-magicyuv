@@ -8,6 +8,18 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`cargo-fuzz` decode harness (`fuzz/`).** A `decode_magicyuv` target
+  drives `decode_frame` on arbitrary bytes, exercising the full header →
+  slice-table → preamble → per-plane Huffman → raw / Huffman payload →
+  Left / Gradient / Median predictor inverse → RGB-decorrelation-reversal
+  chain and asserting decode always returns a `Result` (never panics /
+  overflows / indexes OOB). A header pre-screen skips declared rasters
+  above a 16 MiB cap to avoid OOM false positives on valid-but-enormous
+  frames. Seed corpus spans every FOURCC family / bit-depth tier × encode
+  mode. Local baseline: ~980 k exec in 60 s, zero crashes. A daily
+  `fuzz.yml` workflow runs it in CI. No `src/` changes — the existing
+  decoder was already panic-free across the fuzzed input space.
+
 - **`decode_into(&[u8], &mut DecodedFrame)` streaming entry point.**
   The existing [`decode_frame`] always allocates fresh per-plane
   `Vec`s (one per plane in `plane_bufs`, one per output `DecodedPlane`,
