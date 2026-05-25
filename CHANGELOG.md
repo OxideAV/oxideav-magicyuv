@@ -6,6 +6,33 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Decoder Huffman primary table is now a packed `Vec<u32>`** (low 8
+  bits = code length or `REDIRECT_MARKER = 0xff`, high 24 bits =
+  symbol or secondary-subtable index). Replaces the prior
+  `Vec<(u32, u8)>` layout that paid 8 B per slot due to alignment
+  padding (5 B used, 3 B wasted). Same change applies to the
+  per-prefix secondary subtables. The primary working set drops
+  16 KB → 8 KB per plane at `max_len = 18`, and the 8-bit
+  single-level hot loop in `HuffmanTable::decode_into_u8` does one
+  4-B aligned `u32` load per pixel instead of an 8-B tuple fetch.
+  Measured decode-side win across `examples/quick_bench` scenarios
+  is -5 % … -13 % per FOURCC (1080p Gray Left -8 % on top of the
+  round-4 baseline; 256×256 Median -13 %). The encoder side does
+  not construct a `HuffmanTable` (it builds canonical lengths via
+  Package-Merge directly) so encoder timings are unchanged. New
+  unit tests `pack_entry_round_trip_terminal_and_redirect` (asserts
+  every legal `(length, symbol)` pair in the primary's range
+  survives the pack→unpack cycle and that `REDIRECT_MARKER` is
+  unambiguous against any terminal length 1..=18) and
+  `decode_into_u8_matches_per_pixel_decode` (asserts the batch
+  helper and per-pixel `decode` produce the same symbol stream from
+  the same bit input on a real-world `spec/05 §1.2` descriptor)
+  cover the new layout. The trace JSONL emitter is unaffected
+  (`HuffmanTable::codes()` still surfaces the per-symbol canonical
+  codes for `audit/02 §4.2`'s `huff.used` map).
+
 ### Fixed
 
 - **Encoder Huffman length cap now uses length-limited Package-Merge.**

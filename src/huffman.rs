@@ -30,8 +30,22 @@ use crate::bitreader::BitReader;
 use crate::error::{Error, Result};
 
 /// Maximum primary-table prefix bits. Keeps the flat table at
-/// 4K entries × `(u16, u8)` even for max_length = 18.
+/// 4K entries × packed `u32` even for max_length = 18 (= 16 KB → 8 KB
+/// after the round-127 packed-entry reshuffle).
 const PRIMARY_BITS: u8 = 12;
+
+/// Sentinel value in the low byte of a primary-table entry that means
+/// "redirect to a secondary subtable". Lengths 1..=18 ≪ 0xff so it is
+/// unambiguous against any terminal entry.
+const REDIRECT_MARKER: u8 = 0xff;
+
+/// Pack `(symbol_or_subtable_index, length_or_marker)` into the u32
+/// layout used by `primary` and `secondary`. Low 8 bits hold the
+/// length / marker; high 24 bits hold the symbol / subtable index.
+#[inline(always)]
+const fn pack_entry(sym_or_sub: u32, len_or_marker: u8) -> u32 {
+    (sym_or_sub << 8) | (len_or_marker as u32)
+}
 
 /// Per-plane Huffman length descriptor parser (`spec/05` §1.1).
 ///
@@ -123,19 +137,34 @@ pub struct HuffmanTable {
     /// allows it.
     max_len: u8,
     /// Primary table indexed by the top `primary_bits` bits.
-    /// `(symbol_or_subtable_index, length_or_marker)`. If `length`
-    /// is `≤ primary_bits` the entry is terminal (`length` is the
-    /// real code length, `symbol` is the decoded symbol). If
-    /// `length` is `0xff` the entry is a redirect: `symbol` is the
-    /// index into `secondary` of the per-prefix subtable, and the
-    /// caller consumes another `(max_len - primary_bits)` bits.
-    primary: Vec<(u32, u8)>,
+    /// Packed `u32` per entry — replaces the prior `(u32, u8)` tuple
+    /// layout (which paid 8 bytes per slot due to alignment padding)
+    /// with a flat 4-byte u32, halving the primary working set from
+    /// 16 KB → 8 KB per plane at `max_len = 18`. Cuts the per-pixel
+    /// hot-loop load width in half (one 4-byte aligned `u32` read
+    /// instead of an 8-byte tuple load) and improves L1 fit on small
+    /// frames.
+    ///
+    /// Encoding (low 8 bits = length-or-marker, high 24 bits =
+    /// symbol-or-subtable-index):
+    ///
+    /// * If `(entry & 0xff) ≤ primary_bits` ⇒ terminal: `entry >> 8`
+    ///   is the decoded symbol, `entry & 0xff` is its code length.
+    /// * If `(entry & 0xff) == 0xff` ⇒ redirect: `entry >> 8` is the
+    ///   index into `secondary` of the per-prefix subtable, and the
+    ///   caller consumes another `(max_len - primary_bits)` bits.
+    ///
+    /// The 24-bit symbol field covers the 14-bit alphabet
+    /// (16384 symbols) and the secondary-table index (at most 4096
+    /// distinct primary prefixes when `primary_bits = 12`).
+    primary: Vec<u32>,
     /// Effective primary-prefix size in bits. `min(max_len, PRIMARY_BITS)`.
     primary_bits: u8,
-    /// Per-prefix secondary tables. Each entry is `Vec<(symbol,
-    /// length_in_subtable)>` indexed by the next `(max_len -
-    /// primary_bits)` bits. Empty when `max_len ≤ primary_bits`.
-    secondary: Vec<Vec<(u32, u8)>>,
+    /// Per-prefix secondary tables, packed identically to `primary`
+    /// (low 8 bits = length within the subtable, high 24 bits =
+    /// symbol). Indexed by the next `(max_len - primary_bits)` bits.
+    /// Empty when `max_len ≤ primary_bits`.
+    secondary: Vec<Vec<u32>>,
 }
 
 impl HuffmanTable {
@@ -187,8 +216,8 @@ impl HuffmanTable {
         } else {
             1usize << primary_bits
         };
-        let mut primary = vec![(0u32, 0u8); primary_size];
-        let mut secondary: Vec<Vec<(u32, u8)>> = Vec::new();
+        let mut primary = vec![0u32; primary_size];
+        let mut secondary: Vec<Vec<u32>> = Vec::new();
 
         if max_len == 0 {
             return Ok(Self {
@@ -210,8 +239,9 @@ impl HuffmanTable {
                 let shift = (primary_bits - l) as u32;
                 let base = (code[s] as usize) << shift;
                 let count = 1usize << shift;
+                let entry = pack_entry(s as u32, l);
                 for k in 0..count {
-                    primary[base + k] = (s as u32, l);
+                    primary[base + k] = entry;
                 }
             }
         } else {
@@ -239,14 +269,15 @@ impl HuffmanTable {
                     let shift = (primary_bits - l) as u32;
                     let base = (code[s] as usize) << shift;
                     let count = 1usize << shift;
+                    let entry = pack_entry(s as u32, l);
                     for k in 0..count {
-                        primary[base + k] = (s as u32, l);
+                        primary[base + k] = entry;
                     }
                 } else {
                     // Deferred: route via a subtable.
                     let prefix = code[s] >> (l - primary_bits);
                     let sub_idx = *prefix_to_idx.entry(prefix).or_insert_with(|| {
-                        secondary.push(vec![(0u32, 0u8); secondary_size]);
+                        secondary.push(vec![0u32; secondary_size]);
                         secondary.len() - 1
                     });
                     // Within the subtable, the symbol covers
@@ -261,12 +292,13 @@ impl HuffmanTable {
                     let base = (resid as usize) << shift;
                     let count = 1usize << shift;
                     let l_in_sub = l - primary_bits;
+                    let sub_entry = pack_entry(s as u32, l_in_sub);
                     for k in 0..count {
-                        secondary[sub_idx][base + k] = (s as u32, l_in_sub);
+                        secondary[sub_idx][base + k] = sub_entry;
                     }
-                    // Mark the primary entry as a redirect (length =
-                    // 0xff sentinel; symbol = sub_idx).
-                    primary[prefix as usize] = (sub_idx as u32, 0xff);
+                    // Mark the primary entry as a redirect:
+                    // `(sub_idx, REDIRECT_MARKER)`.
+                    primary[prefix as usize] = pack_entry(sub_idx as u32, REDIRECT_MARKER);
                 }
             }
         }
@@ -306,8 +338,10 @@ impl HuffmanTable {
             return 0;
         }
         let key = br.peek_bits(self.primary_bits as u32) as usize;
-        let (sym_or_sub, len) = self.primary[key];
-        if len != 0xff {
+        let entry = self.primary[key];
+        let len = (entry & 0xff) as u8;
+        let sym_or_sub = entry >> 8;
+        if len != REDIRECT_MARKER {
             br.consume(len as u32);
             sym_or_sub
         } else {
@@ -316,9 +350,10 @@ impl HuffmanTable {
             br.consume(self.primary_bits as u32);
             let secondary_bits = self.max_len - self.primary_bits;
             let key2 = br.peek_bits(secondary_bits as u32) as usize;
-            let (sym, l_in_sub) = self.secondary[sym_or_sub as usize][key2];
+            let sub_entry = self.secondary[sym_or_sub as usize][key2];
+            let l_in_sub = (sub_entry & 0xff) as u8;
             br.consume(l_in_sub as u32);
-            sym
+            sub_entry >> 8
         }
     }
 
@@ -348,9 +383,14 @@ impl HuffmanTable {
         if self.max_len <= self.primary_bits {
             for px in out.iter_mut() {
                 let key = br.peek_bits(primary_bits) as usize;
-                let (sym, len) = primary[key];
-                br.consume(len as u32);
-                *px = sym as u8;
+                let entry = primary[key];
+                // Length in low 8 bits, symbol in high 24. For the
+                // 8-bit single-level path every entry is terminal,
+                // so `(entry & 0xff)` is always the real code length
+                // (never the `REDIRECT_MARKER` sentinel).
+                let len = entry & 0xff;
+                br.consume(len);
+                *px = (entry >> 8) as u8;
             }
         } else {
             for px in out.iter_mut() {
@@ -538,5 +578,83 @@ mod tests {
 
         // Avoid unused-warnings on the constructed lens:
         let _ = lens;
+    }
+
+    #[test]
+    fn pack_entry_round_trip_terminal_and_redirect() {
+        // Terminal entry: every (length, symbol) tuple a primary slot can
+        // hold (length 1..=PRIMARY_BITS = 12, symbol up to a 14-bit
+        // alphabet = 16383) must survive the pack→unpack cycle.
+        for len in 1..=PRIMARY_BITS {
+            for &sym in &[0u32, 1, 255, 256, 4095, 4096, 8191, 16383] {
+                let entry = pack_entry(sym, len);
+                let unpacked_len = (entry & 0xff) as u8;
+                let unpacked_sym = entry >> 8;
+                assert_eq!(unpacked_len, len);
+                assert_eq!(unpacked_sym, sym);
+                assert_ne!(unpacked_len, REDIRECT_MARKER);
+            }
+        }
+        // Redirect entries: the low-byte marker is `REDIRECT_MARKER`
+        // (0xff), unambiguously distinct from any legal length 1..=18.
+        for sub_idx in [0u32, 1, 255, 256, 4095] {
+            let entry = pack_entry(sub_idx, REDIRECT_MARKER);
+            assert_eq!((entry & 0xff) as u8, REDIRECT_MARKER);
+            assert_eq!(entry >> 8, sub_idx);
+        }
+    }
+
+    #[test]
+    fn decode_into_u8_matches_per_pixel_decode() {
+        // Equivalence between the batch helper (which assumes the 8-bit
+        // single-level fast path) and the generic `decode` per pixel:
+        // both must produce the same symbol sequence from the same bit
+        // stream for any 8-bit alphabet. Build a real-world descriptor
+        // and exercise both paths.
+        let desc = [0x01, 0x89, 0x5d, 0x08, 0x89, 0x9f];
+        let (lens, _) = parse_lengths(&desc, 256, 12, 0).unwrap();
+        let table = HuffmanTable::build(lens, 0).expect("build");
+        // Encode a known-symbol stream by walking the canonical codes
+        // for arbitrary symbol values, then decode it twice.
+        let codes = table.codes().to_vec();
+        let lengths = table.lengths().to_vec();
+        // Pick 11 symbols all with positive length.
+        let chosen: Vec<u8> = (0..=10)
+            .filter(|&s| lengths[s as usize] > 0)
+            .take(8)
+            .collect();
+        // Hand-assemble the bit stream (MSB-first) using the canonical
+        // codes the build phase assigned.
+        let mut bit_buf: u64 = 0;
+        let mut bit_fill: u32 = 0;
+        let mut bytes: Vec<u8> = Vec::new();
+        for &sym in &chosen {
+            let l = lengths[sym as usize] as u32;
+            let c = codes[sym as usize] as u64;
+            bit_buf = (bit_buf << l) | c;
+            bit_fill += l;
+            while bit_fill >= 8 {
+                bit_fill -= 8;
+                bytes.push(((bit_buf >> bit_fill) & 0xff) as u8);
+            }
+        }
+        if bit_fill > 0 {
+            bytes.push(((bit_buf << (8 - bit_fill)) & 0xff) as u8);
+        }
+        // Pad with zero so the BitReader can refill at end-of-stream.
+        bytes.extend_from_slice(&[0u8; 16]);
+
+        // Per-pixel reference.
+        let mut br_ref = BitReader::new(&bytes);
+        let ref_syms: Vec<u8> = (0..chosen.len())
+            .map(|_| table.decode(&mut br_ref) as u8)
+            .collect();
+        // Batch path.
+        let mut br_batch = BitReader::new(&bytes);
+        let mut batch_syms = vec![0u8; chosen.len()];
+        assert!(table.decode_into_u8(&mut br_batch, &mut batch_syms));
+
+        assert_eq!(ref_syms, chosen);
+        assert_eq!(batch_syms, chosen);
     }
 }

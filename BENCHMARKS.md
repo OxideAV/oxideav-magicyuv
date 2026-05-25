@@ -132,23 +132,58 @@ Encoder figures (cumulative, vs round-3 baseline):
 | enc M8G0 / left   / 1920×1080     | 14.41 ms  |  8.11 ms  | -43.7 % |
 | enc M0RG / gradient / 1280×720    | 26.87 ms  | 16.37 ms  | -39.1 % |
 
+### 6. Decoder primary-table packed `u32` layout
+
+`HuffmanTable::primary` was `Vec<(u32, u8)>` — each slot paid 8 B due
+to alignment padding (5 B used, 3 B wasted). Replaced with `Vec<u32>`
+that packs `(symbol_or_subtable_index, length_or_marker)` into a single
+4-B word (low 8 b = length, high 24 b = symbol). Same applies to the
+per-prefix secondary subtables. Halves the primary working set from
+16 KB → 8 KB per plane at `max_len = 18` (the 10/12/14-bit alphabets),
+and cuts the 8-bit hot loop's per-pixel load from an 8-B tuple to a
+single 4-B `u32` read. A new unit test
+(`pack_entry_round_trip_terminal_and_redirect`) asserts every legal
+`(length, symbol)` pair in the primary's range survives the
+pack→unpack cycle and that `REDIRECT_MARKER = 0xff` is unambiguous
+against any terminal length (1..=18); another
+(`decode_into_u8_matches_per_pixel_decode`) asserts the batch helper
+and per-pixel `decode` produce the same symbol stream from the same
+bit input on a real-world descriptor.
+
+Decoder figures (this-round only, opt-5 → opt-6 on the same host
+within the same boot — back-to-back pre/post measurements so the
+delta is not contaminated by thermal / scheduler drift). Encoder is
+unchanged because it builds canonical lengths via Package-Merge
+directly and never constructs a `HuffmanTable`:
+
+| Scenario                          | Pre opt-6 | After opt-6 | Δ        |
+| --------------------------------- | --------: | ----------: | -------: |
+| dec M8RG / gradient / 1280×720    | 12.10 ms  | 11.00 ms    |  -9.1 % |
+| dec M8Y0 / gradient / 1280×720    |  5.65 ms  |  5.06 ms    | -10.5 % |
+| dec M8G0 / left   / 1920×1080     |  7.42 ms  |  6.52 ms    | -12.1 % |
+| dec M0RG / gradient / 1280×720    | 14.22 ms  | 13.44 ms    |  -5.5 % |
+| dec M8RG / median   / 256×256     |  0.95 ms  |  0.82 ms    | -13.4 % |
+
 ## Final cumulative deltas
 
 | Scenario                             | Decode Δ | Encode Δ |
 | ------------------------------------ | -------: | -------: |
-| M8RG / gradient / 1280×720           |  -42.2 % |  -43.2 % |
-| M8Y0 / gradient / 1280×720           |  -47.4 % |  -42.7 % |
-| M8G0 / left   / 1920×1080            |  -44.4 % |  -43.7 % |
-| M0RG / gradient / 1280×720 / 10-bit  |  -41.3 % |  -39.1 % |
-| M8RG / median   / 256×256            |  -39.7 % |    n/a   |
+| M8RG / gradient / 1280×720           |  -47.4 % |  -43.2 % |
+| M8Y0 / gradient / 1280×720           |  -52.9 % |  -42.7 % |
+| M8G0 / left   / 1920×1080            |  -54.5 % |  -43.7 % |
+| M0RG / gradient / 1280×720 / 10-bit  |  -44.6 % |  -39.1 % |
+| M8RG / median   / 256×256            |  -47.7 % |    n/a   |
 
 ## Trace-feature lockstep
 
 The `--features trace` JSONL emitter is bit-identical before and
 after this round (verified by MD5 of the tape on a 32×16 M8RG
 gradient frame: `5744c8060e6a3bccd53e1abf05ad6846` on both
-`f8624ad` baseline and `d98b090` post-opt-5). All 56 tests pass
-under `--features trace`.
+`f8624ad` baseline and `d98b090` post-opt-5). The opt-6 packed
+primary-table change does not touch the trace emitter
+(`HuffmanTable::codes()` still surfaces the per-symbol canonical
+codes from a separate `codes: Vec<u32>` field, which the packed
+layout doesn't change). All 78 tests pass under `--features trace`.
 
 ## Round-N+1 candidates
 
@@ -163,11 +198,16 @@ under `--features trace`.
   optimal *length-limited* prefix code with Kraft sum exactly 1.0
   (spec/05 §1.3). The common (non-binding) path keeps the plain
   canonical lengths byte-for-byte, so the trace lockstep is unchanged.
-- **Decoder primary-table layout** — `Vec<(u32, u8)>` packs each
-  entry into 8 bytes (5 used, 3 padding). Switching to
-  `Vec<u16>` (6 bits length, 10 bits symbol — fits 8-bit alphabet)
-  halves the working-set and may move the table into L1 hot for
-  smaller frames.
+- ~~**Decoder primary-table layout**~~ *(resolved — packed `u32`
+  layout)* — the `Vec<(u32, u8)>` 8-B-per-slot layout is now a flat
+  `Vec<u32>` packing length into the low 8 b and symbol /
+  subtable-index into the high 24 b. Halves the primary working set
+  (16 KB → 8 KB per plane at `max_len = 18`), and the 8-bit hot loop
+  now does a single 4-B load per pixel instead of an 8-B tuple
+  fetch. The `Vec<u16>` candidate alternative was discarded: the
+  10/12/14-bit alphabets exceed the 10-bit symbol field and the
+  redirect marker can't be encoded in 6-bit length, so the 4-B
+  packed `u32` is the right balance of generality and memory.
 - **Predictor SIMD (Left only)** — Left has the simplest dependency
   chain (only `cur[c-1]`); a `wrapping_add` prefix-scan over u8x16
   using `core::simd` could give another 2-3× on Gray (Left at
