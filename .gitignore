@@ -1,1 +1,12 @@
-Cargo.lock
+# Rust build lockfile — this crate is a library, so we do not commit its
+# Cargo.lock per https://doc.rust-lang.org/cargo/faq.html#why-do-binaries-have-cargolock-in-version-control-but-not-libraries
+# Anchored to the crate root with a leading `/` so the cargo-fuzz binary
+# crate under fuzz/ (a `publish = false` binary, which conventionally
+# pins its lockfile for reproducible fuzz builds) is exempt. Matches
+# sibling oxideav-utvideo / oxideav-qoi.
+#
+# Without the anchor, `Cargo.lock` glob-matches `fuzz/Cargo.lock`, which
+# release-plz then flags as "both committed and in .gitignore" and
+# refuses to compute next-version (its preflight tree-cleanliness
+# check). The anchored form scopes the ignore to the crate root only.
+/Cargo.lock
