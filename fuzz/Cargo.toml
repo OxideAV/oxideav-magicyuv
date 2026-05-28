@@ -7,24 +7,36 @@ edition = "2021"
 [package.metadata]
 cargo-fuzz = true
 
-# MagicYUV's v7 frame decoder is the part worth fuzzing: a 32-byte
-# header (`spec/01` §3) selects one of 17 native FOURCCs (8/10/12/14-bit
-# RGB / RGBA / YUV / YUVA / Gray), after which a `(N+1)`-entry u32 slice
-# table, a per-slice preamble (plane count + plane-index bytes + the
-# per-plane canonical-Huffman length descriptors of `spec/05` §2.0), and
-# the per-slice payloads (raw or Huffman-coded residuals) are walked and
+# MagicYUV's v7 frame decoder + encoder are both worth fuzzing.
+#
+# Decoder (`decode_magicyuv`): a 32-byte header (`spec/01` §3) selects
+# one of 17 native FOURCCs (8/10/12/14-bit RGB / RGBA / YUV / YUVA /
+# Gray), after which a `(N+1)`-entry u32 slice table, a per-slice
+# preamble (plane count + plane-index bytes + the per-plane
+# canonical-Huffman length descriptors of `spec/05` §2.0), and the
+# per-slice payloads (raw or Huffman-coded residuals) are walked and
 # run through the Left / Gradient / Median predictor inverse — Median
 # being modular at 8-bit and standard JPEG-LS at 10/12/14-bit, with an
 # optional interlaced field-stride and an RGB inter-plane decorrelation
-# reversal. There is no external library worth pulling in as a
+# reversal. Feed arbitrary bytes to `decode_frame` and assert it
+# always returns a `Result` rather than panicking / aborting /
+# overflowing / indexing OOB / OOMing.
+#
+# Encoder (`encode_magicyuv`): drives `encode_frame(rec, w, h,
+# slice_height, planes, options)` across the full parameter cube —
+# 17 FOURCCs × 4 predictor strategies (Fixed{Left,Gradient,Median} +
+# Dynamic) × 3 slice modes (Huffman/Raw/Auto) × interlaced on/off — and
+# asserts (a) the encoder never panics on hostile inputs, (b) every
+# `Ok(bytes)` round-trips through `decode_frame` byte-for-byte (the
+# encoder is not allowed to emit syntactically-malformed bytes its own
+# decoder rejects). There is no external library worth pulling in as a
 # cross-decode oracle (and the clean-room wall bars any reference codec
-# source anyway), so this fuzz crate is **decode-only**: feed arbitrary
-# bytes to `decode_frame` and assert it always returns a `Result` rather
-# than panicking / aborting / overflowing / indexing OOB / OOMing.
+# source anyway), so the round-trip *to our own decoder* is the
+# correctness witness.
 #
 # `default-features = false` keeps the framework registry (and its
-# `oxideav-core` dependency) out of the fuzz binary — the decoder entry
-# point is feature-independent.
+# `oxideav-core` dependency) out of the fuzz binary — both entry points
+# are feature-independent.
 [dependencies]
 libfuzzer-sys = "0.4"
 
@@ -42,5 +54,11 @@ debug = 1
 [[bin]]
 name = "decode_magicyuv"
 path = "fuzz_targets/decode_magicyuv.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "encode_magicyuv"
+path = "fuzz_targets/encode_magicyuv.rs"
 test = false
 doc = false

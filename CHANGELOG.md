@@ -8,6 +8,30 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`cargo-fuzz` encode harness (`fuzz/fuzz_targets/encode_magicyuv.rs`).**
+  A second target drives `encode_frame(rec, w, h, slice_height, planes,
+  options)` across the full parameter cube — 17 FOURCCs (8 + 10/12/14-bit
+  RGB / RGBA / YUV / YUVA / Gray) × 4 predictor strategies
+  (`Fixed{Left,Gradient,Median}` + Dynamic) × 3 per-slice modes
+  (Huffman / Raw / Auto) × interlaced on/off — and asserts (a) the
+  encoder never panics on hostile inputs, (b) every `Ok(bytes)` round-
+  trips through `decode_frame` byte-for-byte (the encoder is forbidden
+  from emitting wire bytes its own decoder rejects). The harness
+  enforces the implicit encoder precondition `slice_height % rec.sub_y
+  == 0` (the spec's v2.4.2 default `slice_height = 28` satisfies it
+  trivially at every native subsampling); a smaller seed would round
+  chroma `plane_slice_height` to 0 and silently drop the chroma planes
+  from the wire — out of scope for a fuzz harness driving legal
+  encoder inputs. Local baseline: ~210 k exec / 60 s, ~418 k / 180 s,
+  zero crashes. Dimensions capped at 32×32 to keep the budget on
+  logic (canonical-Huffman builder + length-limited Package-Merge
+  fallback, slice-range arithmetic, RGB decorrelate, bit-pack/unpack
+  symmetry, Dynamic per-slice predictor selection, Auto per-slice mode
+  comparison) rather than allocator branches. The existing daily
+  `fuzz.yml` workflow's reusable `crate-fuzz.yml` auto-discovers the
+  new target and splits the 1800-s total budget evenly across both
+  `decode_magicyuv` and `encode_magicyuv`. No `src/` changes.
+
 - **`cargo-fuzz` decode harness (`fuzz/`).** A `decode_magicyuv` target
   drives `decode_frame` on arbitrary bytes, exercising the full header →
   slice-table → preamble → per-plane Huffman → raw / Huffman payload →

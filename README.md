@@ -85,22 +85,40 @@ AVI is a container, not a codec — its demux/mux (single-RIFF AVI 1.0
 
 ## Fuzzing
 
-A [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz) harness lives
-under [`fuzz/`](fuzz/). The `decode_magicyuv` target drives
-`decode_frame` on an arbitrary byte buffer, exercising the whole
-header → slice-table → preamble → per-plane Huffman → raw / Huffman
-slice payload → Left / Gradient / Median predictor inverse →
-RGB-decorrelation-reversal chain; the contract under test is that decode
-always *returns* a `Result` and never panics / overflows / indexes OOB.
-A header pre-screen skips declared rasters above a 16 MiB cap so a
-valid-but-enormous frame (a resource request, not a logic bug) doesn't
-register as an OOM false positive. The seed corpus is a spread of valid
-frames across every FOURCC family / bit-depth tier × encode mode
-(Huffman / raw / Dynamic+Auto / interlaced). Latest local baseline:
-~980 k exec in 60 s, zero crashes. CI runs it daily via `fuzz.yml`.
+Two [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz) harnesses
+live under [`fuzz/`](fuzz/), both wired into the daily `fuzz.yml`
+workflow that splits a 1800-s total budget evenly across them.
+
+**`decode_magicyuv`** drives `decode_frame` on an arbitrary byte
+buffer, exercising the whole header → slice-table → preamble →
+per-plane Huffman → raw / Huffman slice payload → Left / Gradient /
+Median predictor inverse → RGB-decorrelation-reversal chain; the
+contract under test is that decode always *returns* a `Result` and
+never panics / overflows / indexes OOB. A header pre-screen skips
+declared rasters above a 16 MiB cap so a valid-but-enormous frame (a
+resource request, not a logic bug) doesn't register as an OOM false
+positive. Seed corpus spans every FOURCC family / bit-depth tier ×
+encode mode (Huffman / raw / Dynamic+Auto / interlaced). Latest local
+baseline: ~980 k exec in 60 s, zero crashes.
+
+**`encode_magicyuv`** drives `encode_frame(rec, w, h, slice_height,
+planes, options)` across the full parameter cube — 17 native v7
+FOURCCs (8 + 10/12/14-bit RGB / RGBA / YUV / YUVA / Gray) × 4
+predictor strategies (`Fixed{Left,Gradient,Median}` + Dynamic) × 3
+per-slice modes (Huffman / Raw / Auto) × interlaced on/off. Two
+contracts are checked: (a) the encoder never panics on hostile inputs,
+(b) every `Ok(bytes)` round-trips through `decode_frame` byte-for-byte
+(the encoder is forbidden from emitting wire bytes its own decoder
+rejects). Dimensions capped at 32×32 so the budget lands on encode
+logic — canonical-Huffman builder + length-limited Package-Merge
+fallback, slice-range arithmetic, RGB decorrelate, bit-pack/unpack
+symmetry, Dynamic per-slice predictor selection, Auto per-slice mode
+comparison — rather than allocator branches. Latest local baseline:
+~210 k exec / 60 s, ~418 k / 180 s, zero crashes.
 
 ```sh
 cd fuzz && cargo +nightly fuzz run decode_magicyuv -- -max_total_time=60
+cd fuzz && cargo +nightly fuzz run encode_magicyuv -- -max_total_time=60
 ```
 
 ## Why clean-room
