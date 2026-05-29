@@ -539,9 +539,27 @@ pub(crate) struct BitWriter {
 }
 
 impl BitWriter {
-    pub(crate) fn new() -> Self {
+    /// Allocate the output buffer up front. Saves the geometric `Vec`
+    /// reallocations on the slice-payload hot path, where the caller
+    /// already knows a tight upper bound on the encoded byte count:
+    ///
+    /// - For 8-bit Auto / Huffman slice payloads the cap is `pixels`
+    ///   bytes (Auto's Huffman branch fails over to raw the moment the
+    ///   encoded size would exceed it; pure Huffman mode is bounded by
+    ///   `(pixels * max_huff_len + 7) / 8` ≤ 1.5 * pixels at
+    ///   max_huff_len = 12 for the 8-bit alphabet).
+    /// - For 10/12/14-bit raw payloads the cap is exactly
+    ///   `(pixels * bits + 7) / 8`.
+    /// - For Auto-comparison Huffman buffers the same `pixels` /
+    ///   `(pixels * bits + 7) / 8` ceiling applies.
+    ///
+    /// Slightly over-provisioning is harmless — the worst-case
+    /// difference is a single allocator slop block which `Vec::shrink_to`
+    /// could reclaim post-hoc but we don't because the resulting buffer
+    /// is short-lived (assembled into the frame and dropped).
+    pub(crate) fn with_capacity(byte_cap: usize) -> Self {
         Self {
-            bytes: Vec::new(),
+            bytes: Vec::with_capacity(byte_cap),
             acc: 0,
             bits_used: 0,
         }
@@ -805,7 +823,14 @@ fn encode_frame_u8(
             SliceMode::Raw => 0x01,
             SliceMode::Auto => {
                 let huff = &plane_huffs[plane];
-                let mut bw = BitWriter::new();
+                // Pre-size to the raw-size upper bound: under Auto, any
+                // Huffman encoding exceeding `raw_size` would lose to
+                // raw, so the actual emitted byte count is ≤ `raw_size`
+                // when Huffman wins. Add 1 for the partial-byte tail
+                // `finish()` flushes (`bits_used ∈ [1,7]` ⇒ one more
+                // byte). Eliminates ~17 geometric reallocations per
+                // slice at 1280×28 = 35840 input bytes.
+                let mut bw = BitWriter::with_capacity(raw_size + 1);
                 for &sym in res_block {
                     let len = huff.lengths[sym as usize];
                     let code = huff.codes[sym as usize];
@@ -821,7 +846,13 @@ fn encode_frame_u8(
             }
         };
 
-        let mut payload = Vec::new();
+        // Pre-size the per-slice payload: flags + pred_id + body. The
+        // body is `raw_size` for raw, `huff_buf.len()` (≤ raw_size + 1)
+        // for cached-Auto, and bounded by the 8-bit max-Huffman-length
+        // `(pixels * 12 + 7) / 8` for fresh-Huffman. Use `raw_size + 2`
+        // as a tight upper bound for the common path; oversized cases
+        // will just realloc once at the end.
+        let mut payload = Vec::with_capacity(raw_size + 2);
         payload.push(flags);
         payload.push(pred_id);
 
@@ -831,7 +862,13 @@ fn encode_frame_u8(
             payload.extend(buf);
         } else {
             let huff = &plane_huffs[plane];
-            let mut bw = BitWriter::new();
+            // Pure-Huffman mode (SliceMode::Huffman): output bounded by
+            // `(pixels * max_huff_len + 7) / 8` ≤ 1.5 * raw_size at the
+            // 8-bit alphabet's `max_huff_len = 12`. Pre-size to
+            // `raw_size + raw_size / 2 + 1` so the common path doesn't
+            // reallocate; pathological skewed slices will still grow
+            // gracefully.
+            let mut bw = BitWriter::with_capacity(raw_size + raw_size / 2 + 1);
             for &sym in res_block {
                 let len = huff.lengths[sym as usize];
                 let code = huff.codes[sym as usize];
@@ -1158,7 +1195,9 @@ fn encode_frame_u16(
             SliceMode::Raw => 0x01,
             SliceMode::Auto => {
                 let huff = &plane_huffs[plane];
-                let mut bw = BitWriter::new();
+                // See the u8 Auto branch for the cap reasoning. At
+                // 10/12/14-bit `raw_size = (pixels * bits + 7) / 8`.
+                let mut bw = BitWriter::with_capacity(raw_size + 1);
                 for &sym in res_block {
                     let len = huff.lengths[sym as usize];
                     let code = huff.codes[sym as usize];
@@ -1174,13 +1213,21 @@ fn encode_frame_u16(
             }
         };
 
-        let mut payload = Vec::new();
+        // Pre-size the per-slice payload. For the 10/12/14-bit path,
+        // pure-Huffman mode is capped by `(pixels * max_huff_len + 7)
+        // / 8` with `max_huff_len ∈ {14,16,18}` (spec/05 §1) — the
+        // worst-case ratio over `raw_size = (pixels * bits + 7) / 8` is
+        // `max_huff_len / bits ≤ 18/10 = 1.8`. We use the same `2 *
+        // raw_size + 2` cap as a comfortable margin.
+        let mut payload = Vec::with_capacity(2 * raw_size + 2);
         payload.push(flags);
         payload.push(pred_id);
 
         if flags & 0x01 != 0 {
-            // Bit-pack at `bits` bits MSB-first.
-            let mut bw = BitWriter::new();
+            // Bit-pack at `bits` bits MSB-first. Output is exactly
+            // `raw_size` bytes (final partial byte already accounted
+            // for by `div_ceil`).
+            let mut bw = BitWriter::with_capacity(raw_size);
             for &sym in res_block {
                 bw.write(sym as u32, bits);
             }
@@ -1189,7 +1236,9 @@ fn encode_frame_u16(
             payload.extend(buf);
         } else {
             let huff = &plane_huffs[plane];
-            let mut bw = BitWriter::new();
+            // See the u8 fresh-Huffman comment for the cap rationale;
+            // 1.8 × raw_size at 10-bit is the worst case.
+            let mut bw = BitWriter::with_capacity(2 * raw_size + 1);
             for &sym in res_block {
                 let len = huff.lengths[sym as usize];
                 let code = huff.codes[sym as usize];

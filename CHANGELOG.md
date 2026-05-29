@@ -6,7 +6,45 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Encoder slice-payload `BitWriter` pre-allocation.** The
+  `encode_frame_u8` / `encode_frame_u16` slice-emit hot path
+  constructed `BitWriter::new()` (zero-capacity `Vec<u8>`) at five
+  sites per Auto-mode slice (Auto Huffman trial, fresh-Huffman
+  re-emit, u16 raw bit-pack, u16 Auto trial, u16 fresh-Huffman emit).
+  Each `bw.write` grew its backing buffer geometrically — ~17
+  reallocations for a 1280×28 8-bit slice (35840 bytes), each
+  copying the prefix. Every site now uses
+  `BitWriter::with_capacity(byte_cap)` with a known upper bound
+  (raw_size + 1 for Auto comparison; `raw_size + raw_size / 2 + 1`
+  for 8-bit fresh-Huffman at `max_huff_len = 12`; `2 * raw_size + 1`
+  for the 10/12/14-bit fresh-Huffman at `max_huff_len ∈ {14,16,18}`).
+  The per-slice `payload` `Vec` is similarly pre-sized so the final
+  `payload.extend(bw.finish())` doesn't pay one more allocation. The
+  unused `BitWriter::new()` is removed in the same commit. Same
+  observable byte stream — all 83 unit + round-trip tests pass
+  under `--all-features` and 74 under `--no-default-features`.
+  Measured improvement on the new
+  `examples/quick_bench dynamic` scenario
+  (`EncodeOptions::dynamic_auto()` = `PredictorStrategy::Dynamic` +
+  `SliceMode::Auto`, the v2.4.2 always-on adaptive combination per
+  spec/04 §3 + spec/05 §6.2): -2.2 % to -3.4 % across the four
+  scenarios on the in-tree Apple M-series host. Fixed-strategy
+  encode + the Huffman-only Fixed `time_encode` scenarios are
+  within noise; decode is unchanged.
+
 ### Added
+
+- **`examples/quick_bench dynamic` scenario.** Times the
+  `EncodeOptions::dynamic_auto()` configuration (spec/04 §3 +
+  spec/05 §6.2 — the v2.4.2 encoder's always-on adaptive
+  combination, three predictor candidates evaluated per slice + per
+  slice Huffman/raw size comparison). Joins the existing Fixed-
+  strategy `encode` selector under the same `quick_bench all` driver.
+  This is the production-relevant encode workload; the prior
+  `time_encode` scenarios pin a single fixed predictor for
+  hot-path attribution only.
 
 - **`cargo-fuzz` encode harness (`fuzz/fuzz_targets/encode_magicyuv.rs`).**
   A second target drives `encode_frame(rec, w, h, slice_height, planes,

@@ -229,7 +229,84 @@ primary-table change does not touch the trace emitter
 codes from a separate `codes: Vec<u32>` field, which the packed
 layout doesn't change). All 78 tests pass under `--features trace`.
 
+### 8. `BitWriter::with_capacity` for slice-payload encode
+
+The per-slice Huffman / raw bit-packing path constructed a `BitWriter`
+via `BitWriter::new()` — `Vec::new()` with zero pre-allocation.
+`bw.write` then grew the backing `Vec<u8>` geometrically: a 1280×28
+Auto-mode slice with raw_size ≈ 35840 paid ~17 `realloc`s walking from
+1 → 2 → 4 → … → 65536, all copying the prefix. Same shape for the 8-bit
+fresh-Huffman emit, the 10/12/14-bit Auto Huffman trial, the 10/12/14-bit
+raw bit-pack, and the 10/12/14-bit fresh-Huffman emit — five sites total.
+
+`BitWriter::with_capacity(byte_cap)` lets each call-site pre-size the
+output buffer from a known upper bound (raw_size + 1 for the
+size-comparison branches, `raw_size + raw_size / 2 + 1` for 8-bit
+fresh-Huffman at `max_huff_len = 12`, `2 * raw_size + 1` for the
+10/12/14-bit fresh-Huffman). The per-slice `payload` `Vec` is also
+pre-sized to its known cap so the trailing `extend` doesn't pay one
+more reallocation. `BitWriter::new()` is removed since every caller
+moves to `with_capacity`; the public surface stays `pub(crate)` so no
+downstream API is affected.
+
+Encoder figures (`examples/quick_bench dynamic`, new scenario this
+round — `EncodeOptions::dynamic_auto()` = `PredictorStrategy::Dynamic`
++ `SliceMode::Auto`, the v2.4.2 always-on adaptive combination per
+spec/04 §3 + spec/05 §6.2). Same host, back-to-back pre/post within
+a single boot:
+
+| Scenario                            | Pre opt-8 | After opt-8 | Δ        |
+| ----------------------------------- | --------: | ----------: | -------: |
+| enc M8RG / dynamic / 1280×720       | 14.25 ms  | 13.93 ms    |  -2.2 % |
+| enc M8Y0 / dynamic / 1280×720       |  7.45 ms  |  7.28 ms    |  -2.3 % |
+| enc M8G0 / dynamic / 1920×1080      | 11.00 ms  | 10.90 ms    |  -1.0 % |
+| enc M0RG / dynamic / 1280×720 / 10b | 20.80 ms  | 20.10 ms    |  -3.4 % |
+
+Fixed-strategy encode (`enc … / gradient | left`, the prior
+`time_encode` scenarios) is unchanged from opt-7 within run-to-run
+noise; the saving lands specifically on the
+Dynamic-strategy / Auto-mode path that owns the most BitWriters per
+slice (three predictor trials × per-slice Huffman size probe ⇒ four
+BitWriters per slice). Decode side is untouched.
+
+All 83 unit + round-trip tests pass under `--all-features` and 74
+under `--no-default-features`; trace MD5 is unchanged because the
+trace emitter runs in the decoder only.
+
 ## Round-N+1 candidates
+
+- **Predictor SIMD (Left only)** — Left has the simplest dependency
+  chain (only `cur[c-1]`); a `wrapping_add` prefix-scan over u8x16
+  using `core::simd` could give another 2-3 % on Gray (Left at
+  1080p is the simplest predictor in our coverage). Carried forward
+  from opt-7 — `core::simd` is nightly-only, so this needs the MSRV
+  bump or a `core::arch::aarch64`/`core::arch::x86_64` fallback.
+- **`HuffmanTable::build`** itself is on the cold path but takes
+  ~2-5 % of `decode_frame` for small frames (256×256 / smaller). A
+  one-shot `(symbol, length, code)` construction that skips the
+  intermediate `code` and `start` Vecs would help that quantile.
+- **Auto-mode size probe without emit** — when raw beats Huffman, the
+  current code already wrote the full Huffman bitstream into a
+  buffer (just to measure its length) and discards it. Summing
+  `huff.lengths[sym]` across the slice would compute the size in a
+  single linear pass without touching a `BitWriter`. Net even on
+  the typical case (Huffman usually wins so the bitstream is needed
+  anyway), but for high-entropy slices where raw wins this saves the
+  emit. Skipped this round to keep the diff scoped.
+
+## Round 181 closed candidates (no-go)
+
+- ~~**Fused encode-predictor + L1-score pass**~~ — implemented as
+  `encode_predictor_u{8,16}_with_score`, then rolled back. The
+  unfused two-pass shape compiles to autovectorized inner loops
+  (LLVM SIMDifies the `(b as i8).abs()` scan in
+  `abs_signed_sum_u8`); forcing the score into the predictor loop
+  body suppressed that vectorization and regressed Dynamic-mode
+  encode by ~3 % on every scenario. The reverse hypothesis — fewer
+  memory passes wins — was wrong on this codebase at this slice
+  size.
+
+## Earlier resolved candidates
 
 - ~~**Encoder `canonical_huffman_lengths` → `enforce_length_cap`**~~
   *(resolved — package-merge limiter)* — the prior `enforce_length_cap`
@@ -252,10 +329,6 @@ layout doesn't change). All 78 tests pass under `--features trace`.
   10/12/14-bit alphabets exceed the 10-bit symbol field and the
   redirect marker can't be encoded in 6-bit length, so the 4-B
   packed `u32` is the right balance of generality and memory.
-- **Predictor SIMD (Left only)** — Left has the simplest dependency
-  chain (only `cur[c-1]`); a `wrapping_add` prefix-scan over u8x16
-  using `core::simd` could give another 2-3× on Gray (Left at
-  1080p is the simplest predictor in our coverage).
 - ~~**`vec![0u8; w*h]` per decode**~~ *(resolved — `decode_into`)* —
   the per-frame `Vec` allocations (one per plane in `plane_bufs` +
   one per output `DecodedPlane` + the working clone of the G plane
@@ -263,7 +336,3 @@ layout doesn't change). All 78 tests pass under `--features trace`.
   consumers by the new `decode_into(&mut DecodedFrame)` entry point.
   `decode_frame` is now a wrapper around `decode_into` so it also
   picks up the G-clone removal even on the fresh-allocate path.
-- **`HuffmanTable::build`** itself is on the cold path but takes
-  ~2-5 % of `decode_frame` for small frames (256×256 / smaller). A
-  one-shot `(symbol, length, code)` construction that skips the
-  intermediate `code` and `start` Vecs would help that quantile.
