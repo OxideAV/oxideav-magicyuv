@@ -196,9 +196,15 @@ impl HuffmanTable {
         }
 
         // Phase 2 pass: assign codes to symbols.
+        // The previous `cur = start.clone()` step paid for a fresh
+        // `Vec<u32>` of length `max_len + 2` (up to 20 u32 = 80 B at
+        // the 14-bit alphabet's max_len = 18). It also kept `start`
+        // live for no further use. Since `start` isn't read after the
+        // assignment phase, we hand the buffer to `cur` by `mem::take`
+        // — no allocation, no copy.
         let mut code = vec![0u32; lengths.len()];
         if max_len > 0 {
-            let mut cur = start.clone();
+            let mut cur = core::mem::take(&mut start);
             for (s, &l) in lengths.iter().enumerate() {
                 if l == 0 {
                     continue;
@@ -257,8 +263,21 @@ impl HuffmanTable {
             let secondary_size = 1usize << secondary_bits;
             // Discover the unique primary prefixes that have any
             // deferred symbol, in canonical-code order.
-            let mut prefix_to_idx: std::collections::HashMap<u32, usize> =
-                std::collections::HashMap::new();
+            //
+            // The previous shape used `HashMap<u32, usize>` for the
+            // prefix → subtable-index lookup. The prefix is bounded by
+            // `1 << primary_bits ≤ 4096`, so a direct-indexed
+            // `Vec<i32>` of that size is denser and faster than the
+            // SipHash-keyed map: the lookup is one indexed load, the
+            // miss-then-insert is an indexed compare-and-store. The
+            // map paid a `HashMap` heap allocation (typically 48 B
+            // header + a ~32 B bucket array even when empty) and a
+            // hash computation per probe; the direct-index path pays
+            // exactly `primary_size * 4` B (up to 16 KB at
+            // `primary_bits = 12`) zeroed once. `i32` with the
+            // sentinel `-1` for "no subtable yet" avoids an `Option`
+            // tag check inside the hot loop.
+            let mut prefix_to_idx = vec![-1i32; primary_size];
 
             for (s, &l) in lengths.iter().enumerate() {
                 if l == 0 {
@@ -276,10 +295,15 @@ impl HuffmanTable {
                 } else {
                     // Deferred: route via a subtable.
                     let prefix = code[s] >> (l - primary_bits);
-                    let sub_idx = *prefix_to_idx.entry(prefix).or_insert_with(|| {
+                    let slot = &mut prefix_to_idx[prefix as usize];
+                    let sub_idx = if *slot < 0 {
                         secondary.push(vec![0u32; secondary_size]);
-                        secondary.len() - 1
-                    });
+                        let idx = secondary.len() - 1;
+                        *slot = idx as i32;
+                        idx
+                    } else {
+                        *slot as usize
+                    };
                     // Within the subtable, the symbol covers
                     // `1 << (max_len - l)` entries starting at
                     // `(code[s] & ((1<<(l-primary_bits))-1)) << (max_len - l)`
@@ -656,5 +680,59 @@ mod tests {
 
         assert_eq!(ref_syms, chosen);
         assert_eq!(batch_syms, chosen);
+    }
+
+    /// Build a high-bit-depth descriptor whose alphabet uses several
+    /// distinct primary-prefix buckets in the two-level path
+    /// (`max_len > PRIMARY_BITS = 12`). The direct-indexed prefix →
+    /// subtable-index lookup that replaced the prior `HashMap<u32,
+    /// usize>` must produce the same per-symbol decode results: each
+    /// encoded symbol round-trips through `table.decode` exactly as
+    /// it would have under the HashMap shape. This is the build-side
+    /// equivalent of `decode_into_u8_matches_per_pixel_decode` and
+    /// protects against any off-by-one in `prefix_to_idx[prefix as
+    /// usize]` indexing or sentinel handling.
+    #[test]
+    fn build_two_level_uses_per_prefix_subtables() {
+        // 16384-symbol all-length-14 alphabet: Kraft = 16384·2^-14 = 1.
+        // The canonical-code assignment spreads codes across all
+        // 4096 primary prefixes (each prefix bucket gets 16384/4096 =
+        // 4 symbols, all in its dedicated subtable of 4 entries), so
+        // the build path exercises 4096 distinct
+        // `prefix_to_idx[prefix]` updates. Decode a hand-assembled bit
+        // stream that bounces across several prefix buckets and
+        // assert each emitted symbol matches the source.
+        let lens = vec![14u8; 16384];
+        let table = HuffmanTable::build(lens, 0).expect("build long-code");
+        assert_eq!(table.max_len(), 14);
+        // Pick a spread of symbols that fall into different primary
+        // prefix buckets.
+        let chosen_syms: Vec<u32> = vec![0, 7, 4095, 4096, 8191, 8192, 12345, 16383];
+        let codes = table.codes().to_vec();
+        let lengths_view = table.lengths().to_vec();
+        // Hand-assemble MSB-first bit stream from the canonical codes.
+        let mut bit_buf: u64 = 0;
+        let mut bit_fill: u32 = 0;
+        let mut bytes: Vec<u8> = Vec::new();
+        for &sym in &chosen_syms {
+            let l = lengths_view[sym as usize] as u32;
+            let c = codes[sym as usize] as u64;
+            bit_buf = (bit_buf << l) | c;
+            bit_fill += l;
+            while bit_fill >= 8 {
+                let shift = bit_fill - 8;
+                bytes.push(((bit_buf >> shift) & 0xff) as u8);
+                bit_fill -= 8;
+                bit_buf &= (1u64 << bit_fill).wrapping_sub(1);
+            }
+        }
+        if bit_fill > 0 {
+            bytes.push(((bit_buf << (8 - bit_fill)) & 0xff) as u8);
+        }
+        let mut br = BitReader::new(&bytes);
+        let decoded: Vec<u32> = (0..chosen_syms.len())
+            .map(|_| table.decode(&mut br))
+            .collect();
+        assert_eq!(decoded, chosen_syms);
     }
 }

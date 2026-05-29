@@ -273,6 +273,55 @@ All 83 unit + round-trip tests pass under `--all-features` and 74
 under `--no-default-features`; trace MD5 is unchanged because the
 trace emitter runs in the decoder only.
 
+### 9. `HuffmanTable::build` allocation cleanups
+
+Two micro-cleanups on the decoder build path the prior round flagged
+as the "small-frame `~2-5 %` quantile of `decode_frame`":
+
+1. `cur = start.clone()` (a fresh `Vec<u32>` of length `max_len + 2`,
+   up to 80 B at the 14-bit alphabet's `max_len = 18`) is replaced by
+   `cur = core::mem::take(&mut start)`, since `start` isn't read
+   after the code-assignment phase. One allocation gone, no copy.
+2. `prefix_to_idx: HashMap<u32, usize>` in the two-level path
+   (`max_len > PRIMARY_BITS = 12`, i.e. every 10 / 12 / 14-bit
+   alphabet) is replaced by a direct-indexed `Vec<i32>` of length
+   `primary_size ≤ 4096`. Prefix values are bounded by `1 <<
+   primary_bits ≤ 4096`, so a Vec lookup is one indexed load + one
+   sentinel-check (`< 0`) instead of a hash compute + bucket walk.
+   The map's heap header (~48 B + bucket array even at size 0) and
+   per-probe SipHash cost are gone; the new Vec costs at most 16 KB
+   (4096 × 4 B) zeroed once at build time.
+
+Same observable `HuffmanTable`. The per-symbol `lengths`, `codes`,
+and lookup-table contents are byte-identical to the prior path —
+the symbol-order walk of `lengths` is preserved, so each prefix's
+subtable lands at the same `secondary[]` index either way. Verified
+by all 84 unit + round-trip tests under `--all-features` and 75
+under `--no-default-features` (one new test:
+`build_two_level_uses_per_prefix_subtables` exercises an alphabet
+that places symbols in every distinct primary prefix bucket); trace
+MD5 is unchanged.
+
+End-to-end decode timings on the in-tree Apple M-series host
+(`examples/quick_bench decode`, three runs back-to-back per side):
+
+| Scenario                          | Baseline | After opt-9 | Δ        |
+| --------------------------------- | -------: | ----------: | -------: |
+| dec M8RG / gradient / 1280×720    | 11.37 ms |    11.34 ms | -0.3 %  |
+| dec M8Y0 / gradient / 1280×720    |  5.26 ms |     5.21 ms | -0.9 %  |
+| dec M8G0 / left   / 1920×1080     |  6.81 ms |     6.76 ms | -0.7 %  |
+| dec M0RG / gradient / 1280×720    | 14.00 ms |    14.02 ms |  0.0 %  |
+| dec M8RG / median   / 256×256     |  0.88 ms |     0.87 ms | -1.1 %  |
+| dec M8RG / gradient / 128×128     |  0.18 ms |     0.18 ms |  0.0 %  |
+| dec M0RG / gradient / 128×128     |  0.25 ms |     0.25 ms |  0.0 %  |
+
+All within run-to-run noise. The build path is genuinely cold even
+on the smallest 128×128 scenario (build is <50 µs out of ~180 µs
+total decode); the saving is allocator-pressure reduction, not a
+measurable speedup. The change ships anyway as a code-quality and
+allocation-discipline win — the `HuffmanTable::build` flagged
+candidate from opt-8 is closed below.
+
 ## Round-N+1 candidates
 
 - **Predictor SIMD (Left only)** — Left has the simplest dependency
@@ -281,18 +330,38 @@ trace emitter runs in the decoder only.
   1080p is the simplest predictor in our coverage). Carried forward
   from opt-7 — `core::simd` is nightly-only, so this needs the MSRV
   bump or a `core::arch::aarch64`/`core::arch::x86_64` fallback.
-- **`HuffmanTable::build`** itself is on the cold path but takes
+
+## Round 186 closed candidates (no-go)
+
+- ~~**Auto-mode size probe without emit (spec/05 §6.2)**~~ —
+  implemented as a `PlaneHuff::measure_bits_u{8,16}` precomputed
+  sum-of-lengths followed by a conditional emit, then rolled back.
+  The candidate was advertised as "net even on the typical case
+  (Huffman usually wins so the bitstream is needed anyway)"; actual
+  measurement on the Apple M-series host showed a +3 to +5 % encode
+  regression across all four `quick_bench dynamic` scenarios when
+  Huffman wins on the smooth synthetic plane. The extra read-only
+  pass over the per-slice residuals costs more than the tightened
+  `BitWriter` allocation saves; the raw-wins case (where the emit
+  would have been wasted) is too rare on natural-image residuals
+  for the savings to net out. Closing this candidate — a future
+  retry would need a cheap proxy for "expect raw wins" so the probe
+  only runs when it pays off, not unconditionally.
+
+## Earlier round-N+1 candidates (resolved)
+
+- ~~**`HuffmanTable::build`** itself is on the cold path but takes
   ~2-5 % of `decode_frame` for small frames (256×256 / smaller). A
   one-shot `(symbol, length, code)` construction that skips the
-  intermediate `code` and `start` Vecs would help that quantile.
-- **Auto-mode size probe without emit** — when raw beats Huffman, the
-  current code already wrote the full Huffman bitstream into a
-  buffer (just to measure its length) and discards it. Summing
-  `huff.lengths[sym]` across the slice would compute the size in a
-  single linear pass without touching a `BitWriter`. Net even on
-  the typical case (Huffman usually wins so the bitstream is needed
-  anyway), but for high-entropy slices where raw wins this saves the
-  emit. Skipped this round to keep the diff scoped.
+  intermediate `code` and `start` Vecs would help that quantile.~~
+  *(partially resolved — opt-9 above)* — the `start` `Vec` is now
+  reused as `cur` via `mem::take` (one allocation gone) and the
+  two-level path's `HashMap<u32, usize>` is replaced by a
+  direct-indexed `Vec<i32>` of length `≤ 4096`. The remaining
+  `code: Vec<u32>` is still allocated; folding it directly into
+  the primary/secondary writes would need a re-shape that walks
+  symbols in tier order rather than symbol order and didn't fit
+  this round's scope.
 
 ## Round 181 closed candidates (no-go)
 

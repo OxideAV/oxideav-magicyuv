@@ -8,6 +8,37 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Decoder `HuffmanTable::build` allocation cleanups.** Two
+  build-path tweaks that drop one heap allocation per plane built
+  (`HashMap<u32, usize>` → `Vec<i32>; primary_size` direct-index)
+  and one intermediate `Vec` copy (`start.clone()` → `mem::take`
+  hand-off into the code-assignment loop). The `HashMap` was used to
+  associate a primary prefix value with the per-prefix subtable
+  index in the two-level path (`max_len > PRIMARY_BITS = 12`, i.e.
+  every 10 / 12 / 14-bit alphabet). Since prefix values are bounded
+  by `1 << primary_bits ≤ 4096`, a direct-indexed `Vec<i32>` with
+  the sentinel `-1` for "no subtable yet" is denser than the
+  SipHash-keyed map: the lookup is one indexed load, the
+  miss-then-insert is an indexed compare-and-store, and the build
+  loop's per-symbol branch carries no hash-or-allocate cost. The
+  Vec is up to 16 KB at the 14-bit alphabet (4096 × 4 B), zeroed
+  once at construction. Same observable `HuffmanTable` (the
+  per-symbol `lengths`, `codes`, and lookup-table contents are
+  byte-identical to the prior path; verified by all 84 unit +
+  round-trip tests under `--all-features` and 75 under
+  `--no-default-features`, plus a new
+  `build_two_level_uses_per_prefix_subtables` test that exercises
+  the two-level build path with an alphabet that places symbols in
+  every distinct primary prefix bucket). End-to-end decode timings
+  are within run-to-run noise on the in-tree Apple M-series host —
+  the build cost is a tiny fraction of total decode work even on
+  the smallest scenario (256×256, ~0.9 ms decode of which the build
+  is well under 50 µs) — but the allocator-pressure reduction is
+  real and replaces a SipHash probe per deferred-symbol with an
+  indexed load. Wire bytes the decoder consumes are unchanged
+  (symbol-order walk of `lengths` is identical, so each prefix's
+  subtable lands at the same `secondary[]` index either way).
+
 - **Encoder slice-payload `BitWriter` pre-allocation.** The
   `encode_frame_u8` / `encode_frame_u16` slice-emit hot path
   constructed `BitWriter::new()` (zero-capacity `Vec<u8>`) at five
