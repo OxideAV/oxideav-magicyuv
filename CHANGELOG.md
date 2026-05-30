@@ -6,6 +6,23 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/OxideAV/oxideav-magicyuv/compare/v0.0.4...v0.0.5) - 2026-05-30
+
+### Other
+
+- inline two-level hot loop for decode_into_u16
+- drop one HashMap + one Vec clone from HuffmanTable::build
+- BitWriter::with_capacity for slice-payload hot path
+- anchor Cargo.lock to crate root so fuzz/Cargo.lock isn't dual-state
+- refresh fuzz.yml preamble for the two-target setup
+- add encode_magicyuv target driving the full 17-FOURCC × strategy × mode × interlaced cube
+- add decode_magicyuv cargo-fuzz harness
+- decode_into(&mut DecodedFrame) streaming entry point
+- pack decoder primary table into Vec<u32> (low-8 length, high-24 symbol)
+- length-limited Package-Merge for Huffman code lengths (spec/05 §1.3)
+- preamble_trailing.extra_bytes is an integer count (spec/05 §10 Q6)
+- PredictorStrategy::Dynamic + SliceMode::Auto (spec/04 §3 + spec/05 §6.2)
+
 ### Changed
 
 - **Decoder `HuffmanTable::decode_into_u16` inlined two-level hot loop.**
