@@ -428,13 +428,61 @@ impl HuffmanTable {
     /// to `mask`. Mirrors [`Self::decode_into_u8`] for the 10/12/14-bit
     /// path, where `max_len` may exceed `PRIMARY_BITS = 12` and so the
     /// two-level lookup runs.
+    ///
+    /// Round-191 perf: the hot loop is folded inline so the BitReader
+    /// state (`acc`, `fill`, `pos`) stays in registers across symbols —
+    /// `primary_bits`, `primary`, `secondary`, and `max_len` are
+    /// snapshot once outside the loop and the per-symbol peek/consume +
+    /// table lookup avoids the per-pixel function-call ceremony the
+    /// previous `self.decode(br)` body forced even with
+    /// `#[inline(always)]`. The single-level / two-level split is
+    /// hoisted to the loop selector, identical in shape to
+    /// `decode_into_u8`.
     #[inline]
     pub fn decode_into_u16(&self, br: &mut BitReader<'_>, out: &mut [u16], mask: u16) -> bool {
         if self.max_len == 0 {
             return false;
         }
-        for px in out.iter_mut() {
-            *px = (self.decode(br) as u16) & mask;
+        let primary_bits = self.primary_bits as u32;
+        let primary = self.primary.as_slice();
+        if self.max_len <= self.primary_bits {
+            // Single-level fast path. The 10/12/14-bit alphabets in
+            // practice hit `max_len > primary_bits` (the two-level
+            // selector below), but a well-formed-but-shallow
+            // descriptor (e.g. a low-entropy plane whose realised
+            // `max_len_used` lands at ≤ primary_bits) still funnels
+            // through this branch — keep the symmetry with
+            // `decode_into_u8`.
+            for px in out.iter_mut() {
+                let key = br.peek_bits(primary_bits) as usize;
+                let entry = primary[key];
+                let len = entry & 0xff;
+                br.consume(len);
+                *px = ((entry >> 8) as u16) & mask;
+            }
+        } else {
+            // Two-level path. Snapshot `secondary` + `secondary_bits`
+            // once; the inner loop only re-issues the bitreader ops.
+            let secondary = self.secondary.as_slice();
+            let secondary_bits = (self.max_len - self.primary_bits) as u32;
+            for px in out.iter_mut() {
+                let key = br.peek_bits(primary_bits) as usize;
+                let entry = primary[key];
+                let len = entry & 0xff;
+                if len != REDIRECT_MARKER as u32 {
+                    br.consume(len);
+                    *px = ((entry >> 8) as u16) & mask;
+                } else {
+                    // Primary entry redirects to a subtable.
+                    br.consume(primary_bits);
+                    let sub_idx = (entry >> 8) as usize;
+                    let key2 = br.peek_bits(secondary_bits) as usize;
+                    let sub_entry = secondary[sub_idx][key2];
+                    let l_in_sub = sub_entry & 0xff;
+                    br.consume(l_in_sub);
+                    *px = ((sub_entry >> 8) as u16) & mask;
+                }
+            }
         }
         true
     }
@@ -734,5 +782,107 @@ mod tests {
             .map(|_| table.decode(&mut br))
             .collect();
         assert_eq!(decoded, chosen_syms);
+    }
+
+    /// Round-191 parity guard for the inlined two-level
+    /// `decode_into_u16` hot loop: the batch helper must produce the
+    /// same symbol sequence the per-pixel `decode()` does, on the same
+    /// bit stream, across both single-level and two-level alphabets.
+    /// The 10/12/14-bit path is what the v7 wire actually uses, so this
+    /// pins the hot-loop refactor against the spec-grounded per-pixel
+    /// reference path.
+    #[test]
+    fn decode_into_u16_matches_per_pixel_decode_two_level() {
+        // 14-bit alphabet, max_len_used = 14 (two-level path active).
+        let lens = vec![14u8; 16384];
+        let table = HuffmanTable::build(lens, 0).expect("build long-code");
+        assert_eq!(table.max_len(), 14);
+        // Walk a mix of symbols whose canonical codes land in distinct
+        // primary-prefix buckets, plus a few terminal-looking choices.
+        let chosen_syms: Vec<u16> = vec![
+            0, 1, 7, 255, 4095, 4096, 8191, 8192, 12345, 16383, 1024, 9999,
+        ];
+        let codes = table.codes().to_vec();
+        let lengths_view = table.lengths().to_vec();
+        let mut bit_buf: u64 = 0;
+        let mut bit_fill: u32 = 0;
+        let mut bytes: Vec<u8> = Vec::new();
+        for &sym in &chosen_syms {
+            let l = lengths_view[sym as usize] as u32;
+            let c = codes[sym as usize] as u64;
+            bit_buf = (bit_buf << l) | c;
+            bit_fill += l;
+            while bit_fill >= 8 {
+                let shift = bit_fill - 8;
+                bytes.push(((bit_buf >> shift) & 0xff) as u8);
+                bit_fill -= 8;
+                bit_buf &= (1u64 << bit_fill).wrapping_sub(1);
+            }
+        }
+        if bit_fill > 0 {
+            bytes.push(((bit_buf << (8 - bit_fill)) & 0xff) as u8);
+        }
+        // Tail-pad so the bitreader can refill at end-of-stream
+        // (matches the 8-bit parity test).
+        bytes.extend_from_slice(&[0u8; 16]);
+
+        // Per-pixel reference path.
+        let mut br_ref = BitReader::new(&bytes);
+        let ref_syms: Vec<u16> = (0..chosen_syms.len())
+            .map(|_| table.decode(&mut br_ref) as u16)
+            .collect();
+        // Batch path under test — the inlined two-level hot loop.
+        let mut br_batch = BitReader::new(&bytes);
+        let mut batch_syms = vec![0u16; chosen_syms.len()];
+        assert!(table.decode_into_u16(&mut br_batch, &mut batch_syms, 0x3fff));
+        assert_eq!(ref_syms, chosen_syms);
+        assert_eq!(batch_syms, chosen_syms);
+    }
+
+    /// Round-191 parity guard for the *single-level* branch of the
+    /// inlined `decode_into_u16` hot loop. A well-formed-but-shallow
+    /// 10-bit alphabet whose realised `max_len_used` lands at
+    /// ≤ PRIMARY_BITS = 12 still funnels through `decode_into_u16` and
+    /// must produce the same per-symbol decode result as the generic
+    /// per-pixel `decode()`.
+    #[test]
+    fn decode_into_u16_matches_per_pixel_decode_single_level() {
+        // 1024-symbol all-length-10 alphabet: Kraft = 1024·2^-10 = 1,
+        // max_len_used = 10 ≤ PRIMARY_BITS = 12 ⇒ single-level path.
+        let lens = vec![10u8; 1024];
+        let table = HuffmanTable::build(lens, 0).expect("build single-level u16");
+        assert_eq!(table.max_len(), 10);
+        let chosen_syms: Vec<u16> = vec![0, 1, 7, 255, 512, 1023, 256, 768];
+        let codes = table.codes().to_vec();
+        let lengths_view = table.lengths().to_vec();
+        let mut bit_buf: u64 = 0;
+        let mut bit_fill: u32 = 0;
+        let mut bytes: Vec<u8> = Vec::new();
+        for &sym in &chosen_syms {
+            let l = lengths_view[sym as usize] as u32;
+            let c = codes[sym as usize] as u64;
+            bit_buf = (bit_buf << l) | c;
+            bit_fill += l;
+            while bit_fill >= 8 {
+                let shift = bit_fill - 8;
+                bytes.push(((bit_buf >> shift) & 0xff) as u8);
+                bit_fill -= 8;
+                bit_buf &= (1u64 << bit_fill).wrapping_sub(1);
+            }
+        }
+        if bit_fill > 0 {
+            bytes.push(((bit_buf << (8 - bit_fill)) & 0xff) as u8);
+        }
+        bytes.extend_from_slice(&[0u8; 16]);
+
+        let mut br_ref = BitReader::new(&bytes);
+        let ref_syms: Vec<u16> = (0..chosen_syms.len())
+            .map(|_| table.decode(&mut br_ref) as u16)
+            .collect();
+        let mut br_batch = BitReader::new(&bytes);
+        let mut batch_syms = vec![0u16; chosen_syms.len()];
+        assert!(table.decode_into_u16(&mut br_batch, &mut batch_syms, 0x03ff));
+        assert_eq!(ref_syms, chosen_syms);
+        assert_eq!(batch_syms, chosen_syms);
     }
 }

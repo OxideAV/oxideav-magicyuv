@@ -8,6 +8,42 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Decoder `HuffmanTable::decode_into_u16` inlined two-level hot loop.**
+  The 10/12/14-bit Huffman batch decoder used to walk
+  `self.decode(br)` once per pixel — `#[inline(always)]` on `decode`
+  let the function body fold in, but the loop body still re-loaded
+  `self.max_len`, `self.primary_bits`, the `primary` slice base, the
+  `secondary` slice base, and the `REDIRECT_MARKER` comparand from
+  `&self` on every iteration (the compiler couldn't prove `&self`
+  immutable across the inner `br.consume` mutation). The new shape
+  mirrors `decode_into_u8` (opt-2 in `BENCHMARKS.md`): hoist all five
+  to local bindings once at function entry, split single-level vs
+  two-level into the loop selector (the single-level branch covers
+  well-formed-but-shallow descriptors whose realised `max_len_used`
+  lands at ≤ `PRIMARY_BITS = 12`), and run a flat peek/consume +
+  table lookup body so the BitReader's `acc` / `fill` / `pos` stay
+  in registers across the whole slice. Two new
+  `decode_into_u16_matches_per_pixel_decode_{two_level,single_level}`
+  parity tests pin the batch helper against the per-pixel `decode()`
+  reference on hand-assembled MSB-first bit streams that bounce
+  across multiple primary-prefix buckets (two-level) and across a
+  shallow 10-bit alphabet (single-level), so any future hot-loop
+  tweak that drifts symbol output gets caught the same way the
+  round-2 `decode_into_u8_matches_per_pixel_decode` test caught
+  off-by-ones on the 8-bit batch path. Same observable wire-byte
+  stream — all 86 unit + round-trip tests pass under
+  `--all-features` (was 84; the two new parity tests) and 77 under
+  `--no-default-features` (was 75). End-to-end decode timings on
+  `examples/quick_bench decode` for `M0RG/gradient/1280×720` (the
+  10-bit two-level scenario) move from a 13.62-13.93 ms baseline
+  median of ~13.78 ms to a 13.12-13.91 ms post-opt median of
+  ~13.27 ms — a ~3-4 % saving on the two-level path. The 8-bit
+  M8RG/gradient and M8Y0/gradient scenarios are unchanged within
+  run-to-run noise (their `decode_into_u8` path was already
+  inlined-loop-shaped from opt-2). Trace JSONL emitter is
+  unaffected — it lives in `decoder.rs` and consumes the same
+  per-symbol stream the batch helper produces.
+
 - **Decoder `HuffmanTable::build` allocation cleanups.** Two
   build-path tweaks that drop one heap allocation per plane built
   (`HashMap<u32, usize>` → `Vec<i32>; primary_size` direct-index)
