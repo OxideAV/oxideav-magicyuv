@@ -42,3 +42,7 @@ harness = false
 [[bench]]
 name = "roundtrip"
 harness = false
+
+[[bench]]
+name = "decode_all_fourccs"
+harness = false

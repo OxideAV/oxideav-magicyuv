@@ -15,6 +15,7 @@ helper times the same scenarios with a flat 10-iteration loop.
 | `decode_m8g0_1080p`            | M8G0   | Left      | 1920×1080     | 8-bit Gray, simplest predictor                           |
 | `decode_m0rg_720p_10bit`       | M0RG   | Gradient  | 1280×720      | 10-bit RGB, two-level Huffman lookup                     |
 | `decode_m8rg_256_median`       | M8RG   | Median    | 256×256       | 8-bit RGB, modular-Median path                           |
+| `decode_all_fourccs_640x480`   | all 17 | Gradient  | 640×480       | breadth sweep — one bench per native v7 FOURCC           |
 
 ## Hot-path attribution (sampled with `sample(1)`, decode side)
 
@@ -449,3 +450,87 @@ pass under `--all-features` (was 84; the two new parity tests) and
   consumers by the new `decode_into(&mut DecodedFrame)` entry point.
   `decode_frame` is now a wrapper around `decode_into` so it also
   picks up the G-clone removal even on the fresh-allocate path.
+
+## Round-194: cross-FOURCC decode-throughput sweep
+
+The optimisation-round scenarios above measure five hand-picked
+hot-path archetypes (one per Huffman / predictor / bit-depth /
+subsampling combination). The new `decode_all_fourccs` Criterion
+bench (`cargo bench -p oxideav-magicyuv --bench decode_all_fourccs`)
+is the breadth complement: it covers **every** native MagicYUV v7
+FOURCC (17 entries from `tables/00-fourcc-table.csv`) at a single
+small resolution + predictor so per-format decode throughput can be
+compared at a glance.
+
+- **Resolution:** 640×480 (divisible by 4 in both dimensions so the
+  4:2:0 / 4:2:2 chroma planes are whole-byte).
+- **Predictor:** Gradient (available for every bit-depth — modular
+  8-bit + JPEG-LS 10/12/14-bit — and produces residuals that exercise
+  the Huffman path rather than collapsing to a single-symbol tree).
+- **Slice mode:** Huffman.
+- **Throughput numerator:** raw uncompressed plane bytes — for
+  example M8Y0 (YUV 4:2:0) at 640×480 is 460 800 B and M0RA (10-bit
+  RGBA) is 2 457 600 B. So the MiB/s figures are directly comparable
+  as "decoded pixel volume per second", not bitstream consumption.
+
+Apple M-series, macOS 26.1, Criterion `--quick` mode, two
+back-to-back runs within the same boot; the figures below are
+medians (the prior table's 5-run-median methodology).
+
+| FOURCC | Bit | Family | Subsampling | Decode (ms) | Throughput (MiB/s) |
+| ------ | --: | ------ | ----------- | ----------: | -----------------: |
+| M8RG   |   8 | RGB    | n/a         |       3.697 |              237.7 |
+| M8RA   |   8 | RGBA   | n/a         |       4.873 |              240.5 |
+| M8Y4   |   8 | YUV    | 4:4:4       |       3.406 |              258.1 |
+| M8Y2   |   8 | YUV    | 4:2:2       |       2.256 |              259.7 |
+| M8Y0   |   8 | YUV    | 4:2:0       |       1.671 |              263.0 |
+| M8YA   |   8 | YUVA   | 4:4:4:4     |       4.539 |              258.2 |
+| M8G0   |   8 | Gray   | n/a         |       1.101 |              266.0 |
+| M0Y2   |  10 | YUV    | 4:2:2       |       2.983 |              392.8 |
+| M0RG   |  10 | RGB    | n/a         |       4.571 |              384.5 |
+| M0RA   |  10 | RGBA   | n/a         |       6.045 |              387.7 |
+| M2RG   |  12 | RGB    | n/a         |       4.546 |              386.7 |
+| M2RA   |  12 | RGBA   | n/a         |       6.082 |              385.4 |
+| M4RG   |  14 | RGB    | n/a         |       4.631 |              379.5 |
+| M4RA   |  14 | RGBA   | n/a         |       6.183 |              379.0 |
+| M0G0   |  10 | Gray   | n/a         |       1.484 |              394.8 |
+| M0Y4   |  10 | YUV    | 4:4:4       |       4.476 |              392.7 |
+| M0Y0   |  10 | YUV    | 4:2:0       |       2.226 |              394.8 |
+
+### Reading the table
+
+- **The 8-bit family clusters around 237-266 MiB/s.** RGB / RGBA are
+  the slowest (237 / 240) — both pay the inter-plane G-B-R
+  decorrelation reversal on top of per-plane Huffman + Gradient.
+  Subsampled YUV gets cheaper as chroma shrinks (4:4:4 → 4:2:2 →
+  4:2:0 ⇒ 258 → 260 → 263) because the chroma planes have fewer
+  pixels at the same plane-overhead. Gray is the ceiling (266) —
+  one plane, no cross-plane work.
+- **The 10/12/14-bit family clusters around 379-395 MiB/s — a
+  uniform ~50 % MiB/s improvement over the 8-bit family.** Each
+  decoded pixel carries 2 bytes instead of 1 for the same Huffman
+  + predictor pipeline cost per sample, so the MiB/s metric
+  (which weights bytes) rises even though the per-pixel time is
+  longer (e.g. M0RG 4.571 ms vs M8RG 3.697 ms). This is the
+  expected shape — the hot loop is per-sample, not per-byte.
+- **The packed-`u32` primary-table layout (opt-6) + inlined two-level
+  hot loop (opt-10) keep the 10/12/14-bit gap stable across bit-depths.**
+  M0RG (10-bit) → M2RG (12-bit) → M4RG (14-bit) walk 385 → 387 → 380
+  MiB/s, a ≤ 2 % spread across three different `max_huff_len` values
+  (14 / 16 / 18). The per-pixel two-level lookup cost is essentially
+  flat now — the residual variation is the per-symbol bit-stream length
+  (deeper alphabets carry longer codes on average so the BitReader
+  drains faster).
+- **Alpha (the `*RA` / `*YA` variants) costs roughly one extra plane
+  of decode time** as expected — M8RA - M8RG = 4.873 - 3.697 = 1.18 ms,
+  which matches a fourth 640×480 8-bit plane decode at the per-plane
+  rate the Gray scenario sets (M8G0 = 1.101 ms for one 640×480 plane).
+  10-bit shows the same shape: M0RA - M0RG = 1.47 ms ≈ M0G0 = 1.48 ms.
+
+### Followups
+
+None as actionable optimisations yet — the spread is uniform within
+each bit-depth tier and the gap between tiers is the per-sample-vs-
+per-byte arithmetic, not a hot-path drift. The bench is now part of
+the regression surface so any future change that drifts one FOURCC
+relative to its tier-mates will surface immediately.

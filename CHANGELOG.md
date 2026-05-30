@@ -6,6 +6,27 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Cross-FOURCC decode-throughput Criterion bench
+  (`benches/decode_all_fourccs.rs`).** Covers every native MagicYUV v7
+  FOURCC defined in `tables/00-fourcc-table.csv` (17 entries: 8-bit
+  RGB / RGBA / YUV 4:4:4 / 4:2:2 / 4:2:0 / YUVA / Gray, plus the
+  10/12/14-bit RGB / RGBA / YUV / Gray variants) at the same 640×480
+  Gradient + Huffman configuration so per-format decode throughput
+  can be compared at a glance. Throughput is reported in raw
+  uncompressed plane bytes so the MiB/s figures across formats line
+  up as "decoded pixel volume per second". Captured baseline numbers
+  + per-tier reading (8-bit clusters at 237-266 MiB/s, 10/12/14-bit
+  at 379-395 MiB/s — the expected ~50 % MiB/s gain from the
+  per-sample arithmetic carrying 2 bytes instead of 1 for the same
+  per-sample pipeline cost) added to `BENCHMARKS.md` under
+  "Round-194: cross-FOURCC decode-throughput sweep". The breadth
+  complement to the existing five-scenario optimisation-round
+  picks; future regressions that drift one FOURCC relative to its
+  bit-depth tier-mates will surface immediately on
+  `cargo bench -p oxideav-magicyuv --bench decode_all_fourccs`.
+
 ## [0.0.5](https://github.com/OxideAV/oxideav-magicyuv/compare/v0.0.4...v0.0.5) - 2026-05-30
 
 ### Other
