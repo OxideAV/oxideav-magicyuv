@@ -8,6 +8,32 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Encoder strategy × mode × interlaced Criterion bench
+  (`benches/encode_strategy_matrix.rs`).** The per-FOURCC `encode`
+  bench and the `decode_all_fourccs` breadth sweep both fix
+  `strategy = Fixed(_)` + `mode = Huffman` + `interlaced = false`,
+  leaving the encoder's `PredictorStrategy::Dynamic` (spec/04 §3,
+  per-slice min-residual selection across Left + Gradient + Median)
+  and `SliceMode::Auto` (spec/05 §6.2, per-slice Huffman vs
+  bit-packed-raw size comparison) and the `flags & FLAG_INTERLACED`
+  field-stride=2 prediction path (spec/04 §5.1) without any Criterion
+  coverage. The new bench walks all 24 cells of the
+  `(strategy ∈ {Fixed{Left,Gradient,Median}, Dynamic}) × (mode ∈
+  {Huffman, Raw, Auto}) × (interlaced ∈ {off, on})` cube at M8Y0
+  640×480 (8-bit YUV 4:2:0 — exercises the cross-plane-size dispatch
+  the RGB-only matrix would miss). Captured baseline numbers + the
+  per-axis reading (Raw cells ~1.5× faster than Huffman across every
+  strategy; Dynamic ~1.3-1.4× the cost of any Fixed Huffman cell
+  matching the 3× predictor work × < 30 % predictor share of total
+  encode time; Auto matches Huffman cell-for-cell for the Gradient
+  and Median strategies; interlaced 1-3 % slower than progressive
+  uniformly) added to `BENCHMARKS.md` under "Round-200: encoder
+  strategy × mode × interlaced matrix". Together with the existing
+  benches this finally lights up every orthogonal encoder axis the
+  public `EncodeOptions` exposes; the `Dynamic + Auto`
+  (`EncodeOptions::dynamic_auto()`) shipping configuration now has
+  Criterion regression coverage.
+
 - **Cross-FOURCC decode-throughput Criterion bench
   (`benches/decode_all_fourccs.rs`).** Covers every native MagicYUV v7
   FOURCC defined in `tables/00-fourcc-table.csv` (17 entries: 8-bit

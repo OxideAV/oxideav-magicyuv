@@ -46,3 +46,7 @@ harness = false
 [[bench]]
 name = "decode_all_fourccs"
 harness = false
+
+[[bench]]
+name = "encode_strategy_matrix"
+harness = false

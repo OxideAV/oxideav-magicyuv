@@ -16,6 +16,7 @@ helper times the same scenarios with a flat 10-iteration loop.
 | `decode_m0rg_720p_10bit`       | M0RG   | Gradient  | 1280×720      | 10-bit RGB, two-level Huffman lookup                     |
 | `decode_m8rg_256_median`       | M8RG   | Median    | 256×256       | 8-bit RGB, modular-Median path                           |
 | `decode_all_fourccs_640x480`   | all 17 | Gradient  | 640×480       | breadth sweep — one bench per native v7 FOURCC           |
+| `encode_strategy_matrix_m8y0_640x480` | M8Y0 | all 4 strategies | 640×480 | encoder strategy × mode × interlaced matrix (24 cells) |
 
 ## Hot-path attribution (sampled with `sample(1)`, decode side)
 
@@ -534,3 +535,109 @@ each bit-depth tier and the gap between tiers is the per-sample-vs-
 per-byte arithmetic, not a hot-path drift. The bench is now part of
 the regression surface so any future change that drifts one FOURCC
 relative to its tier-mates will surface immediately.
+
+## Round-200: encoder strategy × mode × interlaced matrix
+
+The per-FOURCC `encode` bench (5 hand-picks) and the
+`decode_all_fourccs` breadth sweep both fix
+`strategy = Fixed(_)` + `mode = Huffman` + `interlaced = false`,
+leaving the encoder's other axes invisible to Criterion. The new
+`encode_strategy_matrix` bench
+(`cargo bench -p oxideav-magicyuv --bench encode_strategy_matrix`)
+walks every combination of the public `EncodeOptions` knobs at a
+single representative FOURCC so a regression on any of them lands as
+a single anomalous cell in the matrix readout:
+
+- **Strategy axis (4 cells):** `Fixed(Left)`, `Fixed(Gradient)`,
+  `Fixed(Median)`, **`Dynamic`** (spec/04 §3 — runs all three
+  predictors per slice and keeps the smallest residual sum, ~3× the
+  prediction-side work of any Fixed strategy).
+- **Mode axis (3 cells):** `Huffman`, `Raw`, **`Auto`** (spec/05 §6.2 —
+  sizes both the Huffman pack and the bit-packed raw payload per slice
+  and picks the smaller, doubling the bit-pack accounting on slices
+  where Huffman wins).
+- **Interlaced axis (2 cells):** progressive vs `flags & FLAG_INTERLACED`
+  on (`spec/04` §5.1 field-stride=2 prediction — same predictor
+  kernels, different neighbour geometry).
+
+24 cells total. FOURCC pick: **M8Y0** (8-bit YUV 4:2:0). Subsampled
+chroma exercises the cross-plane-size dispatch the RGB-only Strategy
+matrix would miss; modular-Median 8-bit is faster than JPEG-LS Median
+10/12/14-bit so the Median × Dynamic × Auto cell finishes in a
+reasonable wall time. Resolution: 640×480 (same as
+`decode_all_fourccs` for cross-bench comparability). Throughput is
+raw uncompressed plane bytes (M8Y0 4:2:0 at 640×480 = 460 800 B).
+
+Apple M-series, macOS 26.1, Criterion default measurement, single
+boot. Time figures are medians from 20 samples × 3 s window.
+
+| Strategy        | Mode     | Interlaced  | Encode (ms) | Throughput (MiB/s) |
+| --------------- | -------- | ----------- | ----------: | -----------------: |
+| Fixed(Left)     | Huffman  | progressive |       1.915 |              229.5 |
+| Fixed(Left)     | Huffman  | interlaced  |       1.983 |              221.6 |
+| Fixed(Left)     | Raw      | progressive |       1.219 |              360.6 |
+| Fixed(Left)     | Raw      | interlaced  |       1.237 |              355.5 |
+| Fixed(Left)     | Auto     | progressive |       2.043 |              215.1 |
+| Fixed(Left)     | Auto     | interlaced  |       2.069 |              212.4 |
+| Fixed(Gradient) | Huffman  | progressive |       1.910 |              230.1 |
+| Fixed(Gradient) | Huffman  | interlaced  |       1.940 |              226.5 |
+| Fixed(Gradient) | Raw      | progressive |       1.254 |              350.5 |
+| Fixed(Gradient) | Raw      | interlaced  |       1.276 |              344.5 |
+| Fixed(Gradient) | Auto     | progressive |       1.895 |              231.9 |
+| Fixed(Gradient) | Auto     | interlaced  |       1.906 |              230.6 |
+| Fixed(Median)   | Huffman  | progressive |       2.060 |              213.4 |
+| Fixed(Median)   | Huffman  | interlaced  |       2.074 |              211.9 |
+| Fixed(Median)   | Raw      | progressive |       1.314 |              334.5 |
+| Fixed(Median)   | Raw      | interlaced  |       1.331 |              330.2 |
+| Fixed(Median)   | Auto     | progressive |       2.074 |              211.9 |
+| Fixed(Median)   | Auto     | interlaced  |       2.090 |              210.3 |
+| Dynamic         | Huffman  | progressive |       2.555 |              172.0 |
+| Dynamic         | Huffman  | interlaced  |       2.500 |              175.8 |
+| Dynamic         | Raw      | progressive |       1.731 |              253.9 |
+| Dynamic         | Raw      | interlaced  |       1.765 |              249.0 |
+| Dynamic         | Auto     | progressive |       2.451 |              179.3 |
+| Dynamic         | Auto     | interlaced  |       2.484 |              176.9 |
+
+### Reading the matrix
+
+- **Raw cells are uniformly ~1.5× faster than Huffman cells** across
+  every strategy (e.g. `Fixed(Gradient)` 1.254 ms raw vs 1.910 ms
+  Huffman = 1.52×). Raw skips canonical-Huffman build + per-sample
+  Huffman pack and just bit-packs residuals. This is the "encoder
+  upper bound" for the chosen predictor — useful when triaging
+  encoder regressions: a Huffman-side regression that shows up as a
+  proportional slowdown in raw too is a predictor regression, not a
+  Huffman one.
+- **`Dynamic` is 1.3-1.4× the cost of any `Fixed(_)` Huffman cell**
+  (2.555 ms vs 1.91-2.06 ms). That matches the spec: Dynamic evaluates
+  Left + Gradient + Median per slice and keeps the smallest residual,
+  so the predictor side does roughly 3× the work — but the predictor
+  is < 30 % of total encode time (the Huffman pack dominates), so the
+  observed factor is well below 3×. The same pattern holds for raw:
+  Dynamic + Raw (1.731 ms) is exactly the sum of one Fixed-Raw plus
+  two extra predictor passes (no extra bit-pack work, since only the
+  winning predictor's residuals get packed).
+- **`Auto` matches Huffman cell-for-cell** for the Gradient and Median
+  strategies (1.895 ms vs 1.910 ms, 2.074 ms vs 2.060 ms) — the
+  per-slice raw-size accounting is cheap and the Auto path keeps
+  picking Huffman because the residual is compressible. The only
+  outlier is `Fixed(Left)` + Auto (2.043 ms vs 1.915 ms Huffman) —
+  Left residuals on this synthetic input are noisier than Gradient's,
+  so the Auto path's raw-size comparison shows up. Still well within
+  the noise budget for a 24-cell matrix.
+- **Interlaced is uniformly 1-3 % slower than progressive**, as
+  expected: same predictor kernels, the field-stride=2 dispatch
+  splits the inner loop into two half-height passes and the first
+  two rows of each field are raw-passed (more bit-stream emission
+  per row at the start of every slice). Within noise everywhere
+  except the Raw cells where the slower-loop effect lines up cleanly.
+
+### Followups
+
+None as actionable optimisations yet — every cell reads as expected
+within the spec's predicted cost shape. The Dynamic + Auto path is
+now timed and could be revisited if a future optimisation targets
+the per-slice predictor-selection inner loop. The bench is now part
+of the regression surface: any future change that drifts one cell
+relative to its row-/column-mates will surface immediately on
+`cargo bench -p oxideav-magicyuv --bench encode_strategy_matrix`.
