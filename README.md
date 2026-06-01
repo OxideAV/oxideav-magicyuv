@@ -121,6 +121,37 @@ cd fuzz && cargo +nightly fuzz run decode_magicyuv -- -max_total_time=60
 cd fuzz && cargo +nightly fuzz run encode_magicyuv -- -max_total_time=60
 ```
 
+## Profiling
+
+[`examples/profile_magicyuv.rs`](examples/profile_magicyuv.rs) is a
+flat sampling-profiler driver. The Criterion benches and
+`examples/quick_bench.rs` are timing-oriented (Criterion's warm-up +
+estimator math show up in the profile; `quick_bench` runs each
+scenario for 10-30 iterations, too short for a sampling profiler to
+settle on the codec body). `profile_magicyuv` runs each scenario in a
+single flat loop with one `Instant`-pair around it, so `samply` /
+`cargo flamegraph` / `perf record` see the codec hot paths directly.
+
+Modes: `encode`, `decode`, `roundtrip`, `dynamic` (the
+`EncodeOptions::dynamic_auto()` v2.4.2 always-on combination per
+spec/04 §3 + spec/05 §6.2), `interlaced` (spec/04 §5.1 field-stride=2
+prediction), `all`.
+
+Scenarios cover the dominant cost-axes the workspace README rows
+track: the 8-bit primary-Huffman path (M8RG / M8Y0 1280×720 +
+M8G0 1920×1080), the two-level 10-bit Huffman path (M0RG 1280×720),
+and the modular-Median 8-bit path (M8RG 256×256). Inputs are the
+same `quick_bench` gradient + 3-bit xorshift noise so profile output
+and bench numbers reference the same residual histogram.
+
+```sh
+cargo build --release --example profile_magicyuv
+samply record -- ./target/release/examples/profile_magicyuv encode 500
+samply record -- ./target/release/examples/profile_magicyuv decode 2000
+samply record -- ./target/release/examples/profile_magicyuv dynamic 500
+cargo flamegraph --example profile_magicyuv -- decode 2000
+```
+
 ## Why clean-room
 
 MagicYUV is a closed-source commercial codec by Pavel Zlatev / "ignus"

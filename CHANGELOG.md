@@ -8,6 +8,35 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Sampling-profiler driver (`examples/profile_magicyuv.rs`).** The
+  existing Criterion benches (`benches/{decode,encode,roundtrip,
+  decode_all_fourccs,encode_strategy_matrix}.rs`) measure steady-state
+  throughput under Criterion's sampling framework, but their warm-up +
+  estimator math show up in a `samply` / `cargo flamegraph` /
+  `perf record` profile and bury the codec hot paths. `quick_bench`
+  is a timing helper (10-30 iters per scenario) — too short for a
+  sampling profiler to settle on the codec body before the loop
+  exits. The new `profile_magicyuv` example runs each scenario in a
+  single flat loop with one `Instant`-pair around it, so the codec
+  hot paths (Huffman batch decode, modular / JPEG-LS Median, RGB
+  decorrelation reversal, Package-Merge length cap, BitWriter
+  drain) are what the profiler sees. Five modes — `encode`,
+  `decode`, `roundtrip`, `dynamic` (the `EncodeOptions::dynamic_auto()`
+  v2.4.2 always-on combination per spec/04 §3 + spec/05 §6.2),
+  `interlaced` (spec/04 §5.1 field-stride=2 prediction) — across the
+  five `quick_bench` archetypes (M8RG/M8Y0/M8G0 8-bit primary-Huffman
+  + M0RG 10-bit two-level + M8RG 256×256 modular-Median). Inputs are
+  the same `quick_bench` gradient + 3-bit xorshift noise so profile
+  output and bench numbers reference the same residual histogram.
+  Throughput print (per-iter ms + MiB/s of raw uncompressed plane
+  bytes + per-iter encoded-byte ratio for encode modes) makes the
+  driver double as a quick A/B harness when Criterion's per-run
+  overhead is too coarse. README has the `samply` / `cargo flamegraph`
+  invocations under the new "Profiling" section. No `src/` changes —
+  the driver consumes the existing `decode_into` /
+  `encode_frame` / `EncodeOptions::{dynamic_auto,fixed}` / `tables::lookup`
+  public API.
+
 - **Encoder strategy × mode × interlaced Criterion bench
   (`benches/encode_strategy_matrix.rs`).** The per-FOURCC `encode`
   bench and the `decode_all_fourccs` breadth sweep both fix
