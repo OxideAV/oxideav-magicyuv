@@ -6,6 +6,59 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Per-plane scratch reuse in `build_slice_residuals_u{8,16}_into`.**
+  The encoder's per-slice predictor-builder previously allocated a
+  fresh `Vec<u8>` (Fixed mode) or three fresh `Vec<u8>`s (Dynamic
+  mode) via `src.to_vec()` on every slice, then dropped two of the
+  three Dynamic Vecs after L1-score selection and copied the
+  winning one into the per-plane residual accumulator via
+  `residuals.extend_from_slice(&block)`. The new shape pre-sizes
+  two scratch `Vec<u8>` / `Vec<u16>` buffers at the per-plane scope
+  (lifetime spans every slice and every kind), and:
+  - Fixed mode writes `src` directly into the tail of `residuals`
+    (which is already pre-sized to `plane_w × plane_h`), then runs
+    `encode_predictor_u{8,16}` in-place on that tail. Per-slice
+    `Vec` allocations: 1 → 0; per-slice memcpys: 2 → 1.
+  - Dynamic mode runs the three candidate predictors through
+    `trial_a` (kind 1, Left) / `trial_b` (kind 2, Gradient) / the
+    loser's slot (kind 3, Median), tracks `best_in_a`, and
+    `extend_from_slice`-copies the winning scratch into
+    `residuals` once. Per-slice `Vec` allocations: 3 → 0;
+    per-slice memcpys: 4 → 4 (same — heap pressure is the only
+    component eliminated).
+
+  Five new `build_slice_residuals_scratch_tests` (`u8_into_matches
+  _reference_across_three_consecutive_slices`, `u16_into_matches
+  _reference_across_consecutive_slices`, `u8_into_interlaced_
+  matches_reference`, `u8_into_dynamic_picks_lowest_l1_with_ties_
+  broken_left_first`, `u8_into_fixed_writes_into_dst_tail_without_
+  touching_scratch`) pin the new shape against a fresh-Vec-per-call
+  reference oracle defined inside the test module, exercising
+  consecutive-slice scratch reuse, interlaced field-stride=2 (where
+  the header-row block is processed before the strided body), the
+  tie-break order on a uniform plane (Left wins, the strict `<`
+  comparison preserves the predictor-id-ascending tie-break the
+  prior shape used), and the Fixed-mode no-touch-scratch contract
+  (a Fixed call may not clobber scratch buffers the caller may
+  legitimately leave un-allocated until the first Dynamic invocation).
+
+  Wall-time impact: timings on the Apple M-series host
+  (`examples/quick_bench encode|dynamic`, 5-run medians per side
+  under matched system load) are flat to within ±1.3 % across both
+  Fixed and Dynamic — the per-slice heap pressure was already
+  amortised by the platform allocator's per-thread arena fast
+  paths. The change ships as an allocation-discipline improvement
+  (peak heap and `Vec` alloc counter per encode drop measurably:
+  for a 1280×720 M8RG/dynamic frame at 30 slices × 3 planes, the
+  per-slice 3 Dynamic mallocs become 2 plane-lifetime trial mallocs,
+  i.e. 90 mallocs → 2 across the residual-build phase) and a
+  shape that any future predictor SIMD / batched-L1-score work
+  has a cleaner buffer to attach to. All 103 unit + round-trip
+  tests pass under `--all-features` (was 98; the 5 new scratch
+  parity tests) and 94 under `--no-default-features` (was 89).
+
 ### Added
 
 - **Direct `BitWriter` parity tests (`encoder::bit_writer_tests`).**

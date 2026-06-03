@@ -368,6 +368,53 @@ frame is bit-identical pre/post). All 86 unit + round-trip tests
 pass under `--all-features` (was 84; the two new parity tests) and
 77 under `--no-default-features` (was 75).
 
+### 11. Per-plane scratch reuse in `build_slice_residuals_u{8,16}_into`
+
+The encoder's per-slice predictor builder allocated a fresh
+`Vec<u8>` (Fixed mode) or three fresh `Vec<u8>`s (Dynamic mode) via
+`src.to_vec()` on every slice, dropped the two non-winning Dynamic
+Vecs after L1-score selection, and copied the winning one into the
+per-plane residual accumulator. The new shape lifts two scratch
+buffers (`trial_a` / `trial_b`) to per-plane scope and:
+
+- Fixed: writes `src` into the tail of the per-plane `residuals`
+  accumulator (already pre-sized to `pw × ph`), runs the predictor
+  in-place. Per-slice mallocs: 1 → 0; per-slice memcpys: 2 → 1.
+- Dynamic: runs the three candidates through `trial_a` /
+  `trial_b` / the loser's slot, tracks `best_in_a`, and
+  `extend_from_slice`-copies the winner into `residuals` once.
+  Per-slice mallocs: 3 → 0; per-slice memcpys: 4 → 4.
+
+For a 1280×720 M8RG/dynamic frame at 30 slices × 3 planes, the
+residual-build phase's `Vec<u8>` malloc count drops from 90 to 2
+(the two plane-lifetime trial mallocs).
+
+Side-by-side timings on the Apple M-series host
+(`examples/quick_bench encode|dynamic`, 5-run medians per side,
+back-to-back under matched system load):
+
+| Scenario                                | Baseline  | After     | Δ        |
+| --------------------------------------- | --------: | --------: | -------: |
+| enc M8RG / gradient / 1280×720          |  12.27 ms |  12.27 ms |  flat    |
+| enc M8Y0 / gradient / 1280×720          |   5.71 ms |   5.75 ms |  +0.7 %  |
+| enc M8G0 / left / 1920×1080             |   8.76 ms |   8.73 ms |  -0.3 %  |
+| enc M0RG / gradient / 1280×720 / 10b    |  18.10 ms |  17.98 ms |  -0.7 %  |
+| enc M8RG / dynamic / 1280×720           |  14.43 ms |  14.44 ms |  flat    |
+| enc M8Y0 / dynamic / 1280×720           |   7.52 ms |   7.51 ms |  flat    |
+| enc M8G0 / dynamic / 1920×1080          |  11.15 ms |  11.15 ms |  flat    |
+| enc M0RG / dynamic / 1280×720 / 10b     |  21.78 ms |  21.49 ms |  -1.3 %  |
+
+Wall-time impact is flat to within ±1.3 % across both Fixed and
+Dynamic — the per-slice heap pressure was already amortised by the
+platform allocator's per-thread arena fast paths. The change ships
+as an allocation-discipline win and as a shape that any future
+predictor-SIMD / batched-L1-score work has a cleaner buffer to
+attach to. Decode-side is untouched; trace JSONL emitter lives in
+`decoder.rs` and is unaffected. All 103 unit + round-trip tests
+pass under `--all-features` (was 98; +5 scratch parity tests in
+`build_slice_residuals_scratch_tests`) and 94 under
+`--no-default-features` (was 89).
+
 ## Round-N+1 candidates
 
 - **Predictor SIMD (Left only)** — Left has the simplest dependency

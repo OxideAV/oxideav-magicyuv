@@ -784,6 +784,17 @@ fn encode_frame_u8(
     let mut plane_resid: Vec<Vec<u8>> = Vec::with_capacity(num_planes);
     let mut slice_predictors: Vec<PredictorKind> = vec![PredictorKind::Left; total_slices];
     let strategy = options.strategy;
+    // Reusable per-plane trial scratch buffers for Dynamic strategy.
+    // Capped at one slice's worth of bytes (max plane_slice_height *
+    // pw across planes); reused across every slice and every kind so
+    // the per-slice allocation count drops from 3 (Dynamic) / 1
+    // (Fixed) Vec<u8> mallocs to 0 after the first slice of the
+    // largest plane. The previous shape paid an
+    // `slice_rows * pw`-byte malloc on every `src.to_vec()` call (3
+    // per slice for Dynamic, 1 per slice for Fixed); see
+    // `build_slice_residuals_u8_into` below.
+    let mut trial_a: Vec<u8> = Vec::new();
+    let mut trial_b: Vec<u8> = Vec::new();
     for p in 0..num_planes {
         let (pw, ph, plane_slice_height) = plane_dims[p];
         let mut residuals: Vec<u8> = Vec::with_capacity(pw * ph);
@@ -793,10 +804,17 @@ fn encode_frame_u8(
             let row_end = ((s + 1) * plane_slice_height).min(ph);
             let slice_rows = row_end - row_start;
             let src = &plane_data[row_start * pw..row_end * pw];
-            let (chosen, block) =
-                build_slice_residuals_u8(strategy, src, slice_rows, pw, field_stride);
+            let chosen = build_slice_residuals_u8_into(
+                strategy,
+                src,
+                slice_rows,
+                pw,
+                field_stride,
+                &mut residuals,
+                &mut trial_a,
+                &mut trial_b,
+            );
             slice_predictors[p * slices_per_plane + s] = chosen;
-            residuals.extend_from_slice(&block);
         }
         plane_resid.push(residuals);
     }
@@ -921,38 +939,108 @@ fn predictor_id_byte(k: PredictorKind) -> u8 {
 /// values, and pick the minimiser (ties broken by predictor-id
 /// ascending — i.e. Left, then Gradient, then Median — matching
 /// spec/04 §3.1's "lowest residual sum" criterion).
-fn build_slice_residuals_u8(
+/// In-place residual-build with reusable scratch buffers.
+///
+/// Fixed: writes the slice's `src` copy directly into the tail of
+/// `dst` (the per-plane residual accumulator, pre-sized to
+/// `plane_w × plane_h` so the extend is allocation-free) and runs the
+/// predictor in-place on that tail. No scratch use.
+///
+/// Dynamic: runs the three candidate predictors through `trial_a` /
+/// `trial_b` (reused across every slice of every plane — alloc-free
+/// after the first slice of the largest plane), tracks the lowest L1
+/// score so far, and on completion copies the winning scratch into
+/// `dst`'s tail with a single `extend_from_slice`. Net per-slice
+/// allocation count is 0 (vs. 3 `src.to_vec()` mallocs in the prior
+/// shape); per-slice copy count is 4 (3 `src→scratch` + 1
+/// `scratch→dst`) — same as before (3 `src.to_vec()` + 1
+/// `extend_from_slice`), but with the heap-pressure component
+/// removed.
+///
+/// Tie-break is the same as the prior shape: predictor-id ascending
+/// (Left, Gradient, Median) — `<` for "strictly better" preserves the
+/// first-runner-up on ties.
+#[allow(clippy::too_many_arguments)]
+fn build_slice_residuals_u8_into(
     strategy: PredictorStrategy,
     src: &[u8],
     rows: usize,
     width: usize,
     field_stride: FieldStride,
-) -> (PredictorKind, Vec<u8>) {
+    dst: &mut Vec<u8>,
+    trial_a: &mut Vec<u8>,
+    trial_b: &mut Vec<u8>,
+) -> PredictorKind {
     match strategy {
         PredictorStrategy::Fixed(p) => {
-            let mut block = src.to_vec();
-            encode_predictor_u8(p, &mut block, rows, width, field_stride);
-            (p, block)
+            let tail_start = dst.len();
+            dst.extend_from_slice(src);
+            encode_predictor_u8(p, &mut dst[tail_start..], rows, width, field_stride);
+            p
         }
         PredictorStrategy::Dynamic => {
-            let mut best_kind = PredictorKind::Left;
-            let mut best_block: Vec<u8> = Vec::new();
-            let mut best_score: u64 = u64::MAX;
-            for &kind in &[
+            // Kind 1 (Left) → trial_a. Becomes "best so far".
+            trial_a.clear();
+            trial_a.extend_from_slice(src);
+            encode_predictor_u8(
                 PredictorKind::Left,
+                &mut trial_a[..],
+                rows,
+                width,
+                field_stride,
+            );
+            let mut best_kind = PredictorKind::Left;
+            let mut best_in_a = true;
+            let mut best_score = abs_signed_sum_u8(trial_a);
+
+            // Kind 2 (Gradient) → trial_b.
+            trial_b.clear();
+            trial_b.extend_from_slice(src);
+            encode_predictor_u8(
                 PredictorKind::Gradient,
-                PredictorKind::Median,
-            ] {
-                let mut block = src.to_vec();
-                encode_predictor_u8(kind, &mut block, rows, width, field_stride);
-                let score = abs_signed_sum_u8(&block);
-                if score < best_score {
-                    best_score = score;
-                    best_kind = kind;
-                    best_block = block;
+                &mut trial_b[..],
+                rows,
+                width,
+                field_stride,
+            );
+            let score_b = abs_signed_sum_u8(trial_b);
+            if score_b < best_score {
+                best_score = score_b;
+                best_kind = PredictorKind::Gradient;
+                best_in_a = false;
+            }
+
+            // Kind 3 (Median) → the current loser's scratch so the
+            // winner survives untouched.
+            {
+                let loser = if best_in_a {
+                    &mut *trial_b
+                } else {
+                    &mut *trial_a
+                };
+                loser.clear();
+                loser.extend_from_slice(src);
+                encode_predictor_u8(
+                    PredictorKind::Median,
+                    &mut loser[..],
+                    rows,
+                    width,
+                    field_stride,
+                );
+                let score_m = abs_signed_sum_u8(loser);
+                if score_m < best_score {
+                    best_kind = PredictorKind::Median;
+                    best_in_a = !best_in_a;
                 }
             }
-            (best_kind, best_block)
+
+            // Append the winning scratch into the residual accumulator.
+            if best_in_a {
+                dst.extend_from_slice(trial_a);
+            } else {
+                dst.extend_from_slice(trial_b);
+            }
+            best_kind
         }
     }
 }
@@ -1154,6 +1242,9 @@ fn encode_frame_u16(
     let mut plane_resid: Vec<Vec<u16>> = Vec::with_capacity(num_planes);
     let mut slice_predictors: Vec<PredictorKind> = vec![PredictorKind::Left; total_slices];
     let strategy = options.strategy;
+    // See `encode_frame_u8` for the per-plane scratch-reuse rationale.
+    let mut trial_a: Vec<u16> = Vec::new();
+    let mut trial_b: Vec<u16> = Vec::new();
     for p in 0..num_planes {
         let (pw, ph, plane_slice_height) = plane_dims[p];
         let mut residuals: Vec<u16> = Vec::with_capacity(pw * ph);
@@ -1163,10 +1254,19 @@ fn encode_frame_u16(
             let row_end = ((s + 1) * plane_slice_height).min(ph);
             let slice_rows = row_end - row_start;
             let src = &plane_data[row_start * pw..row_end * pw];
-            let (chosen, block) =
-                build_slice_residuals_u16(strategy, src, slice_rows, pw, mask, bits, field_stride);
+            let chosen = build_slice_residuals_u16_into(
+                strategy,
+                src,
+                slice_rows,
+                pw,
+                mask,
+                bits,
+                field_stride,
+                &mut residuals,
+                &mut trial_a,
+                &mut trial_b,
+            );
             slice_predictors[p * slices_per_plane + s] = chosen;
-            residuals.extend_from_slice(&block);
         }
         plane_resid.push(residuals);
     }
@@ -1277,12 +1377,14 @@ fn encode_frame_u16(
 
 /// `u16` analogue of [`build_slice_residuals_u8`]: pick a predictor
 /// (per `strategy`) and emit its residuals. For Dynamic, the score is
-/// `sum |signed(residual)|` interpreting each residual as a signed
-/// value in the `bits`-bit window — equivalent to
-/// `min(r, (1 << bits) - r)`. Same monotone-with-Huffman-cost
-/// rationale as the u8 case.
+/// `u16` analogue of [`build_slice_residuals_u8_into`]: same scratch
+/// reuse + in-place-into-`dst`-tail shape. Fixed walks the predictor
+/// in `dst`'s tail; Dynamic shuffles the three trial residuals
+/// through `trial_a` / `trial_b` (reused across every slice + every
+/// kind) and `extend_from_slice`-copies the winning scratch into
+/// `dst` once.
 #[allow(clippy::too_many_arguments)]
-fn build_slice_residuals_u16(
+fn build_slice_residuals_u16_into(
     strategy: PredictorStrategy,
     src: &[u16],
     rows: usize,
@@ -1290,33 +1392,83 @@ fn build_slice_residuals_u16(
     mask: u16,
     bits: u8,
     field_stride: FieldStride,
-) -> (PredictorKind, Vec<u16>) {
+    dst: &mut Vec<u16>,
+    trial_a: &mut Vec<u16>,
+    trial_b: &mut Vec<u16>,
+) -> PredictorKind {
     match strategy {
         PredictorStrategy::Fixed(p) => {
-            let mut block = src.to_vec();
-            encode_predictor_u16(p, &mut block, rows, width, mask, field_stride);
-            (p, block)
+            let tail_start = dst.len();
+            dst.extend_from_slice(src);
+            encode_predictor_u16(p, &mut dst[tail_start..], rows, width, mask, field_stride);
+            p
         }
         PredictorStrategy::Dynamic => {
-            let mut best_kind = PredictorKind::Left;
-            let mut best_block: Vec<u16> = Vec::new();
-            let mut best_score: u64 = u64::MAX;
             let half = 1u32 << (bits - 1);
-            for &kind in &[
+
+            // Kind 1 (Left) → trial_a.
+            trial_a.clear();
+            trial_a.extend_from_slice(src);
+            encode_predictor_u16(
                 PredictorKind::Left,
+                &mut trial_a[..],
+                rows,
+                width,
+                mask,
+                field_stride,
+            );
+            let mut best_kind = PredictorKind::Left;
+            let mut best_in_a = true;
+            let mut best_score = abs_signed_sum_u16(trial_a, half);
+
+            // Kind 2 (Gradient) → trial_b.
+            trial_b.clear();
+            trial_b.extend_from_slice(src);
+            encode_predictor_u16(
                 PredictorKind::Gradient,
-                PredictorKind::Median,
-            ] {
-                let mut block = src.to_vec();
-                encode_predictor_u16(kind, &mut block, rows, width, mask, field_stride);
-                let score = abs_signed_sum_u16(&block, half);
-                if score < best_score {
-                    best_score = score;
-                    best_kind = kind;
-                    best_block = block;
+                &mut trial_b[..],
+                rows,
+                width,
+                mask,
+                field_stride,
+            );
+            let score_b = abs_signed_sum_u16(trial_b, half);
+            if score_b < best_score {
+                best_score = score_b;
+                best_kind = PredictorKind::Gradient;
+                best_in_a = false;
+            }
+
+            // Kind 3 (Median) → loser's scratch.
+            {
+                let loser = if best_in_a {
+                    &mut *trial_b
+                } else {
+                    &mut *trial_a
+                };
+                loser.clear();
+                loser.extend_from_slice(src);
+                encode_predictor_u16(
+                    PredictorKind::Median,
+                    &mut loser[..],
+                    rows,
+                    width,
+                    mask,
+                    field_stride,
+                );
+                let score_m = abs_signed_sum_u16(loser, half);
+                if score_m < best_score {
+                    best_kind = PredictorKind::Median;
+                    best_in_a = !best_in_a;
                 }
             }
-            (best_kind, best_block)
+
+            if best_in_a {
+                dst.extend_from_slice(trial_a);
+            } else {
+                dst.extend_from_slice(trial_b);
+            }
+            best_kind
         }
     }
 }
@@ -1754,5 +1906,314 @@ mod bit_writer_tests {
             }
             assert_eq!(drive(&ops), reference(&ops), "seed {seed}");
         }
+    }
+}
+
+#[cfg(test)]
+mod build_slice_residuals_scratch_tests {
+    //! Pin the `build_slice_residuals_u{8,16}_into` contract: the
+    //! scratch buffers (`trial_a` / `trial_b`) are reused across
+    //! multiple slices + multiple kinds, but each call's output into
+    //! `dst` must be identical to the result of a fresh-Vec per-trial
+    //! reference shape. These tests catch any future scratch-state
+    //! leak (e.g. forgetting `clear()` before `extend_from_slice`).
+    //!
+    //! The round-trip suite (`roundtrip_tests`) is the integration-
+    //! level oracle for bitstream correctness; these are unit-level
+    //! parity tests on the residual builder alone.
+    use super::*;
+    use crate::predict::FieldStride;
+
+    fn reference_u8(
+        strategy: PredictorStrategy,
+        src: &[u8],
+        rows: usize,
+        width: usize,
+        field_stride: FieldStride,
+    ) -> (PredictorKind, Vec<u8>) {
+        match strategy {
+            PredictorStrategy::Fixed(p) => {
+                let mut block = src.to_vec();
+                encode_predictor_u8(p, &mut block, rows, width, field_stride);
+                (p, block)
+            }
+            PredictorStrategy::Dynamic => {
+                let mut best_kind = PredictorKind::Left;
+                let mut best_block: Vec<u8> = Vec::new();
+                let mut best_score: u64 = u64::MAX;
+                for &kind in &[
+                    PredictorKind::Left,
+                    PredictorKind::Gradient,
+                    PredictorKind::Median,
+                ] {
+                    let mut block = src.to_vec();
+                    encode_predictor_u8(kind, &mut block, rows, width, field_stride);
+                    let score = abs_signed_sum_u8(&block);
+                    if score < best_score {
+                        best_score = score;
+                        best_kind = kind;
+                        best_block = block;
+                    }
+                }
+                (best_kind, best_block)
+            }
+        }
+    }
+
+    fn reference_u16(
+        strategy: PredictorStrategy,
+        src: &[u16],
+        rows: usize,
+        width: usize,
+        mask: u16,
+        bits: u8,
+        field_stride: FieldStride,
+    ) -> (PredictorKind, Vec<u16>) {
+        match strategy {
+            PredictorStrategy::Fixed(p) => {
+                let mut block = src.to_vec();
+                encode_predictor_u16(p, &mut block, rows, width, mask, field_stride);
+                (p, block)
+            }
+            PredictorStrategy::Dynamic => {
+                let mut best_kind = PredictorKind::Left;
+                let mut best_block: Vec<u16> = Vec::new();
+                let mut best_score: u64 = u64::MAX;
+                let half = 1u32 << (bits - 1);
+                for &kind in &[
+                    PredictorKind::Left,
+                    PredictorKind::Gradient,
+                    PredictorKind::Median,
+                ] {
+                    let mut block = src.to_vec();
+                    encode_predictor_u16(kind, &mut block, rows, width, mask, field_stride);
+                    let score = abs_signed_sum_u16(&block, half);
+                    if score < best_score {
+                        best_score = score;
+                        best_kind = kind;
+                        best_block = block;
+                    }
+                }
+                (best_kind, best_block)
+            }
+        }
+    }
+
+    fn xorshift(seed: u32, n: usize) -> Vec<u8> {
+        let mut s = seed.max(1);
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            out.push((s & 0xff) as u8);
+        }
+        out
+    }
+
+    fn xorshift_u16(seed: u32, n: usize, mask: u16) -> Vec<u16> {
+        let mut s = seed.max(1);
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            out.push((s as u16) & mask);
+        }
+        out
+    }
+
+    #[test]
+    fn u8_into_matches_reference_across_three_consecutive_slices() {
+        // 16-row plane in three 5/5/6-row slices — exercises scratch
+        // reuse across slices of varying length.
+        let width = 24;
+        let plane = xorshift(0xC0FFEE, 16 * width);
+        let strategies = [
+            PredictorStrategy::Fixed(PredictorKind::Left),
+            PredictorStrategy::Fixed(PredictorKind::Gradient),
+            PredictorStrategy::Fixed(PredictorKind::Median),
+            PredictorStrategy::Dynamic,
+        ];
+        for &strategy in &strategies {
+            let mut dst = Vec::new();
+            let mut ta = Vec::new();
+            let mut tb = Vec::new();
+            let mut row_ofs = 0usize;
+            let row_runs = [5usize, 5, 6];
+            let mut got_kinds = Vec::new();
+            for &rows in &row_runs {
+                let src = &plane[row_ofs * width..(row_ofs + rows) * width];
+                let k = build_slice_residuals_u8_into(
+                    strategy,
+                    src,
+                    rows,
+                    width,
+                    FieldStride::PROGRESSIVE,
+                    &mut dst,
+                    &mut ta,
+                    &mut tb,
+                );
+                got_kinds.push(k);
+                row_ofs += rows;
+            }
+            // Reference: independent fresh-Vec per slice.
+            let mut want: Vec<u8> = Vec::new();
+            let mut want_kinds = Vec::new();
+            row_ofs = 0;
+            for &rows in &row_runs {
+                let src = &plane[row_ofs * width..(row_ofs + rows) * width];
+                let (k, block) = reference_u8(strategy, src, rows, width, FieldStride::PROGRESSIVE);
+                want_kinds.push(k);
+                want.extend_from_slice(&block);
+                row_ofs += rows;
+            }
+            assert_eq!(got_kinds, want_kinds, "strategy {strategy:?}");
+            assert_eq!(dst, want, "strategy {strategy:?}");
+        }
+    }
+
+    #[test]
+    fn u16_into_matches_reference_across_consecutive_slices() {
+        let width = 32;
+        let bits = 10u8;
+        let mask: u16 = (1 << bits) - 1;
+        let plane = xorshift_u16(0xBADBEEF, 24 * width, mask);
+        let strategies = [
+            PredictorStrategy::Fixed(PredictorKind::Left),
+            PredictorStrategy::Fixed(PredictorKind::Gradient),
+            PredictorStrategy::Fixed(PredictorKind::Median),
+            PredictorStrategy::Dynamic,
+        ];
+        for &strategy in &strategies {
+            let mut dst = Vec::new();
+            let mut ta = Vec::new();
+            let mut tb = Vec::new();
+            let mut row_ofs = 0usize;
+            let row_runs = [6usize, 8, 10];
+            let mut got_kinds = Vec::new();
+            for &rows in &row_runs {
+                let src = &plane[row_ofs * width..(row_ofs + rows) * width];
+                let k = build_slice_residuals_u16_into(
+                    strategy,
+                    src,
+                    rows,
+                    width,
+                    mask,
+                    bits,
+                    FieldStride::PROGRESSIVE,
+                    &mut dst,
+                    &mut ta,
+                    &mut tb,
+                );
+                got_kinds.push(k);
+                row_ofs += rows;
+            }
+            let mut want: Vec<u16> = Vec::new();
+            let mut want_kinds = Vec::new();
+            row_ofs = 0;
+            for &rows in &row_runs {
+                let src = &plane[row_ofs * width..(row_ofs + rows) * width];
+                let (k, block) = reference_u16(
+                    strategy,
+                    src,
+                    rows,
+                    width,
+                    mask,
+                    bits,
+                    FieldStride::PROGRESSIVE,
+                );
+                want_kinds.push(k);
+                want.extend_from_slice(&block);
+                row_ofs += rows;
+            }
+            assert_eq!(got_kinds, want_kinds, "strategy {strategy:?}");
+            assert_eq!(dst, want, "strategy {strategy:?}");
+        }
+    }
+
+    #[test]
+    fn u8_into_interlaced_matches_reference() {
+        // field_stride = 2 path: at least 4 rows so the predictor
+        // walks beyond the header-row block.
+        let width = 16;
+        let plane = xorshift(0xDECADE, 8 * width);
+        let mut dst = Vec::new();
+        let mut ta = Vec::new();
+        let mut tb = Vec::new();
+        let k = build_slice_residuals_u8_into(
+            PredictorStrategy::Dynamic,
+            &plane,
+            8,
+            width,
+            FieldStride::INTERLACED,
+            &mut dst,
+            &mut ta,
+            &mut tb,
+        );
+        let (rk, rblock) = reference_u8(
+            PredictorStrategy::Dynamic,
+            &plane,
+            8,
+            width,
+            FieldStride::INTERLACED,
+        );
+        assert_eq!(k, rk);
+        assert_eq!(dst, rblock);
+    }
+
+    #[test]
+    fn u8_into_dynamic_picks_lowest_l1_with_ties_broken_left_first() {
+        // Uniform plane: every predictor produces all-zero residuals,
+        // so all three score 0. Tie-break must pick Left (predictor-id
+        // ascending), matching the prior shape's `<` comparison.
+        let width = 8;
+        let rows = 4;
+        let plane = vec![0x42u8; rows * width];
+        let mut dst = Vec::new();
+        let mut ta = Vec::new();
+        let mut tb = Vec::new();
+        let k = build_slice_residuals_u8_into(
+            PredictorStrategy::Dynamic,
+            &plane,
+            rows,
+            width,
+            FieldStride::PROGRESSIVE,
+            &mut dst,
+            &mut ta,
+            &mut tb,
+        );
+        assert_eq!(k, PredictorKind::Left, "tie-break is Left-first");
+        // Residual is `plane - predicted` reduced modulo 256. For a
+        // uniform 0x42 plane under Left, every cell after column 0 of
+        // row 0 (= 0x42 itself) is `cur - prev = 0`. The (0,0) cell
+        // has no neighbour to subtract.
+        assert_eq!(dst[0], 0x42);
+        assert!(dst[1..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn u8_into_fixed_writes_into_dst_tail_without_touching_scratch() {
+        // Fixed mode must leave the scratch buffers alone — proves
+        // the call doesn't gratuitously clobber state callers may
+        // legitimately not have allocated yet.
+        let width = 8;
+        let rows = 3;
+        let plane = xorshift(7, rows * width);
+        let mut dst = Vec::new();
+        let mut ta = vec![0xAAu8; 16]; // sentinel
+        let mut tb = vec![0xBBu8; 16];
+        let _ = build_slice_residuals_u8_into(
+            PredictorStrategy::Fixed(PredictorKind::Gradient),
+            &plane,
+            rows,
+            width,
+            FieldStride::PROGRESSIVE,
+            &mut dst,
+            &mut ta,
+            &mut tb,
+        );
+        assert_eq!(ta, vec![0xAAu8; 16], "Fixed mode must not touch trial_a");
+        assert_eq!(tb, vec![0xBBu8; 16], "Fixed mode must not touch trial_b");
     }
 }
