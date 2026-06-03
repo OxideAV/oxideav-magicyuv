@@ -582,6 +582,19 @@ impl BitWriter {
         self.acc |= (code as u64) << shift;
         self.bits_used += len as u32;
         // Drain whole bytes from the high end while we have ≥ 8.
+        //
+        // A r217 candidate replaced this byte-by-byte drain with a
+        // single `acc.to_be_bytes()` + `extend_from_slice(&buf[..N])`
+        // — the hypothesis was that one slice memcpy beats up to seven
+        // `Vec::push`es per call. The measurement on the Apple M-series
+        // host disagreed: a +6 to +9 % encode regression across every
+        // `quick_bench encode` scenario (M8RG/M8Y0/M8G0/M0RG, 3-run
+        // medians). LLVM already pipelines the `push(byte) + acc <<= 8
+        // + bits_used -= 8` loop with the pre-allocated `Vec`'s
+        // capacity check elided, so the `to_be_bytes` shape adds a
+        // variable-length slice copy and a branch on `bytes_to_drain
+        // == 8` that the scalar form already amortises. See the
+        // "Round 217 closed candidates" section in `BENCHMARKS.md`.
         while self.bits_used >= 8 {
             let byte = (self.acc >> 56) as u8;
             self.bytes.push(byte);
@@ -1595,5 +1608,151 @@ mod huffman_limit_tests {
     fn single_active_symbol_gets_length_one() {
         let lengths = canonical_huffman_lengths(&[0, 7, 0, 0], 12);
         assert_eq!(lengths, vec![0, 1, 0, 0]);
+    }
+}
+
+#[cfg(test)]
+mod bit_writer_tests {
+    //! Direct parity tests for [`BitWriter`]'s whole-byte-drain shape.
+    //!
+    //! The round-trip suite (`roundtrip_tests.rs`, 84+ scenarios) is
+    //! the primary oracle — it feeds every encoded byte back through
+    //! `decode_frame` and asserts an exact pixel-equal round-trip,
+    //! which catches any wire-byte drift in the `BitWriter` immediately.
+    //!
+    //! These tests pin the writer's emit shape directly at the unit
+    //! level so a future hot-loop tweak shows up as a unit failure
+    //! before the integration tests reach it. The reference is a
+    //! deliberately trivial bit-by-bit shape that walks each `(code,
+    //! len)` MSB-first into a `Vec<u8>`, padding the final partial
+    //! byte with zero bits — exactly the wire convention `spec/05` §1.1
+    //! sets out for the Huffman payload.
+    use super::BitWriter;
+
+    /// Reference encoder: writes `len` MSB-aligned bits into the
+    /// growing byte vector one bit at a time. Matches the
+    /// `BitWriter::finish()` zero-pad-tail convention.
+    fn reference(write_ops: &[(u32, u8)]) -> Vec<u8> {
+        let mut out: Vec<u8> = Vec::new();
+        let mut acc: u8 = 0;
+        let mut bits: u8 = 0;
+        for &(code, len) in write_ops {
+            for i in (0..len).rev() {
+                let bit = ((code >> i) & 1) as u8;
+                acc = (acc << 1) | bit;
+                bits += 1;
+                if bits == 8 {
+                    out.push(acc);
+                    acc = 0;
+                    bits = 0;
+                }
+            }
+        }
+        if bits != 0 {
+            out.push(acc << (8 - bits));
+        }
+        out
+    }
+
+    fn drive(write_ops: &[(u32, u8)]) -> Vec<u8> {
+        let mut bw = BitWriter::with_capacity(write_ops.len());
+        for &(code, len) in write_ops {
+            bw.write(code, len);
+        }
+        bw.finish()
+    }
+
+    #[test]
+    fn empty_writer_emits_no_bytes() {
+        assert!(drive(&[]).is_empty());
+    }
+
+    #[test]
+    fn zero_length_writes_are_noops() {
+        assert_eq!(drive(&[(0, 0), (0, 0), (0xff, 0)]), Vec::<u8>::new());
+        // Mixed with non-zero writes.
+        let ops = [(0, 0), (0b1011, 4), (0, 0), (0b0110, 4)];
+        assert_eq!(drive(&ops), reference(&ops));
+    }
+
+    #[test]
+    fn single_byte_aligned_write() {
+        assert_eq!(drive(&[(0xa5, 8)]), vec![0xa5]);
+    }
+
+    #[test]
+    fn unaligned_tail_zero_pads() {
+        // 4 bits 0b1011 → wire byte 0b1011_0000.
+        assert_eq!(drive(&[(0b1011, 4)]), vec![0b1011_0000]);
+    }
+
+    #[test]
+    fn short_codes_match_reference_fixed() {
+        // Hand-crafted sequence that crosses several byte boundaries
+        // without any single write filling the accumulator. Exercises
+        // the bytes_to_drain ∈ {0, 1, 2} drain paths.
+        let ops = [
+            (0b1, 1),
+            (0b01, 2),
+            (0b110, 3),
+            (0b0101, 4),
+            (0b10110, 5),
+            (0b001100, 6),
+            (0b1010101, 7),
+            (0b10101010, 8),
+            (0b110, 3),
+        ];
+        assert_eq!(drive(&ops), reference(&ops));
+    }
+
+    #[test]
+    fn long_codes_drain_multiple_bytes() {
+        // Each 32-bit write forces a 4-byte drain. Crossing 8-byte
+        // boundaries exercises the larger bytes_to_drain values.
+        let ops = [
+            (0xdead_beef_u32, 32),
+            (0xcafe_babe, 32),
+            (0xfeed_face, 32),
+            (0x1234_5678, 32),
+        ];
+        assert_eq!(drive(&ops), reference(&ops));
+    }
+
+    #[test]
+    fn bits_used_plus_len_equals_64_full_drain() {
+        // Pre-fill the accumulator to bits_used = 32, then issue a
+        // len-32 write so bits_used + len == 64. The drain path then
+        // computes bytes_to_drain = 8 and must zero `acc` rather than
+        // shift by 64 (a u64 << 64 is undefined behaviour the
+        // implementation special-cases). Wire output must still match
+        // the bit-by-bit reference.
+        let ops = [(0x1234_5678_u32, 32), (0xfedc_ba98, 32)];
+        assert_eq!(drive(&ops), reference(&ops));
+        // Same boundary after a tiny prefix so the alignment differs.
+        let ops2 = [(0b1, 1), (0x7fff_ffff, 31), (0x1234_5678, 32)];
+        assert_eq!(drive(&ops2), reference(&ops2));
+    }
+
+    #[test]
+    fn xorshift_random_streams_match_reference() {
+        // 8 independent xorshift streams, each ~512 (code, len) writes
+        // with `len ∈ [1, 32]`. Walks every drain shape the production
+        // hot loop emits in practice (the per-symbol Huffman pack
+        // produces 1-12 bit codes at 8-bit depth, 1-18 at 14-bit
+        // depth — well inside the 32-bit cap).
+        for seed in 0u32..8 {
+            let mut state = 0x9e37_79b9_u32 ^ seed.wrapping_mul(0xdead_beef);
+            let mut ops: Vec<(u32, u8)> = Vec::with_capacity(512);
+            for _ in 0..512 {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                let len = ((state >> 8) % 32) as u8 + 1; // [1, 32]
+                let mask: u32 = if len == 32 { !0 } else { (1u32 << len) - 1 };
+                let code = (state.wrapping_mul(0x85eb_ca6b)) & mask;
+                ops.push((code, len));
+            }
+            assert_eq!(drive(&ops), reference(&ops), "seed {seed}");
+        }
     }
 }

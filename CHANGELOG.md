@@ -8,6 +8,30 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Direct `BitWriter` parity tests (`encoder::bit_writer_tests`).**
+  Eight new unit tests pin the `BitWriter::write` whole-byte drain
+  shape against a deliberately trivial bit-by-bit reference (one
+  MSB bit per loop iteration, partial-byte tail zero-padded per
+  `spec/05` §1.1's Huffman-payload wire convention). Coverage:
+  empty input, zero-length writes interleaved with payload writes,
+  byte-aligned single writes, unaligned tail zero-padding, hand-
+  crafted short-code sequences crossing multiple byte boundaries,
+  back-to-back 32-bit writes that force ≥ 4-byte drains, the
+  `bits_used + len == 64` accumulator-full boundary case, and
+  eight 512-write xorshift streams with `len ∈ [1, 32]` to walk
+  every drain-shape the production hot loop sees in practice. The
+  round-trip suite (84 scenarios across every FOURCC × predictor ×
+  mode × interlaced combination) was already the integration-level
+  oracle for any byte drift in the encoder's bitstream; these
+  direct tests pin the `BitWriter` body at the unit level so a
+  future hot-loop reshape lands as a focused failure before the
+  larger integration tests reach it. Closes a coverage gap noted
+  during the round-217 `to_be_bytes` drain-shape candidate (see
+  `BENCHMARKS.md` "Round 217 closed candidates" — implemented,
+  measured a +7-9 % encode regression on the Apple M-series host,
+  rolled back; the tests stay because they exercise the existing
+  shape just as well).
+
 - **Batched raw-mode bit unpacker (`bitreader::unpack_raw_bits_to_u16`).**
   The high-bit-depth raw-mode slice payload (`spec/05` §4.1: a
   continuous MSB-first bit-stream of `bits ∈ {10, 12, 14}`-wide

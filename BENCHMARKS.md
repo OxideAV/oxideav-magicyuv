@@ -377,6 +377,45 @@ pass under `--all-features` (was 84; the two new parity tests) and
   from opt-7 — `core::simd` is nightly-only, so this needs the MSRV
   bump or a `core::arch::aarch64`/`core::arch::x86_64` fallback.
 
+## Round 217 closed candidates (no-go)
+
+- ~~**`BitWriter::write` whole-byte drain via `to_be_bytes` +
+  `extend_from_slice`**~~ — the per-symbol Huffman emit loop
+  (`for &sym in res_block { bw.write(code, len); }`) calls into
+  `BitWriter::write`, which on entry has `bits_used ≤ 32` and
+  `len ≤ 32`, so after the OR-merge `bits_used + len ≤ 64` and the
+  drain loop runs ≤ 8 iterations per call. The candidate replaced
+  that `while self.bits_used >= 8 { push(byte); acc <<= 8; ... }`
+  loop with a single `let buf = self.acc.to_be_bytes(); self.bytes
+  .extend_from_slice(&buf[..bytes_to_drain]);` so the per-symbol
+  cost was one variable-length slice memcpy + one branch on the
+  `bytes_to_drain == 8` boundary case (to avoid the UB `u64 << 64`)
+  instead of up to seven `Vec::push` calls.
+  Measurement on the Apple M-series host (3-run medians,
+  `examples/quick_bench encode`):
+
+  | Scenario                          | Baseline | Candidate | Δ        |
+  | --------------------------------- | -------: | --------: | -------: |
+  | enc M8RG / gradient / 1280×720    | 12.42 ms | 13.46 ms  | +8.4 %  |
+  | enc M8Y0 / gradient / 1280×720    |  5.68 ms |  6.18 ms  | +8.8 %  |
+  | enc M8G0 / left   / 1920×1080     |  8.71 ms |  9.29 ms  | +6.7 %  |
+  | enc M0RG / gradient / 1280×720    | 18.03 ms | 19.57 ms  | +8.5 %  |
+
+  Universal +7-9 % encode regression. The hypothesis ("one slice
+  memcpy beats seven pushes") was wrong on this codebase: with the
+  output `Vec` pre-allocated by `BitWriter::with_capacity` (opt-7,
+  always-tight upper bound at every call site), each `Vec::push`
+  is a branchless `len < cap` check + one byte store + one len
+  increment, and LLVM unrolls / pipelines the `while bits_used >=
+  8` loop. The `to_be_bytes` shape adds the `bytes_to_drain
+  == 8` branch the scalar loop didn't have, and `extend_from_slice`
+  generalises to an arbitrary-length copy (with its own length
+  check) which is heavier than the inline byte stores. Closing this
+  candidate. The 8 new `bit_writer_tests` (added the same round)
+  pin the existing byte-by-byte drain shape against a bit-by-bit
+  oracle so any *future* hot-loop reshape lands as a unit-test
+  failure before it reaches the round-trip suite.
+
 ## Round 186 closed candidates (no-go)
 
 - ~~**Auto-mode size probe without emit (spec/05 §6.2)**~~ —
