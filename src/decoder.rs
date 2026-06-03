@@ -11,7 +11,7 @@
 //! Round 2 covers the full 8-bit + 10/12/14-bit native FOURCC set
 //! plus interlaced field-stride=2 prediction (`flags & 0x02`).
 
-use crate::bitreader::BitReader;
+use crate::bitreader::{unpack_raw_bits_to_u16, BitReader};
 use crate::error::{Error, Result};
 use crate::header::{self, FrameHeader, FLAG_INTERLACED};
 use crate::huffman::{self, HuffmanTable};
@@ -635,10 +635,11 @@ fn decode_high_bit_depth(
             if payload.len() < 2 + needed_bytes {
                 return Err(Error::SliceTruncated { slice_index: s });
             }
-            let mut br = BitReader::new(&payload[2..]);
-            for px in buf.iter_mut() {
-                *px = (br.read_bits(bits as u32) as u16) & mask;
-            }
+            // Batched unpacker — same observable bit stream as a
+            // per-pixel `BitReader::read_bits(bits)` loop but folds
+            // the refill check into a per-`floor(56/bits)` cadence
+            // rather than firing once per pixel.
+            unpack_raw_bits_to_u16(&payload[2..2 + needed_bytes], buf, bits, mask);
         } else {
             mode_str = "huffman";
             let mut br = BitReader::new(&payload[2..]);

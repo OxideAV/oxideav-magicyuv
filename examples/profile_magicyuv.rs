@@ -42,6 +42,13 @@
 //!     interlaced  — decode N times against a `flags & FLAG_INTERLACED`
 //!                   frame, exercising the spec/04 §5.1 field-stride=2
 //!                   predictor path
+//!     raw         — decode N times against a high-bit-depth raw-mode
+//!                   slice payload (`slice_flags & 0x01 == 1`), the
+//!                   spec/05 §4.1 bit-packed bytes-to-u16 unpacker —
+//!                   per-pixel `BitReader::read_bits` is replaced by
+//!                   `bitreader::unpack_raw_bits_to_u16`, a single
+//!                   refill check every floor(56 / bits) pixels rather
+//!                   than once per pixel
 //!     all         — run every mode in order (default)
 //!
 //! With `samply`:
@@ -465,6 +472,47 @@ fn profile_interlaced(iters_override: Option<u32>) {
     std::io::stdout().flush().ok();
 }
 
+/// High-bit-depth raw-mode decode (`slice_flags & 0x01`). Targets the
+/// batched `unpack_raw_bits_to_u16` hot loop introduced in round 212 —
+/// the rest of the high-bit-depth pipeline (slice walking, predictor
+/// inverse, RGB decorrelation) is shared with the Huffman variant
+/// already covered by `profile_decode`, so any delta between this
+/// scenario's MiB/s and `decode`'s M0RG row is attributable to the
+/// unpacker. Three bit-depth tiers (10/12/14) so the per-tier refill
+/// cadence (≈ 5 / ≈ 4 / ≈ 4 pixels between refills) is exercised end
+/// to end.
+fn profile_raw(iters_override: Option<u32>) {
+    println!("== raw (high-bit-depth bit-packed slice payload, decode_into) ==");
+    // (format_byte, label, width, height, iters_default)
+    let rows: &[(u8, &'static str, u32, u32, u32)] = &[
+        (0x6d, "M0RG/10bit/640x480/raw", 640, 480, 4000),
+        (0x6f, "M2RG/12bit/640x480/raw", 640, 480, 4000),
+        (0x71, "M4RG/14bit/640x480/raw", 640, 480, 4000),
+    ];
+    for (fb, label, w, h, iters_default) in rows {
+        let iters = iters_override.unwrap_or(*iters_default);
+        let rec = tables::lookup(*fb).expect("format_byte in fourcc table");
+        let opts = EncodeOptions {
+            mode: SliceMode::Raw,
+            ..EncodeOptions::fixed(PredictorKind::Left)
+        };
+        let raw = raw_bytes_per_iter(rec, *w, *h) as u64;
+        // Encode once outside the timed region.
+        let planes = make_planes(rec, *w, *h);
+        let bytes = encode_frame(rec, *w, *h, 28, planes, opts).expect("raw setup encode");
+        let mut dst = DecodedFrame::empty();
+        decode_into(&bytes, &mut dst).expect("warmup raw decode_into");
+        let t = Instant::now();
+        for _ in 0..iters {
+            decode_into(std::hint::black_box(&bytes), &mut dst).expect("raw decode_into");
+            std::hint::black_box(&dst);
+        }
+        let elapsed = t.elapsed().as_secs_f64();
+        print_throughput_line("raw", label, iters, elapsed, raw * iters as u64, "");
+        std::io::stdout().flush().ok();
+    }
+}
+
 fn main() {
     let mut args = env::args().skip(1);
     let mode = args.next().unwrap_or_else(|| "all".to_string());
@@ -484,6 +532,7 @@ fn main() {
         "roundtrip" => profile_roundtrip(iters_override),
         "dynamic" | "dynamic_auto" => profile_dynamic(iters_override),
         "interlaced" => profile_interlaced(iters_override),
+        "raw" => profile_raw(iters_override),
         "all" => {
             profile_encode(iters_override);
             println!();
@@ -494,11 +543,13 @@ fn main() {
             profile_dynamic(iters_override);
             println!();
             profile_interlaced(iters_override);
+            println!();
+            profile_raw(iters_override);
         }
         other => {
             eprintln!("unknown mode: {other:?}");
             eprintln!(
-                "usage: profile_magicyuv [encode|decode|roundtrip|dynamic|interlaced|all] [<iters>]"
+                "usage: profile_magicyuv [encode|decode|roundtrip|dynamic|interlaced|raw|all] [<iters>]"
             );
             std::process::exit(2);
         }

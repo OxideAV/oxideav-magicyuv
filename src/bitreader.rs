@@ -134,6 +134,89 @@ impl<'a> BitReader<'a> {
     }
 }
 
+/// Batched unpacker for high-bit-depth raw-mode slice payloads
+/// (`spec/05` §4.1: `(pixels * bits + 7) / 8` MSB-first bits packed in
+/// `data`). Writes `dst.len()` samples of width `bits` ∈ {10, 12, 14}
+/// into `dst`, masking each to the low `bits` bits.
+///
+/// Same observable bit stream as a per-pixel
+/// `BitReader::read_bits(bits)` loop, but folds the bit-bucket into a
+/// 64-bit accumulator that is refilled from 8-byte big-endian loads.
+/// The per-pixel cost is one `peek` (a shift + cast) plus a refill
+/// branch that fires once every `floor(56 / bits)` pixels (≈ 5 at
+/// 10-bit, ≈ 4 at 12/14-bit) — versus the generic
+/// `BitReader::read_bits` path which performs the same refill check
+/// on every call.
+///
+/// `bits` is taken at runtime; if it is 0 or > 16 the buffer is left
+/// untouched. End-of-data is implicitly zero-padded to match the
+/// generic `BitReader` semantics.
+///
+/// Used by the decoder's raw-mode high-bit-depth slice payload
+/// dispatch (`decoder.rs::decode_high_bit_depth`).
+#[inline]
+pub fn unpack_raw_bits_to_u16(data: &[u8], dst: &mut [u16], bits: u8, mask: u16) {
+    if bits == 0 || bits > 16 || dst.is_empty() {
+        return;
+    }
+    let nbits = bits as u32;
+    let mut acc: u64 = 0;
+    let mut fill: u32 = 0;
+    let mut pos: usize = 0;
+    let data_len = data.len();
+    // Initial refill — mirror `BitReader::new`'s behaviour.
+    if pos + 8 <= data_len {
+        let arr: [u8; 8] = data[pos..pos + 8].try_into().expect("8-byte window");
+        acc = u64::from_be_bytes(arr);
+        pos += 8;
+        fill = 64;
+    } else {
+        // Slow scalar fill for short payloads.
+        while fill <= 56 {
+            let byte = if pos < data_len { data[pos] } else { 0 };
+            acc |= (byte as u64) << (56 - fill);
+            fill += 8;
+            if pos < data_len {
+                pos += 1;
+            } else {
+                break;
+            }
+        }
+    }
+    for px in dst.iter_mut() {
+        // Refill if fewer than `nbits` valid bits remain.
+        if fill < nbits {
+            // Pull up to 8 fresh bytes into the empty high region.
+            if pos + 8 <= data_len {
+                let arr: [u8; 8] = data[pos..pos + 8].try_into().expect("8-byte window");
+                let next = u64::from_be_bytes(arr);
+                acc |= next >> fill;
+                let bytes = (64 - fill) / 8;
+                pos += bytes as usize;
+                fill += bytes * 8;
+            } else {
+                while fill < nbits && fill <= 56 {
+                    let byte = if pos < data_len { data[pos] } else { 0 };
+                    acc |= (byte as u64) << (56 - fill);
+                    fill += 8;
+                    if pos < data_len {
+                        pos += 1;
+                    } else {
+                        // EOF — treat the rest as implicit-zero per
+                        // `BitReader::refill`'s pad-with-zero rule.
+                        break;
+                    }
+                }
+            }
+        }
+        // Peek `nbits` from the top of `acc`, consume, mask.
+        let v = (acc >> (64 - nbits)) as u16;
+        acc <<= nbits;
+        fill = fill.saturating_sub(nbits);
+        *px = v & mask;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,5 +248,130 @@ mod tests {
         assert_eq!(br.read_bits(7), 0);
         // Past-EOF reads keep returning zero.
         assert_eq!(br.read_bits(16), 0);
+    }
+
+    /// Reference implementation of `unpack_raw_bits_to_u16` built on
+    /// top of the generic per-pixel `BitReader::read_bits`, used to
+    /// pin the batched unpacker against the same observable bit
+    /// stream the decoder used to emit.
+    fn unpack_ref(data: &[u8], dst: &mut [u16], bits: u8, mask: u16) {
+        let mut br = BitReader::new(data);
+        for px in dst.iter_mut() {
+            *px = (br.read_bits(bits as u32) as u16) & mask;
+        }
+    }
+
+    fn pack_msb_first(samples: &[u16], bits: u8) -> Vec<u8> {
+        // Same MSB-first big-endian wire convention as the encoder's
+        // `BitWriter`. Use a 64-bit accumulator with `bits_used` valid
+        // bits in the top, draining whole bytes from the high end.
+        let mut out: Vec<u8> = Vec::with_capacity((samples.len() * bits as usize).div_ceil(8));
+        let mut acc: u64 = 0;
+        let mut bits_used: u32 = 0;
+        for &s in samples {
+            let shift = 64 - bits_used - (bits as u32);
+            acc |= (s as u64) << shift;
+            bits_used += bits as u32;
+            while bits_used >= 8 {
+                let byte = (acc >> 56) as u8;
+                out.push(byte);
+                acc <<= 8;
+                bits_used -= 8;
+            }
+        }
+        if bits_used > 0 {
+            out.push((acc >> 56) as u8);
+        }
+        out
+    }
+
+    #[test]
+    fn unpack_raw_bits_to_u16_matches_per_pixel_at_10_12_14() {
+        // For each bit-depth pack a deterministic 200-sample stream,
+        // unpack with both paths, assert byte-for-byte agreement.
+        for &bits in &[10u8, 12, 14] {
+            let mask = ((1u32 << bits) - 1) as u16;
+            let n = 200usize;
+            // Deterministic input (xorshift32) covering edge values
+            // (0, mask, mid-range).
+            let mut s: u32 = 0xdead_beef ^ (bits as u32).wrapping_mul(0x9e37_79b9);
+            let mut samples = Vec::with_capacity(n);
+            for i in 0..n {
+                s ^= s << 13;
+                s ^= s >> 17;
+                s ^= s << 5;
+                let v = if i == 0 {
+                    0
+                } else if i == 1 {
+                    mask
+                } else {
+                    (s as u16) & mask
+                };
+                samples.push(v);
+            }
+            let packed = pack_msb_first(&samples, bits);
+
+            let mut fast = vec![0u16; n];
+            unpack_raw_bits_to_u16(&packed, &mut fast, bits, mask);
+
+            let mut slow = vec![0u16; n];
+            unpack_ref(&packed, &mut slow, bits, mask);
+
+            assert_eq!(fast, slow, "fast/slow mismatch at bits={bits}");
+            assert_eq!(fast, samples, "round-trip mismatch at bits={bits}");
+        }
+    }
+
+    #[test]
+    fn unpack_raw_bits_to_u16_zero_pads_past_eof() {
+        // Provide a payload shorter than the destination demands; both
+        // paths should zero-fill the tail.
+        let bits = 12u8;
+        let mask = 0x0fff_u16;
+        // 3 bytes = 2 full 12-bit samples + 0 leftover bits = 24
+        // unread bits → fast path covers first 2 samples; the next
+        // sample(s) should be implicit zeros.
+        let data = [0xab_u8, 0xcd, 0xef];
+        let mut fast = vec![0u16; 5];
+        unpack_raw_bits_to_u16(&data, &mut fast, bits, mask);
+        let mut slow = vec![0u16; 5];
+        unpack_ref(&data, &mut slow, bits, mask);
+        assert_eq!(fast, slow);
+        // First sample is the top 12 bits of the 24-bit stream:
+        // 0xabcdef >> 12 = 0xabc.
+        assert_eq!(fast[0], 0xabc);
+        // Second sample is the low 12 bits: 0xdef.
+        assert_eq!(fast[1], 0xdef);
+        assert_eq!(fast[2], 0);
+        assert_eq!(fast[3], 0);
+        assert_eq!(fast[4], 0);
+    }
+
+    #[test]
+    fn unpack_raw_bits_to_u16_handles_empty_dst() {
+        let mut dst: [u16; 0] = [];
+        unpack_raw_bits_to_u16(&[0xff_u8; 4], &mut dst, 10, 0x3ff);
+        // Just exercising the early-return.
+    }
+
+    #[test]
+    fn unpack_raw_bits_to_u16_long_payload_crosses_refills() {
+        // 4096 samples × 14 bits = 7168 bytes → multiple refill cycles.
+        let bits = 14u8;
+        let mask = 0x3fff_u16;
+        let n = 4096usize;
+        let mut s: u32 = 0x1234_5678;
+        let samples: Vec<u16> = (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 17;
+                s ^= s << 5;
+                (s as u16) & mask
+            })
+            .collect();
+        let packed = pack_msb_first(&samples, bits);
+        let mut fast = vec![0u16; n];
+        unpack_raw_bits_to_u16(&packed, &mut fast, bits, mask);
+        assert_eq!(fast, samples);
     }
 }

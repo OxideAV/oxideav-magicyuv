@@ -8,6 +8,47 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Batched raw-mode bit unpacker (`bitreader::unpack_raw_bits_to_u16`).**
+  The high-bit-depth raw-mode slice payload (`spec/05` §4.1: a
+  continuous MSB-first bit-stream of `bits ∈ {10, 12, 14}`-wide
+  residuals packed across `(pixels * bits + 7) / 8` bytes) was being
+  decoded by a per-pixel `BitReader::read_bits(bits)` loop in
+  `decoder::decode_high_bit_depth`. Each `read_bits` call performs a
+  refill check against the 64-bit accumulator, so a 640×480 10-bit
+  raw slice fires ≈ 300 k refill branches even though only
+  `ceil(640·480·10 / 56)` ≈ 55 k of them actually pull fresh bytes
+  (one in ~5). The new unpacker writes `dst.len()` samples into a
+  pre-sized `&mut [u16]` slice using the same 64-bit MSB-aligned
+  accumulator + 8-byte big-endian refill the generic `BitReader`
+  uses, but the refill check fires at most once per `floor(56 / bits)`
+  pixels (≈ 5 / ≈ 4 / ≈ 4 at 10/12/14-bit) rather than once per
+  pixel. End-of-data is implicitly zero-padded, matching the
+  per-pixel path's `BitReader::refill` semantics. Four unit tests
+  pin the batched implementation against the per-pixel reference
+  (random 200-sample stream at each of 10/12/14-bit, a 5-sample
+  short-payload zero-pad edge case, an empty-destination no-op, and
+  a 4096-sample 14-bit stream that crosses multiple refill cycles).
+  No observable bitstream change — the existing
+  `high_bit_depth_raw_mode` + `all_fourccs_left_raw_random` round-trip
+  tests continue to pass through the new path. Coverage source: the
+  spec/05 §4.1 byte-layout block and the §3.3 64-bit accumulator
+  refill rule shared with the Huffman bitstream.
+
+- **`profile_magicyuv raw` mode (`examples/profile_magicyuv.rs`).** A
+  third scenario in the sampling-profiler driver alongside `decode`
+  and `roundtrip`: walks `M0RG/10bit/640×480`, `M2RG/12bit/640×480`,
+  and `M4RG/14bit/640×480` raw-mode (`slice_flags & 0x01 == 1`)
+  payloads through `decode_into` in a flat loop, so a `samply` /
+  `cargo flamegraph` / `perf record` profile resolves the
+  `unpack_raw_bits_to_u16` hot loop without Criterion's warm-up +
+  estimator math diluting the per-iteration sample. Since the rest
+  of the high-bit-depth pipeline (slice walking, predictor inverse,
+  RGB decorrelation reversal) is shared with the Huffman variant
+  already covered by `profile_decode`, any delta between this
+  scenario's MiB/s and `decode`'s M0RG row is attributable to the
+  unpacker. The three bit-depth tiers exercise the per-tier refill
+  cadence end to end.
+
 - **Sampling-profiler driver (`examples/profile_magicyuv.rs`).** The
   existing Criterion benches (`benches/{decode,encode,roundtrip,
   decode_all_fourccs,encode_strategy_matrix}.rs`) measure steady-state
