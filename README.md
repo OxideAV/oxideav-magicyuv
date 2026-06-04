@@ -85,8 +85,8 @@ AVI is a container, not a codec — its demux/mux (single-RIFF AVI 1.0
 
 ## Fuzzing
 
-Two [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz) harnesses
-live under [`fuzz/`](fuzz/), both wired into the daily `fuzz.yml`
+Three [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz) harnesses
+live under [`fuzz/`](fuzz/), all three wired into the daily `fuzz.yml`
 workflow that splits a 1800-s total budget evenly across them.
 
 **`decode_magicyuv`** drives `decode_frame` on an arbitrary byte
@@ -116,9 +116,27 @@ symmetry, Dynamic per-slice predictor selection, Auto per-slice mode
 comparison — rather than allocator branches. Latest local baseline:
 ~210 k exec / 60 s, ~418 k / 180 s, zero crashes.
 
+**`huffman_descriptor`** pushes arbitrary bytes straight into the
+`huffman::parse_lengths` + `HuffmanTable::build` pair, bypassing the
+32-byte header / slice-table / preamble framing the full-frame target
+walks first. Concentrates fuzz pressure on `spec/05` §1.1 run-length
+descriptor decode, `spec/05` §2.0 canonical-Huffman code construction
+(the audit-corrected longest-length-first cumulative accumulator +
+Kraft check, with `1u64 << len` at `len = max_length = 18` for the
+14-bit tier), and the two-level primary/secondary table arithmetic
+(`REDIRECT_MARKER`, per-prefix subtable allocation, residual-bit
+spread). Successful builds then drive `decode_into_u{8,16}` on the
+trailing fuzz bytes so the post-build BitReader peek/consume hot loop
+sees pressure too. Input layout: byte 0 = bit-depth tier selector
+(mod 4 → `n_symbols ∈ {256, 1024, 4096, 16384}`, `max_length ∈ {12,
+14, 16, 18}`), bytes 1-2 = descriptor cap (LE u16, capped at 16 KiB),
+bytes 3.. = descriptor + trailing decode payload. Latest local
+baseline: ~830 k exec / 16 s (~51 k exec/s), zero crashes.
+
 ```sh
 cd fuzz && cargo +nightly fuzz run decode_magicyuv -- -max_total_time=60
 cd fuzz && cargo +nightly fuzz run encode_magicyuv -- -max_total_time=60
+cd fuzz && cargo +nightly fuzz run huffman_descriptor -- -max_total_time=60
 ```
 
 ## Profiling

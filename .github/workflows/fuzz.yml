@@ -1,15 +1,20 @@
 name: Fuzz
 
-# Daily fuzz run for the cargo-fuzz harnesses under fuzz/. Two targets
-# are wired in: `decode_magicyuv` (the attacker-facing decoder — 32-byte
-# header -> slice table -> preamble + per-plane canonical-Huffman
-# descriptors -> raw / Huffman slice payloads -> Left / Gradient /
-# Median predictor inverse, asserting decode never panics) and
+# Daily fuzz run for the cargo-fuzz harnesses under fuzz/. Three
+# targets are wired in: `decode_magicyuv` (the attacker-facing decoder
+# — 32-byte header -> slice table -> preamble + per-plane canonical-
+# Huffman descriptors -> raw / Huffman slice payloads -> Left /
+# Gradient / Median predictor inverse, asserting decode never panics),
 # `encode_magicyuv` (drives the encoder across 17 FOURCCs × 4
 # predictor strategies × 3 per-slice modes × interlaced on/off, then
-# round-trips every Ok(bytes) through `decode_frame` byte-for-byte).
-# The reusable workflow auto-discovers the targets under fuzz/ and
-# splits the 1800-s total budget evenly across them.
+# round-trips every Ok(bytes) through `decode_frame` byte-for-byte),
+# and `huffman_descriptor` (pushes arbitrary bytes straight into the
+# `huffman::parse_lengths` + `HuffmanTable::build` pair, bypassing the
+# v7 frame framing so the canonical-Huffman code-builder + two-level
+# primary/secondary table arithmetic + post-build decode hot loops see
+# direct fuzz pressure). The reusable workflow auto-discovers the
+# targets under fuzz/ and splits the 1800-s total budget evenly across
+# them.
 
 on:
   schedule:
