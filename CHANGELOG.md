@@ -6,6 +6,18 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/OxideAV/oxideav-magicyuv/compare/v0.0.5...v0.0.6) - 2026-06-04
+
+### Other
+
+- add huffman_descriptor target driving parse_lengths + HuffmanTable::build directly
+- batched raw-mode bit packer (one drain per pixel, hoisted state)
+- per-plane scratch reuse in build_slice_residuals_u{8,16}_into
+- BitWriter direct parity tests + r217 to_be_bytes drain candidate closed
+- batched raw-mode high-bit-depth unpacker (one refill per ~floor(56/bits) pixels)
+- profile_magicyuv samply-friendly flat-loop driver
+- encoder strategy × mode × interlaced matrix (Dynamic + Auto coverage)
+
 ### Added
 
 - **Third cargo-fuzz target `huffman_descriptor`.** Pushes arbitrary
