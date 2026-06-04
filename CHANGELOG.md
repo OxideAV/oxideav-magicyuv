@@ -8,6 +8,38 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Third cargo-fuzz target `huffman_descriptor`.** Pushes arbitrary
+  fuzz-supplied bytes straight into the public Huffman sub-surface
+  (`huffman::parse_lengths` + `HuffmanTable::build` +
+  `decode_into_u{8,16}`), bypassing the 32-byte v7 header / slice-table
+  / preamble framing the full-frame `decode_magicyuv` target walks
+  first. The full-frame harness only reaches `huffman::*` after a
+  valid header has been parsed — most random byte sequences are
+  rejected before they ever touch the canonical-Huffman code-builder.
+  The new target concentrates fuzz pressure on `spec/05` §1.1
+  run-length descriptor decode (literal / run-form alternation +
+  `HuffmanLengthExceedsMax` rejection + `Truncated` rejection),
+  `spec/05` §2.0 canonical-Huffman code construction (the
+  audit-corrected longest-length-first cumulative accumulator + the
+  `(1 << len) <= acc` Kraft check, with the `1u64 << len` cast at
+  `len = max_length = 18` that the 14-bit tier exercises), and the
+  two-level primary/secondary table arithmetic (`REDIRECT_MARKER`
+  sentinel, per-prefix subtable allocation keyed by
+  `code[s] >> (l - primary_bits)`, residual-bit spread). Successful
+  builds drive `decode_into_u{8,16}` on the trailing bytes so the
+  post-build `BitReader` peek/consume hot loop sees pressure too.
+  Input layout: byte 0 = bit-depth tier selector (mod 4), bytes 1-2 =
+  descriptor cap (LE u16, capped at 16 KiB), bytes 3.. = descriptor +
+  trailing decode payload. Allocation cap stays tight (≤ 16 KiB
+  primary table + ≤ 4096 secondary subtables × 64 entries + ≤ 8 KiB
+  `out` for the decode-loop exercise) so no resource-request false
+  positives compete with the logic-bug signal the harness is built to
+  find. Local baseline ~830 k exec / 16 s = ~51 k exec/s, zero
+  crashes. Auto-discovered by the `fuzz.yml` reusable workflow under
+  `OxideAV/.github/.github/workflows/crate-fuzz.yml@master` (no
+  workflow edit needed — the 1800-s daily budget now splits three
+  ways across `decode_magicyuv` + `encode_magicyuv` +
+  `huffman_descriptor`).
 - **Batched raw-mode bit packer (`encoder::pack_raw_bits_from_u16`).**
   Encoder symmetry for the high-bit-depth raw-mode slice payload
   (`spec/05` §4.1: a continuous MSB-first bit-stream of

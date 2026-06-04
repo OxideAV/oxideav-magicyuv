@@ -7,7 +7,8 @@ edition = "2021"
 [package.metadata]
 cargo-fuzz = true
 
-# MagicYUV's v7 frame decoder + encoder are both worth fuzzing.
+# MagicYUV's v7 frame decoder + encoder + the standalone Huffman
+# sub-surface are all worth fuzzing.
 #
 # Decoder (`decode_magicyuv`): a 32-byte header (`spec/01` §3) selects
 # one of 17 native FOURCCs (8/10/12/14-bit RGB / RGBA / YUV / YUVA /
@@ -34,9 +35,23 @@ cargo-fuzz = true
 # source anyway), so the round-trip *to our own decoder* is the
 # correctness witness.
 #
+# Huffman descriptor (`huffman_descriptor`): pushes arbitrary bytes
+# straight into the `huffman::parse_lengths` + `HuffmanTable::build`
+# pair, bypassing the 32-byte header / slice-table / preamble framing
+# the full-frame decoder walks first. Concentrates fuzz pressure on
+# `spec/05` §1.1 run-length descriptor decode, `spec/05` §2.0
+# canonical-Huffman code construction (the audit-corrected
+# longest-length-first cumulative accumulator + Kraft check, with the
+# `1u64 << len` cast at `len = max_length = 18` for the 14-bit tier),
+# and the two-level primary/secondary table arithmetic
+# (REDIRECT_MARKER, per-prefix subtable allocation, residual-bit
+# spread). Successful builds then drive `decode_into_u{8,16}` on the
+# trailing fuzz bytes so the post-build BitReader peek/consume hot
+# loop sees pressure too.
+#
 # `default-features = false` keeps the framework registry (and its
-# `oxideav-core` dependency) out of the fuzz binary — both entry points
-# are feature-independent.
+# `oxideav-core` dependency) out of the fuzz binary — all three entry
+# points are feature-independent.
 [dependencies]
 libfuzzer-sys = "0.4"
 
@@ -60,5 +75,11 @@ doc = false
 [[bin]]
 name = "encode_magicyuv"
 path = "fuzz_targets/encode_magicyuv.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "huffman_descriptor"
+path = "fuzz_targets/huffman_descriptor.rs"
 test = false
 doc = false
