@@ -615,6 +615,65 @@ impl BitWriter {
     }
 }
 
+/// Batched packer for high-bit-depth raw-mode slice payloads
+/// (`spec/05` §4.1: `(pixels * bits + 7) / 8` MSB-first bits packed
+/// in the output). Appends `ceil(src.len() * bits / 8)` bytes to
+/// `dst`. `bits` is taken at runtime; if it is 0, > 16, or `src` is
+/// empty the buffer is left untouched.
+///
+/// Mirrors `bitreader::unpack_raw_bits_to_u16` (the decoder-side
+/// counterpart added in the prior round): the same MSB-first 64-bit
+/// accumulator + whole-byte drain shape used by `BitWriter::write`,
+/// but with the state hoisted into stack locals across the whole
+/// slice. The generic `BitWriter::write` path took `&mut self`, so
+/// the optimiser cannot prove `self.bytes` / `self.acc` /
+/// `self.bits_used` survive across the per-symbol call without a
+/// reload — this entry point keeps all three in registers across the
+/// inner loop. `len` here is the constant per-call `bits`, so the
+/// drain loop's iteration count is bounded by `floor(bits / 8) + 1`
+/// (≤ 2 at 10/12/14-bit) and easily unrolled by LLVM.
+///
+/// Same observable byte stream as a per-pixel
+/// `BitWriter::write(sym as u32, bits)` loop; the slice-payload Vec
+/// receives identical bytes byte-for-byte. Used by the encoder's
+/// `SliceMode::Raw` (and Auto-loser raw-fallback) at 10/12/14-bit.
+#[inline]
+pub(crate) fn pack_raw_bits_from_u16(dst: &mut Vec<u8>, src: &[u16], bits: u8) {
+    if bits == 0 || bits > 16 || src.is_empty() {
+        return;
+    }
+    let nbits = bits as u32;
+    let mask: u64 = if nbits == 64 {
+        u64::MAX
+    } else {
+        (1u64 << nbits) - 1
+    };
+    // Reserve up front so the per-symbol drain can rely on
+    // amortised-O(1) `push`.
+    dst.reserve((src.len() * bits as usize).div_ceil(8));
+    let mut acc: u64 = 0;
+    let mut bits_used: u32 = 0;
+    for &sym in src {
+        // Same `BitWriter::write` arithmetic: place `sym` MSB-first
+        // at acc[(63-bits_used) .. (64-bits_used-nbits)].
+        let shift = 64 - bits_used - nbits;
+        acc |= ((sym as u64) & mask) << shift;
+        bits_used += nbits;
+        // Drain whole bytes from the high end. With `nbits ≤ 16` and
+        // entry `bits_used ≤ 7`, the post-merge `bits_used ≤ 23`, so
+        // the loop runs ≤ 2 times.
+        while bits_used >= 8 {
+            dst.push((acc >> 56) as u8);
+            acc <<= 8;
+            bits_used -= 8;
+        }
+    }
+    if bits_used > 0 {
+        // Same partial-byte zero-pad as `BitWriter::finish`.
+        dst.push((acc >> 56) as u8);
+    }
+}
+
 // ─────────────────────────── 8-bit encode ───────────────────────────
 
 fn encode_predictor_u8(
@@ -1339,12 +1398,12 @@ fn encode_frame_u16(
         if flags & 0x01 != 0 {
             // Bit-pack at `bits` bits MSB-first. Output is exactly
             // `raw_size` bytes (final partial byte already accounted
-            // for by `div_ceil`).
-            let mut bw = BitWriter::with_capacity(raw_size);
-            for &sym in res_block {
-                bw.write(sym as u32, bits);
-            }
-            payload.extend(bw.finish());
+            // for by `div_ceil`). The batched packer hoists the
+            // 64-bit accumulator + drain state into stack locals
+            // across the slice, eliminating the per-symbol
+            // `&mut BitWriter` reload + early-return that the
+            // generic `BitWriter::write` carries.
+            pack_raw_bits_from_u16(&mut payload, res_block, bits);
         } else if let Some(buf) = huff_buf {
             payload.extend(buf);
         } else {
@@ -1906,6 +1965,139 @@ mod bit_writer_tests {
             }
             assert_eq!(drive(&ops), reference(&ops), "seed {seed}");
         }
+    }
+}
+
+#[cfg(test)]
+mod pack_raw_bits_tests {
+    //! Pin the batched `pack_raw_bits_from_u16` against a per-pixel
+    //! `BitWriter::write(sym as u32, bits)` reference oracle.
+    //!
+    //! The round-trip suite covers raw-mode bytes end-to-end (encode
+    //! → decode round-trip on every FOURCC × predictor × Raw
+    //! configuration). These unit tests pin the packer body in
+    //! isolation so any future hot-loop reshape lands as a focused
+    //! failure before the larger integration tests reach it,
+    //! mirroring the `bit_writer_tests` shape from a prior round.
+    use super::*;
+
+    fn reference(samples: &[u16], bits: u8) -> Vec<u8> {
+        // Per-symbol drive through the production `BitWriter` — same
+        // observable byte stream we already verify via the round-trip
+        // tests. The reference walks one `bw.write(sym as u32, bits)`
+        // call per sample, exactly the shape the prior raw-mode
+        // emitter used at every call site.
+        let cap = (samples.len() * bits as usize).div_ceil(8);
+        let mut bw = BitWriter::with_capacity(cap);
+        for &s in samples {
+            bw.write(s as u32, bits);
+        }
+        bw.finish()
+    }
+
+    fn drive(samples: &[u16], bits: u8) -> Vec<u8> {
+        let mut out = Vec::new();
+        pack_raw_bits_from_u16(&mut out, samples, bits);
+        out
+    }
+
+    #[test]
+    fn empty_input_emits_no_bytes() {
+        assert!(drive(&[], 10).is_empty());
+        assert!(drive(&[], 12).is_empty());
+        assert!(drive(&[], 14).is_empty());
+    }
+
+    #[test]
+    fn out_of_range_bits_is_noop() {
+        assert!(drive(&[0x123, 0x456], 0).is_empty());
+        assert!(drive(&[0x1, 0x2], 17).is_empty());
+    }
+
+    #[test]
+    fn single_aligned_sample() {
+        // 16-bit width aligns to two whole bytes.
+        assert_eq!(drive(&[0xabcd], 16), vec![0xab, 0xcd]);
+    }
+
+    #[test]
+    fn appends_to_existing_buffer() {
+        // The packer must `extend` an existing `payload` Vec — verify
+        // the prefix bytes survive intact.
+        let mut out = vec![0xff_u8, 0xee, 0xdd];
+        pack_raw_bits_from_u16(&mut out, &[0xabcd], 16);
+        assert_eq!(out, vec![0xff, 0xee, 0xdd, 0xab, 0xcd]);
+    }
+
+    #[test]
+    fn matches_per_pixel_at_10_12_14() {
+        // For each bit-depth, walk a 200-sample deterministic stream
+        // covering edge values (0, mask, mid-range) plus xorshift
+        // chaos. Assert the batched and per-pixel outputs are
+        // byte-identical, and that the result re-unpacks to the
+        // original samples.
+        use crate::bitreader::unpack_raw_bits_to_u16;
+        for &bits in &[10u8, 12, 14] {
+            let mask = ((1u32 << bits) - 1) as u16;
+            let n = 200usize;
+            let mut s: u32 = 0xdead_beef ^ (bits as u32).wrapping_mul(0x9e37_79b9);
+            let mut samples = Vec::with_capacity(n);
+            for i in 0..n {
+                s ^= s << 13;
+                s ^= s >> 17;
+                s ^= s << 5;
+                let v = if i == 0 {
+                    0
+                } else if i == 1 {
+                    mask
+                } else {
+                    (s as u16) & mask
+                };
+                samples.push(v);
+            }
+            let fast = drive(&samples, bits);
+            let slow = reference(&samples, bits);
+            assert_eq!(fast, slow, "fast/slow mismatch at bits={bits}");
+
+            // Round-trip through the decoder's batched unpacker.
+            let mut recovered = vec![0u16; n];
+            unpack_raw_bits_to_u16(&fast, &mut recovered, bits, mask);
+            assert_eq!(recovered, samples, "round-trip mismatch at bits={bits}");
+        }
+    }
+
+    #[test]
+    fn unaligned_tail_zero_pads() {
+        // 3 samples × 10 bits = 30 bits → 4 bytes (last byte's low 2
+        // bits are zero). Walk the per-pixel reference for the
+        // canonical layout.
+        let samples = [0x3ff_u16, 0x000, 0x2aa];
+        let out = drive(&samples, 10);
+        assert_eq!(out.len(), (3 * 10_usize).div_ceil(8));
+        assert_eq!(out, reference(&samples, 10));
+    }
+
+    #[test]
+    fn long_payload_crosses_multiple_drains() {
+        // 4096 14-bit samples = 7168 bytes, well past any single-
+        // drain boundary. Pins the per-symbol drain loop's
+        // post-merge state across many cycles.
+        let bits = 14u8;
+        let mask = 0x3fff_u16;
+        let n = 4096usize;
+        let mut s: u32 = 0x1234_5678;
+        let samples: Vec<u16> = (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 17;
+                s ^= s << 5;
+                (s as u16) & mask
+            })
+            .collect();
+        let fast = drive(&samples, bits);
+        let slow = reference(&samples, bits);
+        assert_eq!(fast, slow);
+        assert_eq!(fast.len(), (n * bits as usize).div_ceil(8));
     }
 }
 

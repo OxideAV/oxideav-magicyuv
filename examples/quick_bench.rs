@@ -134,6 +134,40 @@ fn time_encode(name: &str, format_byte: u8, w: u32, h: u32, predictor: Predictor
     println!("{:7.2} ms/iter", per_iter_ms);
 }
 
+/// Raw-mode encode timing. `SliceMode::Raw` per spec/05 §4.1 — every
+/// slice is bit-packed at the native bit-depth instead of
+/// Huffman-emitted. The 10/12/14-bit raw path is the call site for the
+/// batched `pack_raw_bits_from_u16` packer added in r230; the 8-bit
+/// path is a `payload.extend_from_slice(res_block)` memcpy so its
+/// timing here is a control for the high-bit-depth scenarios.
+fn time_encode_raw(
+    name: &str,
+    format_byte: u8,
+    w: u32,
+    h: u32,
+    predictor: PredictorKind,
+    iters: u32,
+) {
+    use std::io::Write;
+    print!("  encode {:38} ", name);
+    std::io::stdout().flush().ok();
+    let rec = tables::lookup(format_byte).unwrap();
+    let opts = EncodeOptions {
+        mode: SliceMode::Raw,
+        ..EncodeOptions::fixed(predictor)
+    };
+    let _ = encode_frame(rec, w, h, 28, make_planes(rec, w, h), opts).unwrap();
+
+    let t = Instant::now();
+    for _ in 0..iters {
+        let p = make_planes(rec, w, h);
+        let _ = std::hint::black_box(encode_frame(rec, w, h, 28, p, opts).unwrap());
+    }
+    let elapsed = t.elapsed().as_secs_f64();
+    let per_iter_ms = elapsed * 1000.0 / iters as f64;
+    println!("{:7.2} ms/iter", per_iter_ms);
+}
+
 /// Dynamic-strategy encode timing. Spec/04 §3 + spec/05 §6.2 — the
 /// `EncodeOptions::dynamic_auto()` configuration the v2.4.2 encoder
 /// ships with always-on, evaluating all three predictors per slice +
@@ -268,5 +302,45 @@ fn main() {
         time_encode_dynamic("M8Y0/dynamic/1280x720", 0x69, 1280, 720, 5);
         time_encode_dynamic("M8G0/dynamic/1920x1080", 0x6b, 1920, 1080, 5);
         time_encode_dynamic("M0RG/dynamic/1280x720/10bit", 0x6d, 1280, 720, 5);
+    }
+    if pick == "all" || pick == "encode_raw" || pick == "raw" {
+        println!();
+        println!("Encode raw (per-iteration ms, plane-build included):");
+        // 8-bit raw exercises `payload.extend_from_slice(res_block)` —
+        // a control for the high-bit-depth scenarios below.
+        time_encode_raw(
+            "M8RG/gradient/1280x720",
+            0x65,
+            1280,
+            720,
+            PredictorKind::Gradient,
+            5,
+        );
+        // 10/12/14-bit raw exercises the batched
+        // `pack_raw_bits_from_u16` packer.
+        time_encode_raw(
+            "M0RG/gradient/1280x720/10bit",
+            0x6d,
+            1280,
+            720,
+            PredictorKind::Gradient,
+            5,
+        );
+        time_encode_raw(
+            "M2RG/gradient/1280x720/12bit",
+            0x6f,
+            1280,
+            720,
+            PredictorKind::Gradient,
+            5,
+        );
+        time_encode_raw(
+            "M4RG/gradient/1280x720/14bit",
+            0x71,
+            1280,
+            720,
+            PredictorKind::Gradient,
+            5,
+        );
     }
 }

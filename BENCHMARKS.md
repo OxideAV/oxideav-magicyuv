@@ -415,6 +415,59 @@ pass under `--all-features` (was 98; +5 scratch parity tests in
 `build_slice_residuals_scratch_tests`) and 94 under
 `--no-default-features` (was 89).
 
+### 12. Batched raw-mode bit packer (`pack_raw_bits_from_u16`)
+
+The decoder's `bitreader::unpack_raw_bits_to_u16` (added the prior
+round) batched the high-bit-depth raw-mode unpack — one 64-bit
+accumulator + bounded refill loop across the whole slice. The
+encoder side still walked `for &sym in res_block { bw.write(sym as
+u32, bits); }` on a per-pixel `BitWriter`. `bw.write` is `&mut
+self`, so the optimiser couldn't prove `self.bytes`, `self.acc`,
+and `self.bits_used` survived across iterations without a reload,
+and every call paid an early-return-on-`len == 0` branch that is
+dead in this context (raw mode always emits a fixed-width sample).
+
+The new `encoder::pack_raw_bits_from_u16` mirrors the decoder
+shape: the 64-bit accumulator + whole-byte drain state lives in
+stack locals across the whole slice, the dead early-return is
+dropped, and the function appends directly into the existing
+pre-sized `payload: Vec<u8>` so the per-slice
+`bw.finish() + payload.extend(...)` memcpy is gone too. The drain
+loop's iteration count is bounded by `floor(bits / 8) + 1` ≤ 2 at
+every native bit-depth and is easily unrolled by LLVM.
+
+Seven new `pack_raw_bits_tests` (`empty_input_emits_no_bytes`,
+`out_of_range_bits_is_noop`, `single_aligned_sample`,
+`appends_to_existing_buffer`, `matches_per_pixel_at_10_12_14`,
+`unaligned_tail_zero_pads`, `long_payload_crosses_multiple_drains`)
+pin the batched implementation against a per-pixel
+`BitWriter::write(sym as u32, bits)` reference oracle inside the
+test module. The bit-depth-bounded test also round-trips packed
+bytes through the decoder's `unpack_raw_bits_to_u16` so the
+encoder/decoder symmetry is anchored at both ends.
+
+Side-by-side timings on the Apple M-series host
+(`examples/quick_bench raw`, 10-run medians per side):
+
+| Scenario                                | Baseline  | After     | Δ        |
+| --------------------------------------- | --------: | --------: | -------: |
+| enc M8RG / gradient / 1280×720          |   7.03 ms |   7.05 ms |  flat    |
+| enc M0RG / gradient / 1280×720 / 10b    |  16.92 ms |  14.48 ms |  -14.4 % |
+| enc M2RG / gradient / 1280×720 / 12b    |  18.17 ms |  14.25 ms |  -21.5 % |
+| enc M4RG / gradient / 1280×720 / 14b    |  19.50 ms |  14.79 ms |  -24.2 % |
+
+The 8-bit M8RG raw scenario is unchanged (its raw path is the
+`payload.extend_from_slice(res_block)` byte-copy memcpy, not the
+bit-packer). Fixed-Huffman + Dynamic-Auto encode timings on the
+existing `quick_bench encode` / `dynamic` scenarios are flat to
+within ±1 % run-to-run noise: the new packer fires only on
+`SliceMode::Raw` and on the Auto-loses-to-raw fallback. Decode is
+unchanged.
+
+All 110 unit + round-trip tests pass under `--all-features`
+(was 103; +7 packer parity tests in `pack_raw_bits_tests`) and 101
+under `--no-default-features` (was 94).
+
 ## Round-N+1 candidates
 
 - **Predictor SIMD (Left only)** — Left has the simplest dependency

@@ -6,6 +6,68 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Batched raw-mode bit packer (`encoder::pack_raw_bits_from_u16`).**
+  Encoder symmetry for the high-bit-depth raw-mode slice payload
+  (`spec/05` §4.1: a continuous MSB-first bit-stream of
+  `bits ∈ {10, 12, 14}`-wide samples packed across
+  `(pixels * bits + 7) / 8` bytes). The encoder's raw-mode call site
+  previously walked `for &sym in res_block { bw.write(sym as u32,
+  bits); }` on a per-pixel `BitWriter`; each `bw.write` is a
+  `&mut self` call so the optimiser couldn't prove `self.bytes` /
+  `self.acc` / `self.bits_used` survived across the loop without a
+  reload, and every iteration paid an early-return-on-`len == 0`
+  branch that is dead in this context (raw mode always emits a
+  fixed-width sample). The new function hoists the same 64-bit
+  accumulator + whole-byte drain shape into stack locals across the
+  whole slice, drops the dead early-return, and appends directly into
+  the existing pre-sized `payload: Vec<u8>` (saving the
+  `bw.finish() + payload.extend(...)` memcpy that the prior shape did
+  per slice). The drain loop's iteration count is bounded by
+  `floor(bits / 8) + 1` ≤ 2 at every native bit-depth and is easily
+  unrolled by LLVM. Mirrors the decoder-side
+  `bitreader::unpack_raw_bits_to_u16` added in the prior round.
+  Seven new `pack_raw_bits_tests` (`empty_input_emits_no_bytes`,
+  `out_of_range_bits_is_noop`, `single_aligned_sample`,
+  `appends_to_existing_buffer`, `matches_per_pixel_at_10_12_14`,
+  `unaligned_tail_zero_pads`, `long_payload_crosses_multiple_drains`)
+  pin the batched implementation against a per-pixel
+  `BitWriter::write(sym as u32, bits)` reference oracle defined
+  inside the test module — the same shape the decoder-side tests use.
+  The bit-depth-bounded test also round-trips packed bytes through
+  the decoder's `unpack_raw_bits_to_u16` so the symmetry is anchored
+  at both ends. Same observable wire-byte stream — all 110 unit +
+  round-trip tests pass under `--all-features` (was 103; the 7 new
+  packer parity tests) and 101 under `--no-default-features` (was
+  94). Measured improvement on `examples/quick_bench raw`
+  (10-run medians on the Apple M-series host):
+
+  | Scenario                          | Baseline   | Post       | Δ        |
+  | --------------------------------- | ---------: | ---------: | -------: |
+  | enc M0RG / gradient / 1280×720    | 16.92 ms   | 14.48 ms   | -14.4 %  |
+  | enc M2RG / gradient / 1280×720    | 18.17 ms   | 14.25 ms   | -21.5 %  |
+  | enc M4RG / gradient / 1280×720    | 19.50 ms   | 14.79 ms   | -24.2 %  |
+
+  The 8-bit M8RG raw scenario is unchanged (its raw path is the
+  `payload.extend_from_slice(res_block)` byte-copy memcpy, not the
+  bit-packer). Fixed-Huffman + Dynamic-Auto encode timings on the
+  existing `quick_bench encode` / `dynamic` scenarios are flat to
+  within ±1 % run-to-run noise: the batched packer fires only on
+  `SliceMode::Raw` and on the Auto-loses-to-raw fallback (a rare
+  natural-image case). Decode is unchanged.
+
+- **`examples/quick_bench raw` scenario.** Fourth selector in the
+  micro-bench driver alongside `decode`, `encode`, `dynamic`: walks
+  `SliceMode::Raw` encode for one 8-bit FOURCC (the
+  `extend_from_slice` control) and the 10/12/14-bit RGB family at
+  1280×720. The 10-bit, 12-bit, and 14-bit cells are the exact call
+  sites for the new `pack_raw_bits_from_u16` packer; the 8-bit cell
+  rules out any change to the byte-copy path. `quick_bench raw` is
+  the focused A/B harness for any future raw-pack hot-loop tweak
+  while Criterion's `encode_strategy_matrix` bench remains the
+  fixture-driven regression oracle.
+
 ### Changed
 
 - **Per-plane scratch reuse in `build_slice_residuals_u{8,16}_into`.**
