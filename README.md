@@ -66,6 +66,20 @@ AVI is a container, not a codec — its demux/mux (single-RIFF AVI 1.0
   copy is also gone from `decode_frame` itself now).
 - [`encode_frame`] — encode one frame from per-plane pixel buffers.
 - [`header::parse`] — standalone v7 header parser.
+- [`header::FrameHeader::is_interlaced`] /
+  [`header::FrameHeader::is_full_range`] /
+  [`header::FrameHeader::color_matrix_nibble`] — typed accessors
+  over the `flags` dword's three documented bit groups
+  (`spec/01` §3.1: bit 1 Interlaced / bit 2 Full-range YUV /
+  bits 20..23 ColorMatrix nibble, mask `0x00f00000`). The
+  ColorMatrix nibble is informational at the lossless codec
+  layer — the wire bytes are returned unchanged either way —
+  and downstream colour-conversion (the GUI exposes Rec.601 and
+  Rec.709; the wire layout reserves 16 entries) is the consumer.
+  Paired with the [`header::FLAG_INTERLACED`],
+  [`header::FLAG_FULL_RANGE`], [`header::FLAG_COLOR_MATRIX_MASK`],
+  and [`header::FLAG_COLOR_MATRIX_SHIFT`] public constants for
+  callers that need direct masking against `FrameHeader::flags`.
 - [`Error`], [`Result`] — crate-local error type.
 - `register(ctx)` (default-on `registry` feature) — wire the
   decoder into `oxideav-core`'s codec registry.

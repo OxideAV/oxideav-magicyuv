@@ -42,6 +42,18 @@ pub const FLAG_INTERLACED: u32 = 0x0000_0002;
 /// the flag. Plumbed through into the public `FrameHeader` struct.
 pub const FLAG_FULL_RANGE: u32 = 0x0000_0004;
 
+/// Bit mask isolating the 4-bit ColorMatrix nibble inside the
+/// `flags` dword (`spec/01` §3.1 — encoder OR-accumulates the
+/// `ColorMatrix` registry's low nibble at bits 20..23 of the flags
+/// word; mask `0x00f00000`). Pair with [`FLAG_COLOR_MATRIX_SHIFT`]
+/// to extract the raw nibble (0..=15).
+pub const FLAG_COLOR_MATRIX_MASK: u32 = 0x00f0_0000;
+
+/// Right shift to align the masked ColorMatrix nibble down to a
+/// 0..=15 integer (`spec/01` §3.1 — the encoder writes the value
+/// shifted left by 20 before OR-ing into the flags accumulator).
+pub const FLAG_COLOR_MATRIX_SHIFT: u32 = 20;
+
 /// Defensive cap on width/height. `32 768` exceeds any v2.4.2
 /// fixture by a wide margin; a hostile header with a billion-pixel
 /// width would otherwise allocate gigabytes.
@@ -106,6 +118,22 @@ impl FrameHeader {
     /// `true` if the full-range YUV flag bit is set.
     pub fn is_full_range(&self) -> bool {
         (self.flags & FLAG_FULL_RANGE) != 0
+    }
+
+    /// Raw 4-bit ColorMatrix nibble carried in the `flags` dword
+    /// (`spec/01` §3.1 — bits 20..23, mask `0x00f00000`). The value
+    /// is informational at the lossless codec layer: the wire bytes
+    /// returned by [`crate::decode_frame`] are unchanged either
+    /// way, and downstream colour-conversion (Rec.601 / Rec.709 /
+    /// future entries the GUI does not expose) is the consumer of
+    /// this signal per the spec's "application/conversion layer"
+    /// callout. Returns 0..=15; the vendor encoder writes
+    /// `ColorMatrix == 1` as 0 because the encoder's OR-accumulator
+    /// at `spec/01` §3.1 skips the matrix contribution in that
+    /// case, so a 0 nibble means either "Rec.601" or "encoder
+    /// matrix-skip path"; the bit pattern alone cannot disambiguate.
+    pub fn color_matrix_nibble(&self) -> u8 {
+        ((self.flags & FLAG_COLOR_MATRIX_MASK) >> FLAG_COLOR_MATRIX_SHIFT) as u8
     }
 }
 
@@ -259,6 +287,91 @@ mod tests {
         assert_eq!(h.height, 64);
         assert_eq!(h.width_extra, 64);
         assert_eq!(h.slice_height, 28);
+        // spec/01 §3.1: the ColorMatrix nibble lives at bits 20..23
+        // of `flags`. The §5.2 fixture has `flags = 0x00200000`, so
+        // the nibble is 2 (the GUI's "Rec.709" registry value per
+        // `reference/vendor/changelog.md` v0.9.2-beta).
+        assert_eq!(h.color_matrix_nibble(), 2);
+        // Bit 1 (Interlaced) and bit 2 (Full-range YUV) are both
+        // clear in this fixture.
+        assert!(!h.is_interlaced());
+        assert!(!h.is_full_range());
+    }
+
+    /// Sweep every 0..=15 value the encoder's `ColorMatrix` register
+    /// can fit into `spec/01` §3.1's bits 20..23 nibble and confirm
+    /// [`FrameHeader::color_matrix_nibble`] recovers it from the raw
+    /// `flags` dword. Uses a directly-constructed `FrameHeader` so
+    /// the test isolates the accessor from the parser; the parser
+    /// happy path is covered by `parses_canonical_header_from_spec02_5_2`.
+    #[test]
+    fn color_matrix_nibble_recovers_every_4bit_value() {
+        for nibble in 0u32..=0xf {
+            let h = FrameHeader {
+                format_byte: 0x65,
+                aux_byte: 0x0c,
+                codec_variant: 0x02,
+                flags: nibble << FLAG_COLOR_MATRIX_SHIFT,
+                width: 64,
+                height: 64,
+                width_extra: 64,
+                slice_height: 28,
+            };
+            assert_eq!(
+                h.color_matrix_nibble(),
+                nibble as u8,
+                "nibble {nibble:#x} must round-trip through flags bits 20..23"
+            );
+            // The other documented bits stay isolated from the nibble.
+            assert!(
+                !h.is_interlaced(),
+                "matrix nibble {nibble:#x} must not bleed into bit 1"
+            );
+            assert!(
+                !h.is_full_range(),
+                "matrix nibble {nibble:#x} must not bleed into bit 2"
+            );
+        }
+    }
+
+    /// Cross-bit isolation: setting Interlaced + Full-range
+    /// simultaneously with a non-zero ColorMatrix nibble must
+    /// leave each accessor returning exactly the field it owns.
+    /// Guards against future regressions where someone widens
+    /// [`FLAG_COLOR_MATRIX_MASK`] or shifts a constant by mistake.
+    #[test]
+    fn flag_accessors_are_independent_of_each_other() {
+        let h = FrameHeader {
+            format_byte: 0x65,
+            aux_byte: 0x0c,
+            codec_variant: 0x02,
+            // Interlaced (bit 1) + Full-range (bit 2) + nibble = 0xa
+            // (a value the GUI does not expose, intentionally chosen
+            // to be outside the {0, 2} pair the encoder typically
+            // writes).
+            flags: FLAG_INTERLACED | FLAG_FULL_RANGE | (0xa_u32 << FLAG_COLOR_MATRIX_SHIFT),
+            width: 64,
+            height: 64,
+            width_extra: 64,
+            slice_height: 28,
+        };
+        assert!(h.is_interlaced());
+        assert!(h.is_full_range());
+        assert_eq!(h.color_matrix_nibble(), 0xa);
+    }
+
+    /// The mask and shift constants must satisfy the relation
+    /// documented in `spec/01` §3.1: `mask == 0xf << shift`. This
+    /// catches a constant drift before the run-time accessor would
+    /// silently return wrong values.
+    #[test]
+    fn color_matrix_constants_match_spec01_3_1() {
+        assert_eq!(FLAG_COLOR_MATRIX_MASK, 0xf_u32 << FLAG_COLOR_MATRIX_SHIFT);
+        assert_eq!(FLAG_COLOR_MATRIX_SHIFT, 20);
+        assert_eq!(FLAG_COLOR_MATRIX_MASK, 0x00f0_0000);
+        // No overlap with the two other documented flag bits.
+        assert_eq!(FLAG_COLOR_MATRIX_MASK & FLAG_INTERLACED, 0);
+        assert_eq!(FLAG_COLOR_MATRIX_MASK & FLAG_FULL_RANGE, 0);
     }
 
     #[test]

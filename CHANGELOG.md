@@ -8,6 +8,50 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Typed `FrameHeader::color_matrix_nibble()` accessor + paired
+  `FLAG_COLOR_MATRIX_MASK` / `FLAG_COLOR_MATRIX_SHIFT` public
+  constants (`spec/01` §3.1).** The v7 header's `flags` dword
+  carries three documented bit groups: bit 1 (Interlaced,
+  `FLAG_INTERLACED`), bit 2 (Full-range YUV, `FLAG_FULL_RANGE`),
+  and bits 20..23 (ColorMatrix nibble, mask `0x00f00000`). The
+  first two have been surfaced as typed `is_interlaced()` /
+  `is_full_range()` accessors since round 1; the four-bit
+  ColorMatrix nibble at bits 20..23 was only callable by hand-
+  shifting `header.flags` against an ad-hoc literal. The new
+  `color_matrix_nibble()` accessor extracts the raw 0..=15 value
+  by masking with the new `FLAG_COLOR_MATRIX_MASK` public
+  constant (`0x00f00000`) and shifting right by the new
+  `FLAG_COLOR_MATRIX_SHIFT` public constant (20). The nibble is
+  informational at the lossless codec layer — the wire bytes
+  returned by `decode_frame` / `decode_into` are unchanged
+  regardless — and is consumed by downstream colour-conversion
+  (the GUI in `reference/vendor/changelog.md` v0.9.2-beta
+  exposes Rec.601 and Rec.709; the wire layout reserves 16
+  entries). The accessor returns 0 when the encoder's OR-
+  accumulator at `spec/01` §3.1 skipped the matrix contribution
+  (the encoder treats `ColorMatrix == 1` as the skip case), so a
+  0 nibble cannot disambiguate "Rec.601" from "encoder
+  matrix-skip path" — that distinction lives above the codec
+  layer. Three new unit tests cover the accessor: a 16-way sweep
+  shifting every 0..=15 value into bits 20..23 and confirming
+  the accessor recovers it, an independence test setting
+  Interlaced + Full-range + nibble = 0xa simultaneously to catch
+  future mask drift between the three flag groups, and a
+  constants invariant test asserting
+  `FLAG_COLOR_MATRIX_MASK == 0xf << FLAG_COLOR_MATRIX_SHIFT`
+  and that the nibble mask has zero overlap with
+  `FLAG_INTERLACED` / `FLAG_FULL_RANGE`. The existing
+  `parses_canonical_header_from_spec02_5_2` test gains an extra
+  `color_matrix_nibble() == 2` assertion against the fixture's
+  `flags = 0x00200000` value (the GUI's "Rec.709" registry value
+  per `reference/vendor/changelog.md` v0.9.2-beta), plus a
+  paired assertion that `is_interlaced() == false` and
+  `is_full_range() == false`, so the canonical-header round-trip
+  now exercises all three documented flag accessors instead of
+  just the bit-by-bit `flags == 0x00200000` byte-pattern check.
+  Public API addition only; no change to encoder / decoder /
+  Huffman / predictor wire behaviour. Lib test count grew from
+  106 to 109; clippy clean; fmt clean.
 - **Third cargo-fuzz target `huffman_descriptor`.** Pushes arbitrary
   fuzz-supplied bytes straight into the public Huffman sub-surface
   (`huffman::parse_lengths` + `HuffmanTable::build` +
