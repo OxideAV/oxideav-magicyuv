@@ -48,7 +48,7 @@
 //! round-trips byte-for-byte.
 
 use crate::error::{Error, Result};
-use crate::header::{FLAG_INTERLACED, HEADER_SIZE, MAGY_MAGIC};
+use crate::header::{FLAG_COLOR_MATRIX_SHIFT, FLAG_INTERLACED, HEADER_SIZE, MAGY_MAGIC};
 use crate::predict::FieldStride;
 use crate::tables::{Family, FourccRecord, PredictorKind};
 
@@ -105,6 +105,26 @@ pub struct EncodeOptions {
     /// Set the header `flags & FLAG_INTERLACED` bit and emit
     /// field-stride=2 prediction per `spec/04` §5.1.
     pub interlaced: bool,
+    /// 4-bit ColorMatrix nibble mirroring the v2.4.2 encoder's
+    /// `ColorMatrix` registry value (`spec/01` §3.1 — context
+    /// offset `+0x68`, OR-accumulated into the flags dword at bits
+    /// 20..23 with mask `0x00f00000`). The encoder masks the low
+    /// nibble before the shift, so the on-wire flags dword carries
+    /// `(color_matrix & 0xf) << 20`. The spec's encoder OR-
+    /// accumulator treats registry value `1` as the matrix-skip
+    /// sentinel — the OR step is bypassed and flags bits 20..23
+    /// stay clear; the matching default-`color_matrix = 1` value
+    /// keeps a freshly-constructed `EncodeOptions::default()`
+    /// emitting the same flags dword the r242-era encoder did,
+    /// agreeing with the zero returned by
+    /// [`crate::header::FrameHeader::color_matrix_nibble`] for the
+    /// matrix-skip wire shape. The ColorMatrix nibble is
+    /// informational at the lossless codec layer — the wire pixel
+    /// bytes round-trip unchanged for every value 0..=15 — and is
+    /// consumed by downstream colour-conversion (the GUI in
+    /// `reference/vendor/changelog.md` v0.9.2-beta exposes Rec.601
+    /// and Rec.709; the wire layout reserves 16 entries).
+    pub color_matrix: u8,
     /// **Deprecated, kept for source compatibility.** When `strategy`
     /// is `Fixed(_)`, this field is ignored. Callers should set
     /// `strategy = PredictorStrategy::Fixed(predictor)` instead.
@@ -117,6 +137,7 @@ impl Default for EncodeOptions {
             strategy: PredictorStrategy::Fixed(PredictorKind::Gradient),
             mode: SliceMode::Huffman,
             interlaced: false,
+            color_matrix: 1,
             predictor: PredictorKind::Gradient,
         }
     }
@@ -131,6 +152,7 @@ impl EncodeOptions {
             strategy: PredictorStrategy::Dynamic,
             mode: SliceMode::Auto,
             interlaced: false,
+            color_matrix: 1,
             predictor: PredictorKind::Gradient,
         }
     }
@@ -141,6 +163,7 @@ impl EncodeOptions {
             strategy: PredictorStrategy::Fixed(p),
             mode: SliceMode::Huffman,
             interlaced: false,
+            color_matrix: 1,
             predictor: p,
         }
     }
@@ -975,6 +998,7 @@ fn encode_frame_u8(
         height,
         slice_height,
         options.interlaced,
+        options.color_matrix,
         total_slices,
         slices_per_plane,
         &plane_huffs,
@@ -1427,6 +1451,7 @@ fn encode_frame_u16(
         height,
         slice_height,
         options.interlaced,
+        options.color_matrix,
         total_slices,
         slices_per_plane,
         &plane_huffs,
@@ -1593,6 +1618,7 @@ fn assemble_frame(
     height: u32,
     slice_height: u32,
     interlaced: bool,
+    color_matrix: u8,
     total_slices: usize,
     slices_per_plane: usize,
     plane_huffs: &[PlaneHuff],
@@ -1624,7 +1650,15 @@ fn assemble_frame(
 
     // Build the final frame.
     let mut out = Vec::new();
-    write_header(rec, width, height, slice_height, interlaced, &mut out);
+    write_header(
+        rec,
+        width,
+        height,
+        slice_height,
+        interlaced,
+        color_matrix,
+        &mut out,
+    );
     debug_assert_eq!(out.len(), HEADER_SIZE);
     for &e in &entries {
         out.extend_from_slice(&e.to_le_bytes());
@@ -1645,6 +1679,7 @@ fn write_header(
     height: u32,
     slice_height: u32,
     interlaced: bool,
+    color_matrix: u8,
     out: &mut Vec<u8>,
 ) {
     out.extend_from_slice(&MAGY_MAGIC);
@@ -1653,7 +1688,24 @@ fn write_header(
     out.push(rec.format_byte);
     out.push(rec.aux_byte);
     out.push(0x02); // codec_variant — v2.4.2 always 0x02 (spec/04 §2).
-    let flags: u32 = if interlaced { FLAG_INTERLACED } else { 0 };
+                    // Encoder OR-accumulator from spec/01 §3.1 (the v2.4.2 encoder's
+                    // `magicyuv.dll!0x69b97647`–`0x69b9767a` sequence): the
+                    // `ColorMatrix == 1` registry value is the matrix-skip
+                    // sentinel — the encoder branches over the OR step, leaving
+                    // flags bits 20..23 clear; any other low-nibble value
+                    // (0..=15 modulo `& 0xf`) shifts into bits 20..23 with mask
+                    // `0x00f00000`. Interlaced (bit 1) accumulates from the
+                    // separate `Interlaced` registry value at context `+0x70`.
+                    // Full-range YUV (bit 2, registry `+0x78`) lives on the
+                    // encoder's allowlist for a future round; the two presently-
+                    // public knobs (interlaced + color_matrix) reach the wire here.
+    let mut flags: u32 = 0;
+    if interlaced {
+        flags |= FLAG_INTERLACED;
+    }
+    if color_matrix != 1 {
+        flags |= u32::from(color_matrix & 0x0f) << FLAG_COLOR_MATRIX_SHIFT;
+    }
     out.extend_from_slice(&flags.to_le_bytes());
     out.extend_from_slice(&width.to_le_bytes());
     out.extend_from_slice(&height.to_le_bytes());

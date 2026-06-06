@@ -161,6 +161,7 @@ fn roundtrip(
             predictor,
             mode,
             interlaced,
+            color_matrix: 1,
         },
     )
     .unwrap_or_else(|e| {
@@ -1762,4 +1763,171 @@ fn decode_into_handles_bit_depth_change() {
     // And back to 8-bit Gray.
     decode_into(&bytes_8, &mut dst).expect("decode_into-8 round 2");
     assert!(samples_eq_planes(&planes_8, &dst.planes));
+}
+
+/// Verify the encoder-side `EncodeOptions::color_matrix` knob writes
+/// the nibble into the flags dword at bits 20..23 (`spec/01` §3.1)
+/// per the v2.4.2 encoder's OR-accumulation, and that the value
+/// survives a round-trip through `header::parse` /
+/// [`crate::header::FrameHeader::color_matrix_nibble`]. The 4-bit
+/// space is exhaustively swept (0..=15) on M8RG so the test catches
+/// drift in either the encoder shift / mask or the reader-side
+/// accessor — for each authored value the test confirms (a) the
+/// nibble round-trips through the wire, (b) the on-wire flags dword
+/// matches the documented `(nibble & 0xf) << 20` formula, and (c)
+/// the pixel bytes round-trip unchanged so the matrix knob remains
+/// orthogonal to the lossless residual path (the codec layer
+/// carries the nibble as a header-level annotation, leaving colour
+/// conversion to the consumer above the codec).
+#[test]
+fn encoder_color_matrix_knob_writes_flags_bits_20_23_and_round_trips() {
+    use crate::header::{parse as parse_header, FLAG_COLOR_MATRIX_MASK, FLAG_COLOR_MATRIX_SHIFT};
+    let rec = lookup(0x65).expect("M8RG");
+    let w = 32u32;
+    let h = 16u32;
+    let sh = 16u32;
+    let planes = make_planes_u8(rec, w, h, 7);
+    for authored in 0u8..=15 {
+        let mut opts = EncodeOptions::fixed(PredictorKind::Gradient);
+        opts.color_matrix = authored;
+        let bytes = encode_frame(rec, w, h, sh, planes.clone(), opts)
+            .expect("encode_frame with color_matrix knob");
+        // Parse the header back: the nibble must round-trip exactly
+        // for every authored value except 1 (the spec/01 §3.1
+        // matrix-skip sentinel, which produces a zero nibble on
+        // the wire — that is the documented v2.4.2 behaviour).
+        let parsed = parse_header(&bytes).expect("parse encoder-emitted header");
+        let expected_nibble: u8 = if authored == 1 { 0 } else { authored };
+        assert_eq!(
+            parsed.color_matrix_nibble(),
+            expected_nibble,
+            "authored color_matrix={authored} should land as nibble {expected_nibble} via header.flags bits 20..23",
+        );
+        // The on-wire dword must match the documented
+        // `(nibble & 0xf) << 20` formula precisely (mask isolation).
+        let masked = parsed.flags & FLAG_COLOR_MATRIX_MASK;
+        assert_eq!(
+            masked,
+            u32::from(expected_nibble) << FLAG_COLOR_MATRIX_SHIFT,
+            "authored color_matrix={authored} masked dword mismatch",
+        );
+        // The pixel bytes must round-trip byte-exact regardless of
+        // the nibble — the codec layer treats it as a header
+        // annotation, not a per-sample transform.
+        let frame = decode_frame(&bytes).expect("decode_frame");
+        for (i, p) in frame.planes.iter().enumerate() {
+            let expected_samples = match &planes[i] {
+                PlaneInput::U8(buf) => buf.as_slice(),
+                PlaneInput::U16(_) => unreachable!("M8RG is 8-bit"),
+            };
+            match &p.samples {
+                Samples::U8(got) => {
+                    assert_eq!(
+                        got, expected_samples,
+                        "plane {i} samples must round-trip irrespective of color_matrix={authored}",
+                    );
+                }
+                Samples::U16(_) => unreachable!("M8RG is 8-bit"),
+            }
+        }
+    }
+}
+
+/// The encoder must compose the ColorMatrix nibble with the
+/// Interlaced flag cleanly: setting `interlaced = true`
+/// and `color_matrix = 0xa` simultaneously must produce a flags
+/// dword that carries BOTH bit 1 and bits 20..23, and the parsed
+/// header's typed accessors must each report the right value
+/// independently of the other. Catches a future regression where
+/// the encoder's OR-accumulator overwrites one flag group with
+/// another (e.g. a `flags = ...` assignment in place of a `|=`).
+#[test]
+fn encoder_color_matrix_composes_with_interlaced_flag() {
+    use crate::header::{parse as parse_header, FLAG_INTERLACED};
+    let rec = lookup(0x65).expect("M8RG");
+    let w = 32u32;
+    let h = 16u32;
+    let sh = 16u32;
+    let planes = make_planes_u8(rec, w, h, 3);
+    let opts = EncodeOptions {
+        strategy: PredictorStrategy::Fixed(PredictorKind::Gradient),
+        mode: SliceMode::Huffman,
+        interlaced: true,
+        color_matrix: 0xa,
+        predictor: PredictorKind::Gradient,
+    };
+    let bytes = encode_frame(rec, w, h, sh, planes.clone(), opts).expect("encode_frame combined");
+    let parsed = parse_header(&bytes).expect("parse combined-flags header");
+    assert!(
+        parsed.is_interlaced(),
+        "interlaced flag must survive composition with color_matrix",
+    );
+    assert_eq!(
+        parsed.color_matrix_nibble(),
+        0xa,
+        "color_matrix nibble must survive composition with interlaced",
+    );
+    // The composed flags dword equals the bit-OR of the two
+    // documented contributions — bit 1 plus the nibble shifted up.
+    let expected = FLAG_INTERLACED | (0xa_u32 << 20);
+    assert_eq!(
+        parsed.flags, expected,
+        "composed flags dword mismatch (interlaced + color_matrix=0xa)",
+    );
+    // And the wire pixel bytes still round-trip.
+    let frame = decode_frame(&bytes).expect("decode_frame combined");
+    for (i, p) in frame.planes.iter().enumerate() {
+        let expected_samples = match &planes[i] {
+            PlaneInput::U8(buf) => buf.as_slice(),
+            PlaneInput::U16(_) => unreachable!("M8RG is 8-bit"),
+        };
+        match &p.samples {
+            Samples::U8(got) => {
+                assert_eq!(got, expected_samples, "plane {i} samples mismatch");
+            }
+            Samples::U16(_) => unreachable!("M8RG is 8-bit"),
+        }
+    }
+}
+
+/// `EncodeOptions::default()` (and the `fixed` / `dynamic_auto`
+/// helpers) must initialise `color_matrix` to `1` — the spec/01
+/// §3.1 matrix-skip sentinel. That choice means freshly-defaulted
+/// callers emit a header whose ColorMatrix nibble is 0 on the
+/// wire (matching the zero `header::FrameHeader::color_matrix_nibble`
+/// returns from the matrix-skip flags shape), preserving the
+/// existing behavioural contract from r242 and earlier.
+#[test]
+fn encode_options_defaults_carry_matrix_skip_sentinel() {
+    assert_eq!(
+        EncodeOptions::default().color_matrix,
+        1,
+        "default color_matrix must be 1 (spec/01 §3.1 matrix-skip sentinel)",
+    );
+    assert_eq!(
+        EncodeOptions::fixed(PredictorKind::Left).color_matrix,
+        1,
+        "fixed() helper must carry the matrix-skip sentinel",
+    );
+    assert_eq!(
+        EncodeOptions::dynamic_auto().color_matrix,
+        1,
+        "dynamic_auto() helper must carry the matrix-skip sentinel",
+    );
+    // Sanity check: emit a frame with default options and confirm
+    // the on-wire flags dword has zero in bits 20..23.
+    use crate::header::{parse as parse_header, FLAG_COLOR_MATRIX_MASK};
+    let rec = lookup(0x65).expect("M8RG");
+    let w = 16u32;
+    let h = 16u32;
+    let sh = 16u32;
+    let planes = make_planes_u8(rec, w, h, 1);
+    let bytes = encode_frame(rec, w, h, sh, planes, EncodeOptions::default())
+        .expect("encode default-options frame");
+    let parsed = parse_header(&bytes).expect("parse default-options header");
+    assert_eq!(
+        parsed.flags & FLAG_COLOR_MATRIX_MASK,
+        0,
+        "default options must emit a zero ColorMatrix nibble",
+    );
 }

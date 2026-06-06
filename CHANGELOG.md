@@ -8,6 +8,45 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Encoder-side `EncodeOptions::color_matrix` knob (`spec/01`
+  §3.1).** The encoder's `write_header` now accepts a 4-bit
+  ColorMatrix nibble mirroring the v2.4.2 encoder's `ColorMatrix`
+  registry value at context offset `+0x68`, OR-accumulated into
+  the flags dword at bits 20..23 (mask `0x00f00000`) per the
+  documented OR-accumulator sequence at
+  `magicyuv.dll!0x69b97647`–`0x69b9767a`. The implementation
+  honours the spec's matrix-skip sentinel: when
+  `EncodeOptions::color_matrix == 1` the OR step is bypassed and
+  flags bits 20..23 stay clear, matching the r242-era encoder
+  behaviour byte-for-byte. Any other 0..=15 value (the field is
+  masked low-nibble before the shift, so 16..=255 wraps without
+  affecting other bits) lands the nibble in flags bits 20..23 for
+  recovery via the round-1
+  `FrameHeader::color_matrix_nibble()` accessor. The matrix knob
+  is orthogonal to the lossless residual path: across the full
+  0..=15 sweep on M8RG 32×16 the pixel bytes round-trip byte-exact
+  to the decoder, so the codec layer carries the nibble strictly
+  as a header-level annotation for downstream colour conversion
+  (the GUI in `reference/vendor/changelog.md` v0.9.2-beta exposes
+  Rec.601 and Rec.709). `EncodeOptions::default()` /
+  `EncodeOptions::fixed(_)` / `EncodeOptions::dynamic_auto()` all
+  carry the matrix-skip sentinel so r242-era callers using struct-
+  update syntax (`..EncodeOptions::default()`) keep producing
+  byte-identical headers. The `encode_magicyuv` fuzz target gains
+  coverage of the new knob via the high nibble of header byte 8
+  (low bit kept for `interlaced`), so the full 0..=15 range of
+  `color_matrix` is now exercised at every encoder iteration of
+  the libfuzzer run. Three new lib tests cover the knob: a 0..=15
+  sweep asserting (a) the nibble round-trips, (b) the on-wire
+  flags dword equals `(nibble & 0xf) << 20`, and (c) the pixel
+  bytes round-trip unchanged; a composition test setting
+  `interlaced = true` + `color_matrix = 0xa` together and
+  asserting both bit 1 and bits 20..23 survive the OR-
+  accumulation; and a defaults invariant test asserting each of
+  the three constructor entry points carries the matrix-skip
+  sentinel and that a default-options encode emits a zero
+  ColorMatrix nibble. Lib test count grew from 109 to 112; clippy
+  clean; fmt clean.
 - **Typed `FrameHeader::color_matrix_nibble()` accessor + paired
   `FLAG_COLOR_MATRIX_MASK` / `FLAG_COLOR_MATRIX_SHIFT` public
   constants (`spec/01` §3.1).** The v7 header's `flags` dword

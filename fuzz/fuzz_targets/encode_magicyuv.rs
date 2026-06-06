@@ -180,13 +180,21 @@ fuzz_target!(|data: &[u8]| {
         _ => SliceMode::Auto,
     };
 
-    // ── Header byte 8: interlaced ─────────────────────────────────
+    // ── Header byte 8: interlaced (bit 0) + ColorMatrix nibble (bits 4..7) ─
+    // The high nibble of byte 8 seeds the `EncodeOptions::color_matrix`
+    // field directly. The encoder masks the low 4 bits before shifting
+    // into the flags dword at bits 20..23 (`spec/01` §3.1), and the
+    // value 1 is the documented matrix-skip sentinel — driving the
+    // full 0..=15 range here exercises both the shift / mask plumbing
+    // and the spec's "skip the OR when registry value == 1" branch.
     let interlaced = (data[8] & 1) != 0;
+    let color_matrix = data[8] >> 4;
 
     let options = EncodeOptions {
         strategy,
         mode,
         interlaced,
+        color_matrix,
         predictor,
     };
 

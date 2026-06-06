@@ -65,6 +65,21 @@ AVI is a container, not a codec — its demux/mux (single-RIFF AVI 1.0
   used in RGB inter-plane decorrelation reversal — that working
   copy is also gone from `decode_frame` itself now).
 - [`encode_frame`] — encode one frame from per-plane pixel buffers.
+  Driven by [`EncodeOptions`]; in addition to the predictor strategy
+  + Huffman/raw mode + interlaced switches that have shipped since
+  round 1, `EncodeOptions::color_matrix` (a 4-bit nibble mirroring
+  the v2.4.2 encoder's `ColorMatrix` registry value at context
+  offset `+0x68`) drives the flags-dword bits 20..23 emitted in
+  the on-wire header per `spec/01` §3.1's OR-accumulation logic.
+  The encoder honours the spec's matrix-skip sentinel (`color_matrix
+  == 1`) by bypassing the OR step, so the default-`1` value
+  preserves the round-1 behavioural contract while authoring any
+  other 0..=15 value lands the nibble in the flags dword for
+  recovery via
+  [`header::FrameHeader::color_matrix_nibble`]. The pixel bytes
+  round-trip byte-exact across the full 0..=15 range — the matrix
+  knob is a header-level annotation orthogonal to the lossless
+  residual path.
 - [`header::parse`] — standalone v7 header parser.
 - [`header::FrameHeader::is_interlaced`] /
   [`header::FrameHeader::is_full_range`] /
