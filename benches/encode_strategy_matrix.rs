@@ -179,6 +179,7 @@ fn bench_encode_strategy_matrix(c: &mut Criterion) {
                     mode,
                     interlaced,
                     color_matrix: 1,
+                    full_range: false,
                     predictor,
                 };
                 let label = format!(

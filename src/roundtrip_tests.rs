@@ -162,6 +162,7 @@ fn roundtrip(
             mode,
             interlaced,
             color_matrix: 1,
+            full_range: false,
         },
     )
     .unwrap_or_else(|e| {
@@ -1854,6 +1855,7 @@ fn encoder_color_matrix_composes_with_interlaced_flag() {
         mode: SliceMode::Huffman,
         interlaced: true,
         color_matrix: 0xa,
+        full_range: false,
         predictor: PredictorKind::Gradient,
     };
     let bytes = encode_frame(rec, w, h, sh, planes.clone(), opts).expect("encode_frame combined");
@@ -1929,5 +1931,162 @@ fn encode_options_defaults_carry_matrix_skip_sentinel() {
         parsed.flags & FLAG_COLOR_MATRIX_MASK,
         0,
         "default options must emit a zero ColorMatrix nibble",
+    );
+}
+
+/// `EncodeOptions::full_range` must land on the wire as flags bit 2
+/// (`FLAG_FULL_RANGE`, mask `0x00000004`) per `spec/01` §3.1's
+/// `FullRangeYUV` registry value at encoder context offset `+0x78`
+/// (the v2.4.2 encoder's OR-accumulator at
+/// `magicyuv.dll!0x69b97647`–`0x69b9767a` ORs `0x4` when the
+/// registry value is non-zero). The decoder pickup at
+/// `magicyuv.dll!0x69bae311` (file `@0x2d311`) reads bit 2 back as
+/// a boolean and routes it to the application/conversion layer; on
+/// our side `FrameHeader::is_full_range()` exposes the same
+/// boolean. The lossless codec layer is independent of this signal,
+/// so the wire pixel bytes returned by `decode_frame` must match
+/// the original planes byte-for-byte regardless of the bit's value.
+#[test]
+fn encoder_full_range_knob_writes_flags_bit_2_and_round_trips() {
+    use crate::header::{parse as parse_header, FLAG_FULL_RANGE};
+    let rec = lookup(0x65).expect("M8RG");
+    let w = 32u32;
+    let h = 16u32;
+    let sh = 16u32;
+    let planes = make_planes_u8(rec, w, h, 11);
+    for &authored in &[false, true] {
+        let mut opts = EncodeOptions::fixed(PredictorKind::Gradient);
+        opts.full_range = authored;
+        let bytes = encode_frame(rec, w, h, sh, planes.clone(), opts)
+            .expect("encode_frame with full_range knob");
+        let parsed = parse_header(&bytes).expect("parse encoder-emitted header");
+        assert_eq!(
+            parsed.is_full_range(),
+            authored,
+            "authored full_range={authored} should land as flags bit 2 via FLAG_FULL_RANGE",
+        );
+        let expected_bit = if authored { FLAG_FULL_RANGE } else { 0 };
+        assert_eq!(
+            parsed.flags & FLAG_FULL_RANGE,
+            expected_bit,
+            "authored full_range={authored} masked dword mismatch",
+        );
+        // Pixel bytes must round-trip byte-exact regardless of the
+        // application-layer signal — the codec layer is bit-pure.
+        let frame = decode_frame(&bytes).expect("decode_frame");
+        for (i, p) in frame.planes.iter().enumerate() {
+            let expected_samples = match &planes[i] {
+                PlaneInput::U8(buf) => buf.as_slice(),
+                PlaneInput::U16(_) => unreachable!("M8RG is 8-bit"),
+            };
+            match &p.samples {
+                Samples::U8(got) => {
+                    assert_eq!(
+                        got, expected_samples,
+                        "plane {i} samples must round-trip irrespective of full_range={authored}",
+                    );
+                }
+                Samples::U16(_) => unreachable!("M8RG is 8-bit"),
+            }
+        }
+    }
+}
+
+/// The encoder must compose `full_range` with the other two
+/// presently-public flags-dword knobs (`interlaced` at bit 1 and
+/// `color_matrix` at bits 20..23) without any of the three
+/// clobbering another. Setting all three simultaneously must
+/// produce a flags dword whose typed accessors each report exactly
+/// the field they own, guarding against a future regression where
+/// the OR-accumulator becomes an assignment.
+#[test]
+fn encoder_full_range_composes_with_interlaced_and_color_matrix() {
+    use crate::header::{parse as parse_header, FLAG_FULL_RANGE, FLAG_INTERLACED};
+    let rec = lookup(0x65).expect("M8RG");
+    let w = 32u32;
+    let h = 16u32;
+    let sh = 16u32;
+    let planes = make_planes_u8(rec, w, h, 5);
+    let opts = EncodeOptions {
+        strategy: PredictorStrategy::Fixed(PredictorKind::Gradient),
+        mode: SliceMode::Huffman,
+        interlaced: true,
+        color_matrix: 0xa,
+        full_range: true,
+        predictor: PredictorKind::Gradient,
+    };
+    let bytes =
+        encode_frame(rec, w, h, sh, planes.clone(), opts).expect("encode_frame combined-three");
+    let parsed = parse_header(&bytes).expect("parse combined-three-flags header");
+    assert!(
+        parsed.is_interlaced(),
+        "interlaced flag must survive composition with full_range + color_matrix",
+    );
+    assert!(
+        parsed.is_full_range(),
+        "full_range flag must survive composition with interlaced + color_matrix",
+    );
+    assert_eq!(
+        parsed.color_matrix_nibble(),
+        0xa,
+        "color_matrix nibble must survive composition with interlaced + full_range",
+    );
+    // The composed flags dword equals the bit-OR of the three
+    // documented contributions exactly.
+    let expected = FLAG_INTERLACED | FLAG_FULL_RANGE | (0xa_u32 << 20);
+    assert_eq!(
+        parsed.flags, expected,
+        "composed flags dword mismatch (interlaced + full_range + color_matrix=0xa)",
+    );
+    // Pixel bytes still round-trip.
+    let frame = decode_frame(&bytes).expect("decode_frame combined-three");
+    for (i, p) in frame.planes.iter().enumerate() {
+        let expected_samples = match &planes[i] {
+            PlaneInput::U8(buf) => buf.as_slice(),
+            PlaneInput::U16(_) => unreachable!("M8RG is 8-bit"),
+        };
+        match &p.samples {
+            Samples::U8(got) => {
+                assert_eq!(got, expected_samples, "plane {i} samples mismatch");
+            }
+            Samples::U16(_) => unreachable!("M8RG is 8-bit"),
+        }
+    }
+}
+
+/// `EncodeOptions::default()` (and the `fixed` / `dynamic_auto`
+/// helpers) must initialise `full_range` to `false`. That choice
+/// keeps a freshly-defaulted caller emitting a header whose flags
+/// bit 2 (`FLAG_FULL_RANGE`) stays clear — matching the r242-era
+/// encoder's behaviour byte-for-byte and the matrix-skip-sentinel
+/// default for `color_matrix`. A sanity round-trip confirms the
+/// emitted dword's bit 2 is clear by parsing the header back.
+#[test]
+fn encode_options_defaults_clear_full_range() {
+    assert!(
+        !EncodeOptions::default().full_range,
+        "default full_range must be false",
+    );
+    assert!(
+        !EncodeOptions::fixed(PredictorKind::Left).full_range,
+        "fixed() helper must default full_range to false",
+    );
+    assert!(
+        !EncodeOptions::dynamic_auto().full_range,
+        "dynamic_auto() helper must default full_range to false",
+    );
+    use crate::header::{parse as parse_header, FLAG_FULL_RANGE};
+    let rec = lookup(0x65).expect("M8RG");
+    let w = 16u32;
+    let h = 16u32;
+    let sh = 16u32;
+    let planes = make_planes_u8(rec, w, h, 2);
+    let bytes = encode_frame(rec, w, h, sh, planes, EncodeOptions::default())
+        .expect("encode default-options frame");
+    let parsed = parse_header(&bytes).expect("parse default-options header");
+    assert_eq!(
+        parsed.flags & FLAG_FULL_RANGE,
+        0,
+        "default options must emit a clear FLAG_FULL_RANGE bit",
     );
 }

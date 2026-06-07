@@ -180,14 +180,21 @@ fuzz_target!(|data: &[u8]| {
         _ => SliceMode::Auto,
     };
 
-    // ── Header byte 8: interlaced (bit 0) + ColorMatrix nibble (bits 4..7) ─
+    // ── Header byte 8: interlaced (bit 0) + full_range (bit 1) +
+    // ColorMatrix nibble (bits 4..7) ─────────────────────────────
     // The high nibble of byte 8 seeds the `EncodeOptions::color_matrix`
     // field directly. The encoder masks the low 4 bits before shifting
     // into the flags dword at bits 20..23 (`spec/01` §3.1), and the
     // value 1 is the documented matrix-skip sentinel — driving the
     // full 0..=15 range here exercises both the shift / mask plumbing
     // and the spec's "skip the OR when registry value == 1" branch.
+    // Bit 1 drives `full_range`: the encoder ORs `FLAG_FULL_RANGE`
+    // (mask `0x4`) into the flags dword when the registry value at
+    // context `+0x78` is non-zero (`spec/01` §3.1). The lossless
+    // codec layer is independent of this bit, so the fuzz harness's
+    // byte-exact plane roundtrip remains valid across both values.
     let interlaced = (data[8] & 1) != 0;
+    let full_range = (data[8] & 0b10) != 0;
     let color_matrix = data[8] >> 4;
 
     let options = EncodeOptions {
@@ -195,6 +202,7 @@ fuzz_target!(|data: &[u8]| {
         mode,
         interlaced,
         color_matrix,
+        full_range,
         predictor,
     };
 

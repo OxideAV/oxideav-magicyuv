@@ -17,7 +17,12 @@ norm (`PredictorStrategy::Dynamic`, spec/04 §3), and per-slice
 Huffman / raw fallback (`SliceMode::Auto`, spec/05 §6.2 —
 `(pixels * bits + 7) / 8` byte-budget). `EncodeOptions::dynamic_auto()`
 combines both for the spec/04 §3 + spec/05 §6.2 always-on
-configuration the v2.4.2 encoder ships with. A `trace` Cargo feature
+configuration the v2.4.2 encoder ships with. All three
+`spec/01` §3.1 flags-dword knobs are surfaced as
+[`EncodeOptions`](https://docs.rs/oxideav-magicyuv/latest/oxideav_magicyuv/struct.EncodeOptions.html)
+fields routed through the encoder's OR-accumulator:
+`interlaced` (bit 1), `full_range` (bit 2, registry `+0x78`), and
+the four-bit `color_matrix` nibble (bits 20..23, registry `+0x68`). A `trace` Cargo feature
 surfaces a JSONL trace tape for the Auditor's lockstep harness; the
 `huff.used` field is a per-symbol `{length, code}` map per the
 audit/02 §4.2 forward spec, and `preamble_trailing.extra_bytes` is

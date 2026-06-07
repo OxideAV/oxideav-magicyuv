@@ -48,7 +48,9 @@
 //! round-trips byte-for-byte.
 
 use crate::error::{Error, Result};
-use crate::header::{FLAG_COLOR_MATRIX_SHIFT, FLAG_INTERLACED, HEADER_SIZE, MAGY_MAGIC};
+use crate::header::{
+    FLAG_COLOR_MATRIX_SHIFT, FLAG_FULL_RANGE, FLAG_INTERLACED, HEADER_SIZE, MAGY_MAGIC,
+};
 use crate::predict::FieldStride;
 use crate::tables::{Family, FourccRecord, PredictorKind};
 
@@ -125,6 +127,27 @@ pub struct EncodeOptions {
     /// `reference/vendor/changelog.md` v0.9.2-beta exposes Rec.601
     /// and Rec.709; the wire layout reserves 16 entries).
     pub color_matrix: u8,
+    /// Set the header `flags & FLAG_FULL_RANGE` bit, mirroring the
+    /// v2.4.2 encoder's `FullRangeYUV` registry value (`spec/01`
+    /// §3.1 — context offset `+0x78`, OR-accumulated as bit 2 of
+    /// the flags dword, mask `0x00000004`). The spec's encoder
+    /// OR-accumulator at `magicyuv.dll!0x69b97647`–`0x69b9767a`
+    /// reads the registry value and ORs `0x4` into the flags
+    /// dword when non-zero; the decoder pickup at
+    /// `magicyuv.dll!0x69bae311` (file `@0x2d311`) shifts the
+    /// flags dword right by 2 and isolates the low bit, exposing
+    /// the same boolean to the application/conversion layer. The
+    /// codec layer's pixel residuals are independent of this
+    /// signal — the wire pixel bytes returned by
+    /// [`crate::decode_frame`] round-trip byte-exact regardless of
+    /// the bit's value — so this field is strictly a header-level
+    /// annotation routed to downstream YUV ↔ RGB conversion (the
+    /// `is_full_range()` accessor on the parsed
+    /// [`crate::header::FrameHeader`] recovers the same boolean).
+    /// Pairs with [`Self::interlaced`] (bit 1) and
+    /// [`Self::color_matrix`] (bits 20..23) — the three knobs ride
+    /// the same flags dword without interference.
+    pub full_range: bool,
     /// **Deprecated, kept for source compatibility.** When `strategy`
     /// is `Fixed(_)`, this field is ignored. Callers should set
     /// `strategy = PredictorStrategy::Fixed(predictor)` instead.
@@ -138,6 +161,7 @@ impl Default for EncodeOptions {
             mode: SliceMode::Huffman,
             interlaced: false,
             color_matrix: 1,
+            full_range: false,
             predictor: PredictorKind::Gradient,
         }
     }
@@ -153,6 +177,7 @@ impl EncodeOptions {
             mode: SliceMode::Auto,
             interlaced: false,
             color_matrix: 1,
+            full_range: false,
             predictor: PredictorKind::Gradient,
         }
     }
@@ -164,6 +189,7 @@ impl EncodeOptions {
             mode: SliceMode::Huffman,
             interlaced: false,
             color_matrix: 1,
+            full_range: false,
             predictor: p,
         }
     }
@@ -999,6 +1025,7 @@ fn encode_frame_u8(
         slice_height,
         options.interlaced,
         options.color_matrix,
+        options.full_range,
         total_slices,
         slices_per_plane,
         &plane_huffs,
@@ -1452,6 +1479,7 @@ fn encode_frame_u16(
         slice_height,
         options.interlaced,
         options.color_matrix,
+        options.full_range,
         total_slices,
         slices_per_plane,
         &plane_huffs,
@@ -1619,6 +1647,7 @@ fn assemble_frame(
     slice_height: u32,
     interlaced: bool,
     color_matrix: u8,
+    full_range: bool,
     total_slices: usize,
     slices_per_plane: usize,
     plane_huffs: &[PlaneHuff],
@@ -1657,6 +1686,7 @@ fn assemble_frame(
         slice_height,
         interlaced,
         color_matrix,
+        full_range,
         &mut out,
     );
     debug_assert_eq!(out.len(), HEADER_SIZE);
@@ -1673,6 +1703,7 @@ fn assemble_frame(
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_header(
     rec: FourccRecord,
     width: u32,
@@ -1680,6 +1711,7 @@ fn write_header(
     slice_height: u32,
     interlaced: bool,
     color_matrix: u8,
+    full_range: bool,
     out: &mut Vec<u8>,
 ) {
     out.extend_from_slice(&MAGY_MAGIC);
@@ -1696,12 +1728,19 @@ fn write_header(
                     // (0..=15 modulo `& 0xf`) shifts into bits 20..23 with mask
                     // `0x00f00000`. Interlaced (bit 1) accumulates from the
                     // separate `Interlaced` registry value at context `+0x70`.
-                    // Full-range YUV (bit 2, registry `+0x78`) lives on the
-                    // encoder's allowlist for a future round; the two presently-
-                    // public knobs (interlaced + color_matrix) reach the wire here.
+                    // Full-range YUV (bit 2, registry `+0x78`) — when the
+                    // `FullRangeYUV` registry value is non-zero, the OR step
+                    // contributes `0x4` to the flags dword (mask
+                    // `0x00000004`); the decoder pickup at
+                    // `magicyuv.dll!0x69bae311` (file `@0x2d311`) shifts the
+                    // dword right by 2 and isolates the low bit, routing the
+                    // boolean to the application/conversion layer.
     let mut flags: u32 = 0;
     if interlaced {
         flags |= FLAG_INTERLACED;
+    }
+    if full_range {
+        flags |= FLAG_FULL_RANGE;
     }
     if color_matrix != 1 {
         flags |= u32::from(color_matrix & 0x0f) << FLAG_COLOR_MATRIX_SHIFT;

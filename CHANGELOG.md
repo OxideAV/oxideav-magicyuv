@@ -8,6 +8,39 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Encoder-side `EncodeOptions::full_range` knob (`spec/01`
+  §3.1).** The encoder's `write_header` now accepts a boolean
+  `full_range` mirroring the v2.4.2 encoder's `FullRangeYUV`
+  registry value at context offset `+0x78`, OR-accumulated as
+  `FLAG_FULL_RANGE` (bit 2, mask `0x00000004`) of the flags dword
+  per the documented OR-accumulator sequence at
+  `magicyuv.dll!0x69b97647`–`0x69b9767a`. The decoder pickup at
+  `magicyuv.dll!0x69bae311` (file `@0x2d311`) shifts the dword
+  right by 2 and isolates the low bit, exposing the boolean to the
+  application/conversion layer; the round-1
+  `FrameHeader::is_full_range()` accessor surfaces the same value
+  on the decode side. The codec layer's pixel residuals are
+  independent of the bit, so the wire pixel bytes returned by
+  `decode_frame` round-trip byte-exact regardless of the authored
+  value. `EncodeOptions::default()` / `EncodeOptions::fixed(_)` /
+  `EncodeOptions::dynamic_auto()` all initialise the field to
+  `false`, matching the r245-era encoder behaviour byte-for-byte so
+  callers using struct-update syntax keep producing identical
+  output. The `encode_magicyuv` fuzz target gains coverage of the
+  new knob via bit 1 of header byte 8 (bit 0 stays `interlaced`,
+  high nibble stays `color_matrix`), exercising both values at
+  every libfuzzer iteration alongside the existing two flags-dword
+  knobs. Three new lib tests cover the knob: a true/false sweep
+  asserting (a) the bit round-trips via `is_full_range()`, (b) the
+  on-wire flags dword carries exactly `FLAG_FULL_RANGE` when set,
+  and (c) the pixel bytes round-trip unchanged; a three-way
+  composition test setting `interlaced = true` + `full_range =
+  true` + `color_matrix = 0xa` simultaneously and asserting all
+  three flag groups survive the OR-accumulation; and a defaults
+  invariant test asserting each of the three constructor entry
+  points clears `full_range` and that a default-options encode
+  emits a clear `FLAG_FULL_RANGE` bit. Lib test count grew from
+  112 to 115; clippy clean; fmt clean.
 - **Encoder-side `EncodeOptions::color_matrix` knob (`spec/01`
   §3.1).** The encoder's `write_header` now accepts a 4-bit
   ColorMatrix nibble mirroring the v2.4.2 encoder's `ColorMatrix`
