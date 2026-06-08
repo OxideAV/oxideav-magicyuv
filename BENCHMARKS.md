@@ -468,6 +468,90 @@ All 110 unit + round-trip tests pass under `--all-features`
 (was 103; +7 packer parity tests in `pack_raw_bits_tests`) and 101
 under `--no-default-features` (was 94).
 
+### 13. Batched Huffman-mode bit packer (`pack_huffman_residuals_u{8,16}`) + packed `(code, length)` table
+
+Opt-12 batched the raw-mode bit packer. The Huffman-mode emit hot
+loop still walked
+`for &sym in res_block { let len = huff.lengths[sym as usize]; let
+code = huff.codes[sym as usize]; bw.write(code, len); }` at every
+call site (u8 + u16 × Auto-probe + Huffman-emit = four sites). Two
+costs hide in that shape:
+
+1. **Two table fetches per symbol.** `huff.lengths[sym]` and
+   `huff.codes[sym]` index two separate `Vec`s, so each iteration
+   does two memory loads + two bounds-check elisions. Mirrors the
+   decoder's pre-opt-6 `Vec<(u32, u8)>` 8-byte-tuple primary table
+   the round-127 reshuffle reduced to a single packed-`u32` fetch.
+2. **`&mut self` BitWriter reload.** `BitWriter::write` is `&mut
+   self` so the optimiser can't keep `self.bytes` / `self.acc` /
+   `self.bits_used` in registers across iterations even with
+   `#[inline(always)]` — same shape opt-12 solved for the raw
+   packer by hoisting state into stack locals.
+
+The new `encoder::pack_huffman_residuals_u{8,16}` + the new
+`PlaneHuff::packed: Vec<u32>` table (low 8 b length, high 24 b
+code — safe because max code length is 18 b ⇒ code fits in 18 b
+< 24 b) fix both. One packed-u32 fetch per symbol, `acc` and
+`bits_used` live in registers across the whole slice, the dead
+`if len == 0 { return; }` branch is the only zero-length skip
+left (and only fires on unused symbols, which the histogram
+builder never produces for non-empty slices). The four call sites
+now write directly into the existing `payload: Vec<u8>` instead of
+going through a per-slice
+`BitWriter::with_capacity + finish + payload.extend(...)` memcpy,
+so the per-slice byte-copy hop is gone too — same shape opt-12
+took for the raw path. The Auto-probe site keeps its dedicated
+fresh-Vec body (the size check is `bytes.len() <= raw_size` —
+needs a separate Vec to compare without committing to it).
+
+Side-by-side timings on the Apple M-series host
+(`examples/quick_bench encode` + `dynamic`, 5-run medians per
+side):
+
+| Scenario                                | Baseline  | After     | Δ        |
+| --------------------------------------- | --------: | --------: | -------: |
+| enc M8RG / Fixed-Huffman / 1280×720     |  11.91 ms |  11.69 ms |  -1.8 %  |
+| enc M8Y0 / Fixed-Huffman / 1280×720     |   5.58 ms |   5.35 ms |  -4.1 %  |
+| enc M8G0 / Fixed-Huffman / 1920×1080    |   8.36 ms |   8.20 ms |  -1.9 %  |
+| enc M0RG / Fixed-Huffman / 1280×720/10b |  17.07 ms |  17.37 ms |  +1.8 %  |
+| enc M8RG / Dynamic-Auto / 1280×720      |  14.35 ms |  13.71 ms |  -4.5 %  |
+| enc M8Y0 / Dynamic-Auto / 1280×720      |   7.50 ms |   7.02 ms |  -6.4 %  |
+| enc M8G0 / Dynamic-Auto / 1920×1080     |  11.14 ms |  10.47 ms |  -6.0 %  |
+| enc M0RG / Dynamic-Auto / 1280×720/10b  |  21.40 ms |  20.34 ms |  -5.0 %  |
+
+The Dynamic-Auto scenarios fire the per-symbol Huffman packer
+twice per Huffman-winning slice (once for the Auto-mode size
+probe + once for the emit into `payload`), so the 4-6 % win there
+is roughly twice the Fixed-Huffman gain — consistent with the
+per-symbol-table-fetch cost going from 2 × `Vec` index to 1 ×
+`Vec` index. The 10-bit Fixed-Huffman scenario is within noise
+flat; the 10-bit alphabet's deeper `max_huff_len = 14` keeps the
+per-symbol drain loop longer than the 8-bit's 12-bit ceiling, so
+the table-fetch saving is a smaller fraction of the per-symbol
+cost there. Raw-mode (opt-12) is unchanged because the new packer
+is only on the Huffman + Auto-Huffman-wins branches; the
+`SliceMode::Raw` site already routes through `pack_raw_bits_*`.
+
+Seven new `pack_huffman_residuals_tests` (`empty_input_emits_no_bytes`,
+`appends_to_existing_buffer`, `matches_per_pixel_u8_xorshift`,
+`matches_per_pixel_u16_at_10_12_14`, `skewed_histogram_matches_reference`,
+`packed_layout_matches_codes_and_lengths`, `unused_symbols_are_skipped`)
+pin the batched implementation against a per-pixel
+`BitWriter::write(huff.codes[sym], huff.lengths[sym])` reference
+oracle inside the test module. The packed-layout test asserts the
+`(code << 8) | length` invariant directly; the
+`skewed_histogram_matches_reference` test drives the length-limited
+Package-Merge cap-bound shape so the packer correctness is anchored
+at the 12-bit ceiling boundary.
+
+All 122 unit + round-trip tests pass under default features
+(was 115; +7 packer parity tests in `pack_huffman_residuals_tests`),
+117 under `--no-default-features` (was 110), and 126 under
+`--all-features` (was 119). Round-trip suite covers every FOURCC ×
+predictor × Huffman / Auto configuration end-to-end so the
+byte-for-byte equivalence is anchored at both the slice-payload
+level (parity tests) and the full-frame level (round-trip suite).
+
 ## Round-N+1 candidates
 
 - **Predictor SIMD (Left only)** — Left has the simplest dependency

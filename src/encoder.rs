@@ -284,7 +284,35 @@ fn max_huff_len_for(bit_depth: u8) -> u8 {
 /// Encoder-side per-plane Huffman.
 struct PlaneHuff {
     lengths: Vec<u8>,
+    /// Per-symbol prefix-free code. Kept on the struct so the
+    /// `huffman_limit_tests::codes_are_prefix_free` audit can verify
+    /// the on-wire decodability guarantee (spec/05 §2.0.3) against
+    /// the production build path; the per-symbol encoder emit hot
+    /// loop now fetches `packed` (below) instead so this field is
+    /// not read on the production code path.
+    #[cfg_attr(not(test), allow(dead_code))]
     codes: Vec<u32>,
+    /// Per-symbol `(code, length)` packed into a single `u32`: low 8 bits
+    /// hold `length`, high 24 bits hold `code`. The encoder's per-symbol
+    /// emit hot loop fetches **one** u32 per residual symbol instead of
+    /// two separate `lengths[sym]` + `codes[sym]` indexes — halving the
+    /// table-fetch cost in the inner loop the way the decoder's
+    /// `packed: Vec<u32>` primary table (BENCHMARKS opt-6) did for the
+    /// decode side. Safe at every native bit-depth: `max_huff_len = 18`
+    /// at 14-bit (`MAX_HUFF_LEN_14BIT`), so `code < 2^18 < 2^24` fits.
+    /// Cheap to derive (one allocation + one pass) and amortised across
+    /// every slice of the plane's encode loop.
+    packed: Vec<u32>,
+}
+
+/// Pack `(code, length)` into the `PlaneHuff::packed` u32 layout: low 8
+/// bits hold the length, high 24 bits hold the code. Caller must ensure
+/// `code < 2^24` and `length ≤ 24`; in this crate both invariants hold
+/// because `length ≤ MAX_HUFF_LEN_14BIT = 18 < 24` and
+/// `code < 2^length ≤ 2^18 < 2^24`.
+#[inline(always)]
+const fn pack_huff_entry(code: u32, length: u8) -> u32 {
+    (code << 8) | (length as u32)
 }
 
 impl PlaneHuff {
@@ -316,7 +344,18 @@ impl PlaneHuff {
                 cur[li] = cur[li].wrapping_add(1);
             }
         }
-        Self { lengths, codes }
+        // Precompute the per-symbol packed `(code, length)` table for the
+        // batched emit hot loop. One pass + one allocation; amortised
+        // across every slice that emits this plane's residuals.
+        let mut packed = Vec::with_capacity(n);
+        for (s, &l) in lengths.iter().enumerate() {
+            packed.push(pack_huff_entry(codes[s], l));
+        }
+        Self {
+            lengths,
+            codes,
+            packed,
+        }
     }
 }
 
@@ -580,6 +619,7 @@ fn encode_descriptor(lengths: &[u8]) -> Vec<u8> {
 /// case at 8-bit gives `len ≤ 12`, so 1-2 bytes drain per call).
 /// Same observable byte stream as the per-bit loop, but with the
 /// inner `for i in (0..len).rev()` replaced by a couple of shifts.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct BitWriter {
     bytes: Vec<u8>,
     /// Bit accumulator; valid bits are the high `bits_used` bits.
@@ -587,6 +627,7 @@ pub(crate) struct BitWriter {
     bits_used: u32,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl BitWriter {
     /// Allocate the output buffer up front. Saves the geometric `Vec`
     /// reallocations on the slice-payload hot path, where the caller
@@ -719,6 +760,116 @@ pub(crate) fn pack_raw_bits_from_u16(dst: &mut Vec<u8>, src: &[u16], bits: u8) {
     }
     if bits_used > 0 {
         // Same partial-byte zero-pad as `BitWriter::finish`.
+        dst.push((acc >> 56) as u8);
+    }
+}
+
+/// Batched packer for the encoder's per-plane Huffman emit hot loop
+/// (8-bit residuals). Mirrors `pack_raw_bits_from_u16` (and the
+/// decoder's `decode_into_u8` batched hot loop, BENCHMARKS opt-2): the
+/// 64-bit accumulator + whole-byte drain state lives in stack locals
+/// across the whole slice, so the optimiser keeps `acc` / `bits_used`
+/// / the `Vec::push` length in registers across every symbol — the
+/// generic `BitWriter::write` path took `&mut self`, which forced a
+/// reload of `self.bytes` / `self.acc` / `self.bits_used` after every
+/// call and carried the `if len == 0 { return; }` early-return branch
+/// at every call site.
+///
+/// Per-symbol table fetch is **one** u32 from `packed` (low 8 b length,
+/// high 24 b code) instead of two separate `lengths[sym]` + `codes[sym]`
+/// indexes — matches the encoder-side reshape of the decoder's
+/// `Vec<u32>` packed primary table (opt-6).
+///
+/// Same observable byte stream as the per-pixel
+/// `for &sym in src { bw.write(huff.codes[sym], huff.lengths[sym]); }`
+/// loop the call sites previously walked. Pinned against that
+/// reference by the `pack_huffman_residuals_tests` module + verified
+/// end-to-end by the existing round-trip suite (every FOURCC ×
+/// predictor × Huffman / Auto configuration).
+#[inline]
+pub(crate) fn pack_huffman_residuals_u8(dst: &mut Vec<u8>, src: &[u8], packed: &[u32]) {
+    if src.is_empty() {
+        return;
+    }
+    // Reserve a conservative upper bound: the per-symbol code length is
+    // at most `MAX_HUFF_LEN_8BIT = 12`, so `(src.len() * 12 + 7) / 8`.
+    // Falls short of the cap an over-bit-depth-prefixed `packed` could
+    // request (e.g. if the caller passed a 10/12/14-bit table by
+    // mistake), but the call sites already pre-size the `dst` Vec with
+    // a tight slice-payload cap, so this reservation is a hint at most.
+    dst.reserve((src.len() * 12).div_ceil(8));
+    let mut acc: u64 = 0;
+    let mut bits_used: u32 = 0;
+    for &sym in src {
+        // Single table fetch per symbol — splits the packed u32 into
+        // `(code, length)` once. `length ≤ 18 ≤ 32` so the `BitWriter`
+        // arithmetic below stays in bounds.
+        let entry = packed[sym as usize];
+        let length = (entry & 0xff) as u8;
+        let code = entry >> 8;
+        if length == 0 {
+            // Same as `BitWriter::write`'s `if len == 0 { return; }`
+            // early-return: an unused symbol carries no bits. Keeping
+            // this branch here (rather than at the per-call-site loop
+            // body) keeps the per-symbol cost paid once per *unused*
+            // symbol the encoder hands us — which shouldn't happen
+            // because the histogram is built from this very residual
+            // stream, but the build path tolerates the all-unused
+            // descriptor so we must too.
+            continue;
+        }
+        // Same MSB-first placement as `BitWriter::write`. With
+        // `length ≤ 12` (8-bit max code length) and entry-condition
+        // `bits_used ≤ 7`, the post-merge `bits_used ≤ 19`, so the
+        // drain loop runs ≤ 2 times.
+        let shift = 64 - bits_used - (length as u32);
+        acc |= (code as u64) << shift;
+        bits_used += length as u32;
+        while bits_used >= 8 {
+            dst.push((acc >> 56) as u8);
+            acc <<= 8;
+            bits_used -= 8;
+        }
+    }
+    if bits_used > 0 {
+        // Same partial-byte zero-pad as `BitWriter::finish`.
+        dst.push((acc >> 56) as u8);
+    }
+}
+
+/// 10/12/14-bit analogue of `pack_huffman_residuals_u8`. Symbol index
+/// type widens to `u16` (the residual alphabet is up to 16384 entries
+/// at 14-bit), but the accumulator / drain logic is identical. Per-
+/// symbol code length is at most `MAX_HUFF_LEN_14BIT = 18`, so the
+/// post-merge `bits_used ≤ 25` and the drain loop still runs ≤ 3 times.
+#[inline]
+pub(crate) fn pack_huffman_residuals_u16(dst: &mut Vec<u8>, src: &[u16], packed: &[u32]) {
+    if src.is_empty() {
+        return;
+    }
+    // Reserve a conservative upper bound: `MAX_HUFF_LEN_14BIT = 18`,
+    // so `(src.len() * 18 + 7) / 8`. As with the u8 variant this is a
+    // hint — the call sites pre-size `dst` to `2 * raw_size + 2`.
+    dst.reserve((src.len() * 18).div_ceil(8));
+    let mut acc: u64 = 0;
+    let mut bits_used: u32 = 0;
+    for &sym in src {
+        let entry = packed[sym as usize];
+        let length = (entry & 0xff) as u8;
+        let code = entry >> 8;
+        if length == 0 {
+            continue;
+        }
+        let shift = 64 - bits_used - (length as u32);
+        acc |= (code as u64) << shift;
+        bits_used += length as u32;
+        while bits_used >= 8 {
+            dst.push((acc >> 56) as u8);
+            acc <<= 8;
+            bits_used -= 8;
+        }
+    }
+    if bits_used > 0 {
         dst.push((acc >> 56) as u8);
     }
 }
@@ -966,16 +1117,12 @@ fn encode_frame_u8(
                 // Huffman encoding exceeding `raw_size` would lose to
                 // raw, so the actual emitted byte count is ≤ `raw_size`
                 // when Huffman wins. Add 1 for the partial-byte tail
-                // `finish()` flushes (`bits_used ∈ [1,7]` ⇒ one more
-                // byte). Eliminates ~17 geometric reallocations per
-                // slice at 1280×28 = 35840 input bytes.
-                let mut bw = BitWriter::with_capacity(raw_size + 1);
-                for &sym in res_block {
-                    let len = huff.lengths[sym as usize];
-                    let code = huff.codes[sym as usize];
-                    bw.write(code, len);
-                }
-                let bytes = bw.finish();
+                // the packer's final `dst.push((acc >> 56) as u8)`
+                // flushes (`bits_used ∈ [1,7]` ⇒ one more byte).
+                // Eliminates ~17 geometric reallocations per slice at
+                // 1280×28 = 35840 input bytes.
+                let mut bytes = Vec::with_capacity(raw_size + 1);
+                pack_huffman_residuals_u8(&mut bytes, res_block, &huff.packed);
                 if bytes.len() <= raw_size {
                     huff_buf = Some(bytes);
                     0x00
@@ -1003,17 +1150,13 @@ fn encode_frame_u8(
             let huff = &plane_huffs[plane];
             // Pure-Huffman mode (SliceMode::Huffman): output bounded by
             // `(pixels * max_huff_len + 7) / 8` ≤ 1.5 * raw_size at the
-            // 8-bit alphabet's `max_huff_len = 12`. Pre-size to
-            // `raw_size + raw_size / 2 + 1` so the common path doesn't
-            // reallocate; pathological skewed slices will still grow
-            // gracefully.
-            let mut bw = BitWriter::with_capacity(raw_size + raw_size / 2 + 1);
-            for &sym in res_block {
-                let len = huff.lengths[sym as usize];
-                let code = huff.codes[sym as usize];
-                bw.write(code, len);
-            }
-            payload.extend(bw.finish());
+            // 8-bit alphabet's `max_huff_len = 12`. Reserve
+            // `raw_size + raw_size / 2 + 1` on the existing `payload`
+            // Vec so the batched packer's `dst.push((acc >> 56) as u8)`
+            // hot loop stays branchless on the capacity check;
+            // pathological skewed slices will still grow gracefully.
+            payload.reserve(raw_size + raw_size / 2 + 1);
+            pack_huffman_residuals_u8(&mut payload, res_block, &huff.packed);
         }
         slice_payloads.push(payload);
     }
@@ -1420,13 +1563,8 @@ fn encode_frame_u16(
                 let huff = &plane_huffs[plane];
                 // See the u8 Auto branch for the cap reasoning. At
                 // 10/12/14-bit `raw_size = (pixels * bits + 7) / 8`.
-                let mut bw = BitWriter::with_capacity(raw_size + 1);
-                for &sym in res_block {
-                    let len = huff.lengths[sym as usize];
-                    let code = huff.codes[sym as usize];
-                    bw.write(code, len);
-                }
-                let bytes = bw.finish();
+                let mut bytes = Vec::with_capacity(raw_size + 1);
+                pack_huffman_residuals_u16(&mut bytes, res_block, &huff.packed);
                 if bytes.len() <= raw_size {
                     huff_buf = Some(bytes);
                     0x00
@@ -1460,14 +1598,11 @@ fn encode_frame_u16(
         } else {
             let huff = &plane_huffs[plane];
             // See the u8 fresh-Huffman comment for the cap rationale;
-            // 1.8 × raw_size at 10-bit is the worst case.
-            let mut bw = BitWriter::with_capacity(2 * raw_size + 1);
-            for &sym in res_block {
-                let len = huff.lengths[sym as usize];
-                let code = huff.codes[sym as usize];
-                bw.write(code, len);
-            }
-            payload.extend(bw.finish());
+            // 1.8 × raw_size at 10-bit is the worst case. Reserve on
+            // the existing `payload` so the batched packer's drain
+            // hot loop is branchless on the capacity check.
+            payload.reserve(2 * raw_size + 1);
+            pack_huffman_residuals_u16(&mut payload, res_block, &huff.packed);
         }
         slice_payloads.push(payload);
     }
@@ -2189,6 +2324,225 @@ mod pack_raw_bits_tests {
         let slow = reference(&samples, bits);
         assert_eq!(fast, slow);
         assert_eq!(fast.len(), (n * bits as usize).div_ceil(8));
+    }
+}
+
+#[cfg(test)]
+mod pack_huffman_residuals_tests {
+    //! Pin the batched `pack_huffman_residuals_u{8,16}` against a
+    //! per-pixel `BitWriter::write(huff.codes[sym], huff.lengths[sym])`
+    //! reference oracle.
+    //!
+    //! The round-trip suite covers Huffman-mode bytes end-to-end
+    //! (every FOURCC × predictor × Huffman / Auto configuration). The
+    //! parity tests here pin the packer body in isolation, mirroring
+    //! `pack_raw_bits_tests` so any future hot-loop reshape (e.g. a
+    //! SIMDified inner loop, or a packed-table layout change) lands as
+    //! a focused failure before the broader integration suite reaches
+    //! it.
+    use super::*;
+
+    fn reference_u8(src: &[u8], huff: &PlaneHuff) -> Vec<u8> {
+        // The shape the encoder walked at every call site before
+        // opt-13 — two table fetches per symbol + one `BitWriter::write`
+        // per symbol. The accumulated drain shape is `BitWriter`'s.
+        let cap = src.len();
+        let mut bw = BitWriter::with_capacity(cap);
+        for &sym in src {
+            let len = huff.lengths[sym as usize];
+            let code = huff.codes[sym as usize];
+            bw.write(code, len);
+        }
+        bw.finish()
+    }
+
+    fn reference_u16(src: &[u16], huff: &PlaneHuff) -> Vec<u8> {
+        let cap = 2 * src.len();
+        let mut bw = BitWriter::with_capacity(cap);
+        for &sym in src {
+            let len = huff.lengths[sym as usize];
+            let code = huff.codes[sym as usize];
+            bw.write(code, len);
+        }
+        bw.finish()
+    }
+
+    fn drive_u8(src: &[u8], huff: &PlaneHuff) -> Vec<u8> {
+        let mut out = Vec::new();
+        pack_huffman_residuals_u8(&mut out, src, &huff.packed);
+        out
+    }
+
+    fn drive_u16(src: &[u16], huff: &PlaneHuff) -> Vec<u8> {
+        let mut out = Vec::new();
+        pack_huffman_residuals_u16(&mut out, src, &huff.packed);
+        out
+    }
+
+    /// Build a PlaneHuff from a histogram covering every symbol in
+    /// `src` — guarantees all symbols are reachable from a non-zero
+    /// length, so the per-symbol drive never hits the unused-symbol
+    /// `length == 0` early-continue branch.
+    fn build_huff_u8(src: &[u8], max_len: u8) -> PlaneHuff {
+        let mut hist = vec![0u32; 256];
+        for &s in src {
+            hist[s as usize] += 1;
+        }
+        // Guarantee at least one symbol so `build_from_histogram`
+        // takes the non-trivial path.
+        if src.is_empty() {
+            hist[0] = 1;
+        }
+        PlaneHuff::build_from_histogram(&hist, max_len)
+    }
+
+    fn build_huff_u16(src: &[u16], alphabet: usize, max_len: u8) -> PlaneHuff {
+        let mut hist = vec![0u32; alphabet];
+        for &s in src {
+            hist[s as usize] += 1;
+        }
+        if src.is_empty() {
+            hist[0] = 1;
+        }
+        PlaneHuff::build_from_histogram(&hist, max_len)
+    }
+
+    #[test]
+    fn empty_input_emits_no_bytes() {
+        let huff = build_huff_u8(&[], 12);
+        assert!(drive_u8(&[], &huff).is_empty());
+        let huff16 = build_huff_u16(&[], 1024, 14);
+        assert!(drive_u16(&[], &huff16).is_empty());
+    }
+
+    #[test]
+    fn appends_to_existing_buffer() {
+        // Mirrors the call-site shape: the packer is called on a
+        // payload Vec that already carries `flags + pred_id`. Verify
+        // the prefix bytes survive intact.
+        let src = [0u8, 1, 2, 1, 0, 1, 2, 1, 0];
+        let huff = build_huff_u8(&src, 12);
+        let mut out = vec![0xff_u8, 0xee, 0xdd];
+        pack_huffman_residuals_u8(&mut out, &src, &huff.packed);
+        assert_eq!(&out[..3], &[0xff, 0xee, 0xdd]);
+        assert_eq!(&out[3..], reference_u8(&src, &huff).as_slice());
+    }
+
+    #[test]
+    fn matches_per_pixel_u8_xorshift() {
+        // 8-bit alphabet, xorshift fan-out across the whole 256-symbol
+        // space. Stress every drain-loop cycle the per-call-site walk
+        // would hit; assert byte-for-byte equivalence to the
+        // `BitWriter::write`-per-symbol reference.
+        let n = 4096usize;
+        let mut s: u32 = 0xc0ff_ee01;
+        let src: Vec<u8> = (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 17;
+                s ^= s << 5;
+                s as u8
+            })
+            .collect();
+        let huff = build_huff_u8(&src, 12);
+        let fast = drive_u8(&src, &huff);
+        let slow = reference_u8(&src, &huff);
+        assert_eq!(fast, slow);
+    }
+
+    #[test]
+    fn matches_per_pixel_u16_at_10_12_14() {
+        // High-bit-depth tiers. Each tier walks an alphabet capped at
+        // `1 << bits` with the per-tier `max_len`; the residual stream
+        // is xorshift-shaped + masked into the alphabet so every
+        // symbol class shows up.
+        for &(bits, max_len) in &[(10u8, 14u8), (12, 16), (14, 18)] {
+            let alphabet = 1usize << bits;
+            let mask = (alphabet - 1) as u16;
+            let n = 2048usize;
+            let mut s: u32 = 0xfeed_d00d ^ (bits as u32).wrapping_mul(0x9e37_79b9);
+            let src: Vec<u16> = (0..n)
+                .map(|_| {
+                    s ^= s << 13;
+                    s ^= s >> 17;
+                    s ^= s << 5;
+                    (s as u16) & mask
+                })
+                .collect();
+            let huff = build_huff_u16(&src, alphabet, max_len);
+            let fast = drive_u16(&src, &huff);
+            let slow = reference_u16(&src, &huff);
+            assert_eq!(fast, slow, "fast/slow mismatch at bits={bits}");
+        }
+    }
+
+    #[test]
+    fn skewed_histogram_matches_reference() {
+        // Skewed Fibonacci-like histogram drives `enforce_length_cap`
+        // (the length-limited Package-Merge path). Verifies the packer
+        // is correct even at the cap-bound `max_huff_len = 12` boundary
+        // where the codes hit the 12-bit ceiling.
+        let mut hist = vec![0u32; 256];
+        let mut a: u32 = 1;
+        let mut b: u32 = 1;
+        for h in hist.iter_mut().take(40) {
+            *h = a;
+            let next = a + b;
+            a = b;
+            b = next;
+        }
+        let huff = PlaneHuff::build_from_histogram(&hist, 12);
+        // Drive 1024 symbols sampled from the skewed alphabet.
+        let mut s: u32 = 0x1357_9bdf;
+        let src: Vec<u8> = (0..1024)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 17;
+                s ^= s << 5;
+                // Stay inside the first 40 active symbols.
+                (s as usize % 40) as u8
+            })
+            .collect();
+        let fast = drive_u8(&src, &huff);
+        let slow = reference_u8(&src, &huff);
+        assert_eq!(fast, slow);
+    }
+
+    #[test]
+    fn packed_layout_matches_codes_and_lengths() {
+        // Sanity-check the packed encoding is `(code << 8) | length`.
+        // Take an arbitrary histogram, build, then verify every symbol's
+        // packed entry recovers both halves.
+        let mut hist = vec![0u32; 256];
+        for (i, h) in hist.iter_mut().enumerate().take(64) {
+            *h = (i + 1) as u32;
+        }
+        let huff = PlaneHuff::build_from_histogram(&hist, 12);
+        assert_eq!(huff.packed.len(), 256);
+        for (s, &entry) in huff.packed.iter().enumerate() {
+            let length = (entry & 0xff) as u8;
+            let code = entry >> 8;
+            assert_eq!(length, huff.lengths[s]);
+            assert_eq!(code, huff.codes[s]);
+        }
+    }
+
+    #[test]
+    fn unused_symbols_are_skipped() {
+        // Build a histogram that leaves most symbols unused. Hand the
+        // packer a stream containing only the active symbols and assert
+        // the unused-symbol `length == 0` early-continue branch is never
+        // hit (no bit emitted for any unused symbol) — the active-stream
+        // bytes equal what the per-pixel reference emits.
+        let mut hist = vec![0u32; 256];
+        hist[10] = 3;
+        hist[20] = 2;
+        hist[30] = 1;
+        let huff = PlaneHuff::build_from_histogram(&hist, 12);
+        let src = [10u8, 20, 30, 10, 20, 10];
+        let fast = drive_u8(&src, &huff);
+        let slow = reference_u8(&src, &huff);
+        assert_eq!(fast, slow);
     }
 }
 

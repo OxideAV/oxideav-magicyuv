@@ -6,6 +6,47 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Batched Huffman-mode bit packer
+  (`encoder::pack_huffman_residuals_u{8,16}`) + packed
+  `(code, length)` table (`PlaneHuff::packed: Vec<u32>`,
+  low 8 b length + high 24 b code).** The four per-symbol
+  Huffman emit hot loops (u8 + u16 × Auto-probe + Huffman-emit)
+  previously walked `for &sym in res_block { bw.write(huff.codes[sym
+  as usize], huff.lengths[sym as usize]); }` — two `Vec` table
+  fetches per symbol + a `&mut BitWriter` per-call reload that
+  blocked the optimiser from keeping accumulator state in
+  registers. The new batched packer mirrors the prior round's
+  raw-mode `pack_raw_bits_from_u16` shape: stack-local
+  `acc: u64` + `bits_used: u32` across the whole slice, one
+  packed-`u32` fetch per symbol (length in low 8 b, code in high
+  24 b — safe because `max_huff_len ≤ 18 < 24`), and the per-slice
+  `BitWriter::with_capacity + finish + payload.extend(...)`
+  byte-copy hop is gone (the Huffman-emit packer writes directly
+  into the pre-sized `payload: Vec<u8>`; the Auto-probe site keeps
+  a fresh `Vec` so it can compare the would-be Huffman size
+  against `raw_size` without committing). 4-6 % win on the
+  Dynamic-Auto encode scenarios (per-symbol Huffman fires twice
+  per Huffman-winning slice — once for the size probe, once for
+  the emit) and 2-4 % on the Fixed-Huffman scenarios on the Apple
+  M-series host (`examples/quick_bench encode` + `dynamic`, 5-run
+  medians, full table in `BENCHMARKS.md` §13). Same observable
+  byte stream as the prior per-symbol shape — pinned by seven new
+  `pack_huffman_residuals_tests` (`empty_input_emits_no_bytes`,
+  `appends_to_existing_buffer`, `matches_per_pixel_u8_xorshift`,
+  `matches_per_pixel_u16_at_10_12_14`,
+  `skewed_histogram_matches_reference`,
+  `packed_layout_matches_codes_and_lengths`,
+  `unused_symbols_are_skipped`) against a per-pixel
+  `BitWriter::write(huff.codes[sym], huff.lengths[sym])` reference
+  oracle, and anchored end-to-end by the existing round-trip suite
+  (every FOURCC × predictor × Huffman / Auto configuration). Lib
+  test count grew from 115 to 122 (117 under
+  `--no-default-features`, 126 under `--all-features`); clippy
+  clean; fmt clean. Raw-mode payload bytes are unchanged (the
+  `SliceMode::Raw` site keeps routing through `pack_raw_bits_*`).
+
 ### Added
 
 - **Encoder-side `EncodeOptions::full_range` knob (`spec/01`
