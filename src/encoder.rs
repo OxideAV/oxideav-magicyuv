@@ -601,13 +601,30 @@ fn package_merge_lengths(hist: &[u32], cap: u8) -> Vec<u8> {
 
 /// Encode a sequence of code lengths using the run-length scheme of
 /// `spec/05` §1.1.
+///
+/// The v2.4.2 encoder caps each emitted run at **255** repetitions —
+/// count byte `0xfe` (254), one unit of headroom below the `0xff`
+/// the decoder would also accept (`spec/05` §1.5: run-count cap
+/// branch at `0x69b94600`, two-byte run-emit at `0x69b946d6`). The
+/// reserved `0xff` count byte is never produced by the vendor, so a
+/// length value that repeats `≥ 256` times is split into successive
+/// `(0x80|v, 0xfe)` pairs (a run of 255) followed by the remainder
+/// (`spec/05` §10 Q3: a 10-bit sparse distribution emits
+/// `01 89 fe 89 fe …`, not a single `0xff`-counted run). Matching the
+/// cap keeps the descriptor bytes byte-for-byte identical to the
+/// vendor encoder, including for the high-bit-depth (10/12/14-bit,
+/// N ∈ {1024, 4096, 16384}) plane descriptors where a single length
+/// value commonly repeats thousands of times.
 fn encode_descriptor(lengths: &[u8]) -> Vec<u8> {
+    /// Maximum repetitions a single two-byte run may carry. The count
+    /// byte is `run - 1`, capped at `0xfe` per `spec/05` §1.5.
+    const MAX_RUN: usize = 255;
     let mut out = Vec::new();
     let mut i = 0;
     while i < lengths.len() {
         let v = lengths[i];
         let mut run = 1usize;
-        while i + run < lengths.len() && lengths[i + run] == v && run < 256 {
+        while i + run < lengths.len() && lengths[i + run] == v && run < MAX_RUN {
             run += 1;
         }
         if run >= 2 {
@@ -2091,6 +2108,56 @@ mod huffman_limit_tests {
     fn single_active_symbol_gets_length_one() {
         let lengths = canonical_huffman_lengths(&[0, 7, 0, 0], 12);
         assert_eq!(lengths, vec![0, 1, 0, 0]);
+    }
+
+    // --- Descriptor run-length cap (spec/05 §1.5 / §10 Q3) ---------------
+
+    #[test]
+    fn descriptor_run_caps_at_255_count_byte_0xfe() {
+        // A length value repeated exactly 256 times must NOT collapse
+        // into a single `(0x80|v, 0xff)` pair — the vendor encoder caps
+        // a run at 255 reps (count byte 0xfe), reserving 0xff. The
+        // remaining single repetition spills into a literal.
+        let lengths = vec![9u8; 256];
+        let desc = super::encode_descriptor(&lengths);
+        // Expect: run of 255 (89 fe) + 1 literal (09).
+        assert_eq!(desc, vec![0x80 | 9, 0xfe, 9]);
+        // No 0xff count byte anywhere in the descriptor.
+        assert!(
+            !desc.windows(2).any(|w| (w[0] & 0x80) != 0 && w[1] == 0xff),
+            "descriptor emitted reserved 0xff count byte: {desc:02x?}"
+        );
+    }
+
+    #[test]
+    fn descriptor_sparse_highdepth_splits_into_capped_runs() {
+        // spec/05 §10 Q3 worked shape: a 10-bit (N=1024) plane with one
+        // active symbol then 1023 unused (length-0) symbols. The unused
+        // tail must split into successive 255-rep runs, never a single
+        // out-of-range run.
+        let mut lengths = vec![0u8; 1024];
+        lengths[0] = 1; // sole active symbol
+        let desc = super::encode_descriptor(&lengths);
+        // First byte is the length-1 literal; the rest encode 1023
+        // zero-lengths as 4×(80 fe) [=1020] + a tail run of 3 (80 02).
+        assert_eq!(desc[0], 1);
+        assert!(
+            !desc.windows(2).any(|w| (w[0] & 0x80) != 0 && w[1] == 0xff),
+            "high-depth sparse descriptor emitted 0xff count: {desc:02x?}"
+        );
+        // Round-trip through the decoder's parser reproduces the lengths.
+        let (parsed, consumed) =
+            crate::huffman::parse_lengths(&desc, 1024, 14, 0).expect("descriptor must re-parse");
+        assert_eq!(parsed, lengths);
+        assert_eq!(consumed, desc.len());
+    }
+
+    #[test]
+    fn descriptor_run_of_255_stays_single_pair() {
+        // Exactly 255 reps is the largest single run: count byte 0xfe.
+        let lengths = vec![7u8; 255];
+        let desc = super::encode_descriptor(&lengths);
+        assert_eq!(desc, vec![0x80 | 7, 0xfe]);
     }
 }
 

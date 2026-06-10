@@ -8,6 +8,23 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Huffman descriptor run-length writer caps runs at 255 reps
+  (count byte `0xfe`) per `spec/05` §1.5 / §10 Q3.** The encoder's
+  `encode_descriptor` previously allowed a single two-byte run to
+  carry up to 256 repetitions, emitting the reserved count byte
+  `0xff`. The v2.4.2 encoder caps each run at 255 reps — count byte
+  `0xfe` (the run-count cap branch at `magicyuv.dll!0x69b94600`,
+  two-byte run-emit at `0x69b946d6`), reserving `0xff` with one unit
+  of headroom. A length value that repeats `≥ 256` times now splits
+  into successive `(0x80|v, 0xfe)` pairs followed by the remainder,
+  matching the vendor's descriptor bytes byte-for-byte. Most visible
+  on the high-bit-depth (10/12/14-bit, N ∈ {1024, 4096, 16384})
+  plane descriptors where a single length value commonly repeats
+  thousands of times (`spec/05` §10 Q3's `01 89 fe 89 fe …`
+  10-bit-sparse shape). Round-trip is unchanged — the decoder's
+  `parse_lengths` already accepts both forms — but vendor-byte
+  parity on RLE-heavy descriptors is now exact.
+
 - **Encoder applies the `spec/01` §3.1 RGB-family flags override
   (keep-mask `0xf1903f`).** The v2.4.2 encoder's post-accumulation
   override at `magicyuv.dll!0x69b9769c`–`0x69b976bb` computes the

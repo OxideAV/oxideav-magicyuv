@@ -17,7 +17,15 @@ norm (`PredictorStrategy::Dynamic`, spec/04 §3), and per-slice
 Huffman / raw fallback (`SliceMode::Auto`, spec/05 §6.2 —
 `(pixels * bits + 7) / 8` byte-budget). `EncodeOptions::dynamic_auto()`
 combines both for the spec/04 §3 + spec/05 §6.2 always-on
-configuration the v2.4.2 encoder ships with. All three
+configuration the v2.4.2 encoder ships with. The per-plane Huffman
+length descriptor is run-length-emitted with the vendor's
+`spec/05` §1.5 / §10 Q3 run cap: each two-byte run carries at most
+255 repetitions (count byte `0xfe`, reserving `0xff`), so a length
+that repeats `≥ 256` times — common on the high-bit-depth
+(10/12/14-bit, N ∈ {1024, 4096, 16384}) sparse plane descriptors —
+splits into successive `(0x80|v, 0xfe)` pairs (`01 89 fe 89 fe …`)
+byte-for-byte with the v2.4.2 encoder rather than emitting a single
+out-of-range run. All three
 `spec/01` §3.1 flags-dword knobs are surfaced as
 [`EncodeOptions`](https://docs.rs/oxideav-magicyuv/latest/oxideav_magicyuv/struct.EncodeOptions.html)
 fields routed through the encoder's OR-accumulator:
