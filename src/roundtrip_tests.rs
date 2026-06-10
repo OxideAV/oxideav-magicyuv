@@ -1946,10 +1946,16 @@ fn encode_options_defaults_carry_matrix_skip_sentinel() {
 /// boolean. The lossless codec layer is independent of this signal,
 /// so the wire pixel bytes returned by `decode_frame` must match
 /// the original planes byte-for-byte regardless of the bit's value.
+///
+/// The FOURCC under test is M8Y0 (format byte `0x69`) — a member of
+/// `spec/01` §3.1's keep-mask `0xf1903f` (the YUV/Gray family), so
+/// the post-accumulation override does NOT fire and the authored
+/// bit reaches the wire. (RGB-family FOURCCs have the bit cleared
+/// by the override; see the dedicated family-sweep tests below.)
 #[test]
 fn encoder_full_range_knob_writes_flags_bit_2_and_round_trips() {
     use crate::header::{parse as parse_header, FLAG_FULL_RANGE};
-    let rec = lookup(0x65).expect("M8RG");
+    let rec = lookup(0x69).expect("M8Y0");
     let w = 32u32;
     let h = 16u32;
     let sh = 16u32;
@@ -1974,21 +1980,113 @@ fn encoder_full_range_knob_writes_flags_bit_2_and_round_trips() {
         // Pixel bytes must round-trip byte-exact regardless of the
         // application-layer signal — the codec layer is bit-pure.
         let frame = decode_frame(&bytes).expect("decode_frame");
-        for (i, p) in frame.planes.iter().enumerate() {
-            let expected_samples = match &planes[i] {
-                PlaneInput::U8(buf) => buf.as_slice(),
-                PlaneInput::U16(_) => unreachable!("M8RG is 8-bit"),
-            };
-            match &p.samples {
-                Samples::U8(got) => {
-                    assert_eq!(
-                        got, expected_samples,
-                        "plane {i} samples must round-trip irrespective of full_range={authored}",
-                    );
-                }
-                Samples::U16(_) => unreachable!("M8RG is 8-bit"),
-            }
-        }
+        assert!(
+            samples_eq_planes(&planes, &frame.planes),
+            "samples must round-trip irrespective of full_range={authored}",
+        );
+    }
+}
+
+/// `spec/01` §3.1 post-accumulation override, RGB-family side: for
+/// every native FOURCC whose format byte is NOT in the keep-mask
+/// `0xf1903f` — the in-range RGB family `{0x6d, 0x6e, 0x6f, 0x70,
+/// 0x71, 0x72}` plus `0x65` / `0x66` (8-bit RGB / RGBA) via the
+/// `format_byte - 0x67 > 0x17` out-of-range fallthrough — the
+/// v2.4.2 encoder (`magicyuv.dll!0x69b9769c`–`0x69b976bb`) clears
+/// flags bit 2 even when the `FullRangeYUV` registry value asked
+/// for it. The override touches ONLY bit 2: the Interlaced bit and
+/// the ColorMatrix nibble accumulated earlier must survive, and the
+/// pixel bytes still round-trip (the override is header-only).
+#[test]
+fn full_range_override_clears_bit_2_for_rgb_family() {
+    use crate::header::{parse as parse_header, FLAG_FULL_RANGE};
+    for &fb in &[0x65u8, 0x66, 0x6d, 0x6e, 0x6f, 0x70, 0x71, 0x72] {
+        let rec = lookup(fb).expect("native RGB-family format byte");
+        let w = 16u32;
+        let h = 8u32;
+        let sh = 8u32;
+        let planes = if rec.is_high_bit_depth() {
+            make_planes_u16(rec, w, h, 5)
+        } else {
+            make_planes_u8(rec, w, h, 5)
+        };
+        let opts = EncodeOptions {
+            strategy: PredictorStrategy::Fixed(PredictorKind::Gradient),
+            mode: SliceMode::Huffman,
+            interlaced: true,
+            color_matrix: 0xa,
+            full_range: true,
+            predictor: PredictorKind::Gradient,
+        };
+        let bytes = encode_frame(rec, w, h, sh, planes.clone(), opts)
+            .expect("encode_frame RGB-family full_range");
+        let parsed = parse_header(&bytes).expect("parse RGB-family header");
+        assert!(
+            !parsed.is_full_range(),
+            "format byte {fb:#04x}: spec/01 §3.1 override must clear flags bit 2",
+        );
+        assert_eq!(
+            parsed.flags & FLAG_FULL_RANGE,
+            0,
+            "format byte {fb:#04x}: masked dword must have bit 2 clear",
+        );
+        // The override is bit-2-only — the other two accumulated
+        // flag groups survive untouched.
+        assert!(
+            parsed.is_interlaced(),
+            "format byte {fb:#04x}: override must not clear the Interlaced bit",
+        );
+        assert_eq!(
+            parsed.color_matrix_nibble(),
+            0xa,
+            "format byte {fb:#04x}: override must not clear the ColorMatrix nibble",
+        );
+        let frame = decode_frame(&bytes).expect("decode_frame RGB-family");
+        assert!(
+            samples_eq_planes(&planes, &frame.planes),
+            "format byte {fb:#04x}: samples must round-trip under the override",
+        );
+    }
+}
+
+/// `spec/01` §3.1 post-accumulation override, YUV/Gray-family side:
+/// every native FOURCC whose format byte IS in the keep-mask
+/// `0xf1903f` (`{0x67, 0x68, 0x69, 0x6a, 0x6b, 0x6c, 0x73, 0x76,
+/// 0x7b}` among the published set) branches over the override
+/// block, so an authored `full_range = true` reaches the wire as
+/// flags bit 2 and reads back through `is_full_range()`.
+#[test]
+fn full_range_survives_for_yuv_and_gray_family() {
+    use crate::header::{parse as parse_header, FLAG_FULL_RANGE};
+    for &fb in &[0x67u8, 0x68, 0x69, 0x6a, 0x6b, 0x6c, 0x73, 0x76, 0x7b] {
+        let rec = lookup(fb).expect("native YUV/Gray-family format byte");
+        let w = 16u32;
+        let h = 8u32;
+        let sh = 8u32;
+        let planes = if rec.is_high_bit_depth() {
+            make_planes_u16(rec, w, h, 5)
+        } else {
+            make_planes_u8(rec, w, h, 5)
+        };
+        let mut opts = EncodeOptions::fixed(PredictorKind::Gradient);
+        opts.full_range = true;
+        let bytes = encode_frame(rec, w, h, sh, planes.clone(), opts)
+            .expect("encode_frame YUV/Gray-family full_range");
+        let parsed = parse_header(&bytes).expect("parse YUV/Gray-family header");
+        assert!(
+            parsed.is_full_range(),
+            "format byte {fb:#04x}: keep-mask member must retain flags bit 2",
+        );
+        assert_eq!(
+            parsed.flags & FLAG_FULL_RANGE,
+            FLAG_FULL_RANGE,
+            "format byte {fb:#04x}: masked dword must carry bit 2",
+        );
+        let frame = decode_frame(&bytes).expect("decode_frame YUV/Gray-family");
+        assert!(
+            samples_eq_planes(&planes, &frame.planes),
+            "format byte {fb:#04x}: samples must round-trip with bit 2 set",
+        );
     }
 }
 
@@ -1999,10 +2097,14 @@ fn encoder_full_range_knob_writes_flags_bit_2_and_round_trips() {
 /// produce a flags dword whose typed accessors each report exactly
 /// the field they own, guarding against a future regression where
 /// the OR-accumulator becomes an assignment.
+///
+/// Uses M8Y0 (format byte `0x69`, a `spec/01` §3.1 keep-mask
+/// member) so the RGB-family override does not clear bit 2 and all
+/// three authored knobs are observable on the wire simultaneously.
 #[test]
 fn encoder_full_range_composes_with_interlaced_and_color_matrix() {
     use crate::header::{parse as parse_header, FLAG_FULL_RANGE, FLAG_INTERLACED};
-    let rec = lookup(0x65).expect("M8RG");
+    let rec = lookup(0x69).expect("M8Y0");
     let w = 32u32;
     let h = 16u32;
     let sh = 16u32;
@@ -2040,18 +2142,10 @@ fn encoder_full_range_composes_with_interlaced_and_color_matrix() {
     );
     // Pixel bytes still round-trip.
     let frame = decode_frame(&bytes).expect("decode_frame combined-three");
-    for (i, p) in frame.planes.iter().enumerate() {
-        let expected_samples = match &planes[i] {
-            PlaneInput::U8(buf) => buf.as_slice(),
-            PlaneInput::U16(_) => unreachable!("M8RG is 8-bit"),
-        };
-        match &p.samples {
-            Samples::U8(got) => {
-                assert_eq!(got, expected_samples, "plane {i} samples mismatch");
-            }
-            Samples::U16(_) => unreachable!("M8RG is 8-bit"),
-        }
-    }
+    assert!(
+        samples_eq_planes(&planes, &frame.planes),
+        "samples must round-trip under the combined three-flag encode",
+    );
 }
 
 /// `EncodeOptions::default()` (and the `fixed` / `dynamic_auto`

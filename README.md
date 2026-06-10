@@ -22,7 +22,13 @@ configuration the v2.4.2 encoder ships with. All three
 [`EncodeOptions`](https://docs.rs/oxideav-magicyuv/latest/oxideav_magicyuv/struct.EncodeOptions.html)
 fields routed through the encoder's OR-accumulator:
 `interlaced` (bit 1), `full_range` (bit 2, registry `+0x78`), and
-the four-bit `color_matrix` nibble (bits 20..23, registry `+0x68`). A `trace` Cargo feature
+the four-bit `color_matrix` nibble (bits 20..23, registry `+0x68`).
+The encoder also applies the `spec/01` §3.1 post-accumulation
+RGB-family override (keep-mask `0xf1903f` over
+`format_byte - 0x67`): RGB / RGBA FOURCCs at every bit depth get
+flags bit 2 cleared on the wire regardless of the authored
+`full_range`, so the bit is only observable on YUV / Gray streams —
+matching the v2.4.2 encoder byte-for-byte. A `trace` Cargo feature
 surfaces a JSONL trace tape for the Auditor's lockstep harness; the
 `huff.used` field is a per-symbol `{length, code}` map per the
 audit/02 §4.2 forward spec, and `preamble_trailing.extra_bytes` is

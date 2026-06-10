@@ -147,6 +147,19 @@ pub struct EncodeOptions {
     /// Pairs with [`Self::interlaced`] (bit 1) and
     /// [`Self::color_matrix`] (bits 20..23) — the three knobs ride
     /// the same flags dword without interference.
+    ///
+    /// **RGB-family override** (`spec/01` §3.1,
+    /// `magicyuv.dll!0x69b9769c`–`0x69b976bb`): after the
+    /// OR-accumulation, the encoder tests
+    /// `1 << (format_byte - 0x67)` against the keep-mask
+    /// `0xf1903f` (the YUV/Gray-family format bytes) and, for any
+    /// format byte outside that set — every native RGB / RGBA
+    /// FOURCC at every bit depth, with `0x65` / `0x66` reaching
+    /// the override via the out-of-range fallthrough — clears
+    /// flags bit 2 again. An authored `full_range = true` is
+    /// therefore only observable on the wire for YUV / Gray
+    /// FOURCCs; RGB-family headers always carry a clear bit 2,
+    /// matching the v2.4.2 encoder byte-for-byte.
     pub full_range: bool,
     /// **Deprecated, kept for source compatibility.** When `strategy`
     /// is `Fixed(_)`, this field is ignored. Callers should set
@@ -1838,6 +1851,21 @@ fn assemble_frame(
     out
 }
 
+/// `spec/01` §3.1 flags-override keep-mask. The v2.4.2 encoder's
+/// post-accumulation override at
+/// `magicyuv.dll!0x69b9769c`–`0x69b976bb` builds the bit
+/// `1 << (format_byte - 0x67)` and tests it against this mask.
+/// Decoded per the spec's `bit b ↔ format byte 0x67 + b` formula,
+/// the mask names the YUV/Gray-family format bytes
+/// `{0x67, 0x68, 0x69, 0x6a, 0x6b, 0x6c, 0x73, 0x76, 0x77, 0x7b,
+/// 0x7c, 0x7d, 0x7e}` — the set for which the override does **not**
+/// fire. Every other format byte — the RGB family inside
+/// `[0x67, 0x7e]`, plus `0x65` / `0x66` (8-bit RGB / RGBA) via the
+/// out-of-range fallthrough — takes the override path: flags bit 2
+/// (Full-range YUV, [`FLAG_FULL_RANGE`]) is cleared and the
+/// codec_variant byte at header `+0x0b` is forced to `0x02`.
+const FULL_RANGE_KEEP_MASK: u32 = 0x00f1_903f;
+
 #[allow(clippy::too_many_arguments)]
 fn write_header(
     rec: FourccRecord,
@@ -1879,6 +1907,24 @@ fn write_header(
     }
     if color_matrix != 1 {
         flags |= u32::from(color_matrix & 0x0f) << FLAG_COLOR_MATRIX_SHIFT;
+    }
+    // spec/01 §3.1 post-accumulation override
+    // (`magicyuv.dll!0x69b9769c`–`0x69b976bb`): compute the biased
+    // index `format_byte - 0x67`; when it exceeds `0x17` the
+    // override block is reached unconditionally (the unsigned
+    // compare's fallthrough is how 8-bit RGB `0x65` / `0x66` land
+    // there), otherwise the bit `1 << biased` is tested against
+    // `FULL_RANGE_KEEP_MASK` and the override fires when the bit is
+    // NOT in the mask (the RGB family). The override clears flags
+    // bit 2 (Full-range YUV) and forces the codec_variant byte at
+    // `+0x0b` to `0x02` — the latter is already unconditional above
+    // per the spec/01 §3.0 v2.4.2 clamp at
+    // `magicyuv.dll!0x69ba9060`, so only the flags-bit-2 clear is
+    // materialised here. YUV/Gray-family streams retain whatever
+    // bit 2 the OR-accumulation produced.
+    let biased = u32::from(rec.format_byte).wrapping_sub(0x67);
+    if biased > 0x17 || (1u32 << biased) & FULL_RANGE_KEEP_MASK == 0 {
+        flags &= !FLAG_FULL_RANGE;
     }
     out.extend_from_slice(&flags.to_le_bytes());
     out.extend_from_slice(&width.to_le_bytes());

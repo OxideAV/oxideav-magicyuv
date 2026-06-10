@@ -6,6 +6,48 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Encoder applies the `spec/01` §3.1 RGB-family flags override
+  (keep-mask `0xf1903f`).** The v2.4.2 encoder's post-accumulation
+  override at `magicyuv.dll!0x69b9769c`–`0x69b976bb` computes the
+  biased index `format_byte - 0x67`, reaches the override block
+  unconditionally when it exceeds `0x17` (the unsigned-compare
+  fallthrough that routes 8-bit RGB `0x65` / `0x66` there), and
+  otherwise tests `1 << biased` against the mask `0xf1903f` — the
+  YUV/Gray-family format bytes `{0x67, 0x68, 0x69, 0x6a, 0x6b,
+  0x6c, 0x73, 0x76, 0x77, 0x7b, 0x7c, 0x7d, 0x7e}` for which the
+  override does NOT fire. For every other format byte (the RGB
+  family at every bit depth) the override clears flags bit 2
+  (Full-range YUV, `FLAG_FULL_RANGE`) and forces the codec_variant
+  byte at header `+0x0b` to `0x02`. Our `write_header` previously
+  OR-ed `FLAG_FULL_RANGE` for any FOURCC when
+  `EncodeOptions::full_range` was set — a wire deviation from the
+  v2.4.2 encoder on RGB-family streams. The override is now
+  materialised after the OR-accumulation (the codec_variant force
+  is already unconditional per the `spec/01` §3.0 v2.4.2 clamp at
+  `magicyuv.dll!0x69ba9060`, so only the flags-bit-2 clear is new);
+  it touches bit 2 only — Interlaced (bit 1) and the ColorMatrix
+  nibble (bits 20..23) survive untouched, and the pixel bytes are
+  unaffected (the override is header-only; the lossless residual
+  path never reads the bit). Default-options output is
+  byte-identical to the prior round for every FOURCC
+  (`full_range` defaults to `false`, making the clear a no-op).
+  Two new family-sweep round-trip tests pin both sides: the
+  RGB-family sweep ({`0x65`, `0x66`, `0x6d`, `0x6e`, `0x6f`,
+  `0x70`, `0x71`, `0x72`} — all eight published RGB/RGBA FOURCCs)
+  authors all three flags knobs and asserts bit 2 is clear on the
+  wire while Interlaced + the ColorMatrix nibble survive and the
+  samples round-trip; the YUV/Gray sweep ({`0x67`, `0x68`, `0x69`,
+  `0x6a`, `0x6b`, `0x6c`, `0x73`, `0x76`, `0x7b`} — all nine
+  published keep-mask members) asserts the authored bit reaches
+  the wire and reads back via `is_full_range()`. The two existing
+  `full_range` knob tests moved from M8RG (an override-path FOURCC,
+  where asserting bit-2-set contradicted the spec) to M8Y0 (a
+  keep-mask member) in the same commit. Lib test count grew from
+  122 to 124 (119 under `--no-default-features`, 128 under
+  `--all-features`); clippy clean; fmt clean.
+
 ### Changed
 
 - **Batched Huffman-mode bit packer
