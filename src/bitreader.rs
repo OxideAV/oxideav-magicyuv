@@ -132,6 +132,62 @@ impl<'a> BitReader<'a> {
             }
         }
     }
+
+    /// Batched single-level canonical-Huffman decode into `out` as
+    /// `u8`. `primary` is the flat `1 << primary_bits` entry table
+    /// (low 8 b = code length, high 24 b = symbol) and every entry is
+    /// terminal (no redirect marker) — the caller guarantees `max_len ≤
+    /// primary_bits`, which holds for every native 8-bit FOURCC.
+    ///
+    /// Round-286 perf: the previous hot loop called `peek_bits` +
+    /// `consume` per pixel, and `consume` re-issued the `refill`
+    /// branch (`fill <= 56 && pos + 8 <= len`) on *every* symbol even
+    /// though a productive refill only happens once every
+    /// `floor(56 / primary_bits) ≈ 4-5` symbols (each 8-bit code is
+    /// ≤ `primary_bits ≤ 12` bits, and a fresh 64-bit accumulator
+    /// holds ≥ 56 valid bits). This method hoists the refill test out
+    /// of the per-symbol path: the local `acc`/`fill` live in
+    /// registers, a refill fires only when `fill < primary_bits`, and
+    /// the inner peek/consume is a pure shift pair. The byte cursor
+    /// and EOF zero-pad semantics are delegated to the existing
+    /// [`Self::refill`] (called via the field state), so the observable
+    /// bit stream is byte-identical to the per-symbol path. The slice
+    /// state (`acc`, `fill`, `pos`) is written back so a subsequent
+    /// reader call resumes exactly where this left off.
+    #[inline]
+    pub fn decode_single_level_into_u8(
+        &mut self,
+        primary: &[u32],
+        primary_bits: u32,
+        out: &mut [u8],
+    ) {
+        // Pull the bit state into locals so the inner loop keeps it in
+        // registers; only the refill path touches the `self` fields.
+        let mut acc = self.acc;
+        let mut fill = self.fill;
+        let shift = 64 - primary_bits;
+        for px in out.iter_mut() {
+            if fill < primary_bits {
+                // Spill back, refill via the canonical path (handles
+                // the 8-byte fast load + EOF zero-pad identically),
+                // then reload. `refill` raises `fill` to ≥ 57 (or
+                // zero-pads past EOF), so after it `fill ≥ primary_bits`.
+                self.acc = acc;
+                self.fill = fill;
+                self.refill();
+                acc = self.acc;
+                fill = self.fill;
+            }
+            let key = (acc >> shift) as usize;
+            let entry = primary[key];
+            let len = entry & 0xff;
+            acc <<= len;
+            fill -= len;
+            *px = (entry >> 8) as u8;
+        }
+        self.acc = acc;
+        self.fill = fill;
+    }
 }
 
 /// Batched unpacker for high-bit-depth raw-mode slice payloads

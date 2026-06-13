@@ -67,6 +67,38 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Batched single-level Huffman decode — per-symbol refill branch
+  hoisted out of the 8-bit hot loop (`BitReader::decode_single_level_into_u8`).**
+  The 8-bit decode hot loop in `HuffmanTable::decode_into_u8` ran
+  `peek_bits` + `consume` per symbol, and `consume` ends with an
+  unconditional `refill()` that re-evaluates its guard
+  (`fill <= 56 && pos + 8 <= len`) on *every* symbol — even though a
+  productive refill only happens once every `floor(56 / primary_bits)
+  ≈ 4-5` symbols (each native 8-bit code is ≤ `primary_bits ≤ 12`
+  bits, and a topped-up 64-bit accumulator holds ≥ 56 valid bits).
+  The new `BitReader::decode_single_level_into_u8` keeps `acc`/`fill`
+  in stack-local registers and only calls `refill` when
+  `fill < primary_bits`; the inner per-symbol step is a pure
+  shift-pair plus one table fetch with no function call, no `pos`
+  arithmetic, and no refill branch on the ~4-of-5 symbols that don't
+  need one. The byte cursor + EOF zero-pad behaviour is delegated to
+  the existing `refill` (via the spilled field state), so the
+  observable bit stream is byte-identical. Every native 8-bit FOURCC
+  (`max_len ≤ 12 = PRIMARY_BITS`) routes here; the 10/12/14-bit
+  two-level `decode_into_u16` path is untouched. Decode wall time
+  improves ~24-29 % on the three large 8-bit scenarios (M8RG/M8Y0
+  gradient 1280×720, M8G0 left 1920×1080) and ~13 % on the small-frame
+  8-bit Median scenario (`examples/profile_magicyuv decode`, 5-pass
+  interleaved A/B medians); the 10-bit M0RG scenario is flat (the
+  change does not touch its path). Bit-identity is pinned by the
+  existing `decode_into_u8_matches_per_pixel_decode` parity test plus
+  all 60 round-trip tests exercising 8-bit Huffman decode end-to-end,
+  and verified by a whole-corpus FNV-1a digest over the 102
+  `fuzz/corpus/decode_magicyuv/*.magy` fixtures' reconstructed plane
+  samples (`47e29dec388ea4ed` identical before and after, 102/102
+  decoded). Lib test count unchanged at 127 (default features), 131
+  under `--all-features`; clippy clean; fmt clean.
+
 - **Batched Huffman-mode bit packer
   (`encoder::pack_huffman_residuals_u{8,16}`) + packed
   `(code, length)` table (`PlaneHuff::packed: Vec<u32>`,

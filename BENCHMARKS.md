@@ -552,6 +552,63 @@ predictor × Huffman / Auto configuration end-to-end so the
 byte-for-byte equivalence is anchored at both the slice-payload
 level (parity tests) and the full-frame level (round-trip suite).
 
+### 14. Batched single-level Huffman decode — refill hoisted out of the per-symbol path
+
+The 8-bit decode hot loop in `decode_into_u8` walked
+`for px in out { let key = br.peek_bits(primary_bits); let entry =
+primary[key]; br.consume(entry & 0xff); *px = entry >> 8; }`.
+`BitReader::consume` ends with an unconditional `self.refill()`, and
+`refill` re-evaluates its guard (`fill <= 56 && pos + 8 <= len`) on
+**every symbol** — even though a *productive* refill only happens
+once every `floor(56 / primary_bits) ≈ 4-5` symbols (each native
+8-bit code is ≤ `primary_bits ≤ 12` bits and a topped-up 64-bit
+accumulator holds ≥ 56 valid bits). So ~4 of every 5 symbols paid a
+branch + a `pos + 8 <= len` bounds compute for a refill that did
+nothing.
+
+The new `BitReader::decode_single_level_into_u8` hoists the bit state
+(`acc`, `fill`) into stack locals and only calls `refill` when
+`fill < primary_bits`. The inner per-symbol step is then a pure
+shift-pair (`key = acc >> shift; acc <<= len; fill -= len`) with one
+table fetch and one cheap `fill < primary_bits` compare — no function
+call, no `pos` arithmetic, no refill branch on the ~4-of-5 symbols
+that don't need one. The byte cursor + EOF zero-pad path is delegated
+to the existing `refill` (called via the spilled field state), so the
+observable bit stream is byte-identical. Every native 8-bit FOURCC
+(`max_len ≤ 12 = PRIMARY_BITS`) routes here; the 10/12/14-bit
+two-level path (`decode_into_u16`) is untouched (it already has its
+own inlined two-level loop, opt-10, and its codes can reach 18 bits
+so the single-level fast path doesn't apply).
+
+Interleaved A/B on the Apple M-series host (`examples/profile_magicyuv
+decode 800`, 5-pass medians per side, baseline = pre-change HEAD built
+into a separate target):
+
+| Scenario                          | Baseline | After-14 | Δ        |
+| --------------------------------- | -------: | -------: | -------: |
+| dec M8RG / gradient / 1280×720    | 11.45 ms |  8.12 ms | -29.1 % |
+| dec M8Y0 / gradient / 1280×720    |  5.28 ms |  4.02 ms | -23.9 % |
+| dec M8G0 / left   / 1920×1080     |  6.86 ms |  5.02 ms | -26.8 % |
+| dec M0RG / gradient / 1280×720/10b| 13.90 ms | 13.90 ms |   0.0 % |
+| dec M8RG / median / 256×256       |  0.87 ms |  0.76 ms | -12.6 % |
+
+The three large 8-bit scenarios pick up 24-29 %; the small-frame
+8-bit Median scenario picks up ~13 % (its slice payloads are shorter,
+so the per-slice `BitReader::new` + table-build fixed costs are a
+larger share of the wall time and dilute the inner-loop saving). The
+10-bit M0RG scenario is flat to within noise, confirming the change
+is isolated to the 8-bit single-level path.
+
+**Bit-identity:** the new path is pinned by the existing
+`decode_into_u8_matches_per_pixel_decode` unit test (batched helper
+== per-pixel `decode()` on a real descriptor) plus all 60 round-trip
+tests that exercise 8-bit Huffman decode end-to-end. A whole-corpus
+FNV-1a digest over the 102 `fuzz/corpus/decode_magicyuv/*.magy`
+fixtures' reconstructed plane samples was `47e29dec388ea4ed` both
+before and after the change (102/102 decoded, identical). Lib test
+count unchanged at 127 (default features), 131 under `--all-features`;
+clippy + fmt clean.
+
 ## Round-N+1 candidates
 
 - **Predictor SIMD (Left only)** — Left has the simplest dependency

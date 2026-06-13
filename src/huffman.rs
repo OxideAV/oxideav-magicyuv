@@ -405,17 +405,17 @@ impl HuffmanTable {
         // below; they still benefit from the `#[inline(always)]` on
         // `decode` itself.
         if self.max_len <= self.primary_bits {
-            for px in out.iter_mut() {
-                let key = br.peek_bits(primary_bits) as usize;
-                let entry = primary[key];
-                // Length in low 8 bits, symbol in high 24. For the
-                // 8-bit single-level path every entry is terminal,
-                // so `(entry & 0xff)` is always the real code length
-                // (never the `REDIRECT_MARKER` sentinel).
-                let len = entry & 0xff;
-                br.consume(len);
-                *px = (entry >> 8) as u8;
-            }
+            // Round-286: hoist the per-symbol refill branch out of the
+            // hot loop. Every entry here is terminal (no redirect
+            // marker), so the batched single-level decoder peeks the
+            // top `primary_bits` and consumes the real code length per
+            // pixel, refilling only when `fill < primary_bits` (≈ once
+            // every 4-5 pixels for an 8-bit alphabet) instead of after
+            // every symbol. Same observable bit stream as the prior
+            // `peek_bits` + `consume` body — the EOF zero-pad + 8-byte
+            // fast load are delegated to `BitReader::refill` unchanged,
+            // pinned by `decode_into_u8_matches_per_pixel_decode`.
+            br.decode_single_level_into_u8(primary, primary_bits, out);
         } else {
             for px in out.iter_mut() {
                 *px = self.decode(br) as u8;
