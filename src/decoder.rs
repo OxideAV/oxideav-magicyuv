@@ -299,15 +299,32 @@ pub fn decode_into(bytes: &[u8], dst: &mut DecodedFrame) -> Result<()> {
         });
     }
     let per_slice_plane = &preamble[1..1 + total_slices];
+    // Honour the on-wire slice→plane mapping rather than assuming the
+    // plane-major ordering (`spec/02` §7.3: "A spec-compliant decoder
+    // MUST read `per_slice_plane_index` from the preamble (not assume
+    // the plane-major ordering); the encoder's freedom to interleave
+    // is preserved by the table format."). Each `per_slice_plane_index`
+    // byte names the plane its slice belongs to; the slice's
+    // within-plane index is the running count of slices already seen
+    // for that plane (so the k-th slice of plane p covers chroma /
+    // luma rows `[k*plane_slice_height, …)` per §6 regardless of where
+    // it sits in the global slice order). A plane index outside
+    // `[0, num_planes)`, or one that over-fills a plane's
+    // `slices_per_plane` quota, is rejected as malformed.
+    let mut slice_plane_map: Vec<(usize, usize)> = Vec::with_capacity(total_slices);
+    let mut plane_fill = vec![0usize; num_planes];
     for (s, &p) in per_slice_plane.iter().enumerate() {
-        let expected = (s / slices_per_plane) as u8;
-        if p != expected {
-            return Err(Error::Truncated {
-                what: "preamble per_slice_plane_index not plane-major",
-                needed: expected as usize,
-                have: p as usize,
+        let plane = p as usize;
+        if plane >= num_planes || plane_fill[plane] >= slices_per_plane {
+            return Err(Error::BadPlaneIndex {
+                slice_index: s,
+                got: plane,
+                num_planes,
             });
         }
+        let in_plane_idx = plane_fill[plane];
+        plane_fill[plane] += 1;
+        slice_plane_map.push((plane, in_plane_idx));
     }
 
     #[cfg(feature = "trace")]
@@ -391,7 +408,7 @@ pub fn decode_into(bytes: &[u8], dst: &mut DecodedFrame) -> Result<()> {
             &entries,
             table_off,
             total_slices,
-            slices_per_plane,
+            &slice_plane_map,
             &plane_geoms,
             &huff_tables,
             rec,
@@ -407,7 +424,7 @@ pub fn decode_into(bytes: &[u8], dst: &mut DecodedFrame) -> Result<()> {
             &entries,
             table_off,
             total_slices,
-            slices_per_plane,
+            &slice_plane_map,
             &plane_geoms,
             &huff_tables,
             rec,
@@ -468,7 +485,7 @@ fn decode_eight_bit(
     entries: &[u32],
     table_off: usize,
     total_slices: usize,
-    slices_per_plane: usize,
+    slice_plane_map: &[(usize, usize)],
     plane_geoms: &[PlaneGeom],
     huff_tables: &[HuffmanTable],
     rec: FourccRecord,
@@ -483,8 +500,10 @@ fn decode_eight_bit(
     let mut plane_bufs: Vec<Vec<u8>> = take_plane_bufs_u8(dst, plane_geoms);
 
     for s in 0..total_slices {
-        let plane = s / slices_per_plane;
-        let in_plane_idx = s % slices_per_plane;
+        // `(plane, in_plane_idx)` comes from the on-wire
+        // `per_slice_plane_index` mapping (spec/02 §7.3), not the
+        // assumed plane-major `s / slices_per_plane`.
+        let (plane, in_plane_idx) = slice_plane_map[s];
         let g = plane_geoms[plane];
         let row_start = in_plane_idx * g.plane_slice_height;
         let row_end = ((in_plane_idx + 1) * g.plane_slice_height).min(g.height);
@@ -581,7 +600,7 @@ fn decode_high_bit_depth(
     entries: &[u32],
     table_off: usize,
     total_slices: usize,
-    slices_per_plane: usize,
+    slice_plane_map: &[(usize, usize)],
     plane_geoms: &[PlaneGeom],
     huff_tables: &[HuffmanTable],
     rec: FourccRecord,
@@ -597,8 +616,9 @@ fn decode_high_bit_depth(
     let mut plane_bufs: Vec<Vec<u16>> = take_plane_bufs_u16(dst, plane_geoms);
 
     for s in 0..total_slices {
-        let plane = s / slices_per_plane;
-        let in_plane_idx = s % slices_per_plane;
+        // On-wire slice→plane mapping (spec/02 §7.3); see
+        // `decode_eight_bit` for the rationale.
+        let (plane, in_plane_idx) = slice_plane_map[s];
         let g = plane_geoms[plane];
         let row_start = in_plane_idx * g.plane_slice_height;
         let row_end = ((in_plane_idx + 1) * g.plane_slice_height).min(g.height);

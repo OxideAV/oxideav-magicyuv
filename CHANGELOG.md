@@ -8,6 +8,40 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Decoder honours the on-wire `per_slice_plane_index` mapping
+  instead of assuming plane-major order (`spec/02` §7.3).** The
+  preamble carries one `per_slice_plane_index` byte per slice naming
+  the plane that slice belongs to; `spec/02` §7.3 states a
+  spec-compliant decoder MUST read this mapping and NOT assume the
+  plane-major ordering the v2.4.2 encoder happens to emit ("the
+  encoder's freedom to interleave is preserved by the table format").
+  The decoder previously parsed the bytes only to *reject* any frame
+  whose mapping deviated from the computed `s / slices_per_plane`,
+  returning a `Truncated{"… not plane-major"}` error — so a valid
+  interleaved stream (e.g. round-robin slice ordering across planes
+  for parallel emit) was refused. The slice loop now derives each
+  slice's `(plane, in_plane_idx)` from the mapping byte plus a running
+  per-plane appearance counter: the k-th slice naming plane `p` covers
+  plane `p`'s row block `[k·plane_slice_height, …)` regardless of its
+  position in the global slice order. The file-offset bounds still
+  come from the slice table in global order (`entry[s+1]..entry[s+2]`),
+  so payload extraction is unchanged. A mapping byte outside
+  `[0, num_planes)` or one that over-fills a plane's
+  `slices_per_plane` quota is rejected via the new
+  `Error::BadPlaneIndex` variant (replacing the prior plane-major
+  rejection). Plane-major streams — every frame the bundled encoder
+  produces — decode byte-identically to before (the running counter
+  reproduces `s / slices_per_plane` exactly for plane-major input).
+  Six new lib tests (`per_slice_plane_index_ordering` module) re-emit
+  encoder-produced frames with permuted global slice orders that keep
+  each plane's within-plane slice order — round-robin RGB-8bit /
+  YUV-4:2:0-8bit / RGB-10bit, reverse-plane-order RGBA-8bit — and
+  assert pixel-exact decode parity with the plane-major source, plus
+  out-of-range and over-quota mapping bytes both surfacing
+  `BadPlaneIndex`. Lib test count 127 → 133 (128 under
+  `--no-default-features`, 137 under `--all-features`); clippy clean;
+  fmt clean.
+
 - **Huffman descriptor run-length writer caps runs at 255 reps
   (count byte `0xfe`) per `spec/05` §1.5 / §10 Q3.** The encoder's
   `encode_descriptor` previously allowed a single two-byte run to

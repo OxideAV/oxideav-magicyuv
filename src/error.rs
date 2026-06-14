@@ -109,6 +109,21 @@ pub enum Error {
         expected: usize,
         got: usize,
     },
+    /// A `per_slice_plane_index` byte in the preamble named a plane
+    /// outside `[0, num_planes)`, or named one plane more times than
+    /// the plane has slices (`spec/02` §7.3). The on-wire slice→plane
+    /// mapping must address each plane exactly `slices_per_plane`
+    /// times; the decoder honours an arbitrary (e.g. interleaved)
+    /// ordering but rejects a mapping that over- or under-fills a
+    /// plane's slice quota.
+    BadPlaneIndex {
+        /// Slice index inside the frame whose mapping byte was bad.
+        slice_index: usize,
+        /// The plane index the preamble named for this slice.
+        got: usize,
+        /// Number of planes the format byte implies.
+        num_planes: usize,
+    },
 }
 
 impl fmt::Display for Error {
@@ -179,6 +194,14 @@ impl fmt::Display for Error {
             } => write!(
                 f,
                 "oxideav-magicyuv: encoder plane {plane} length {got} != expected {expected}"
+            ),
+            Self::BadPlaneIndex {
+                slice_index,
+                got,
+                num_planes,
+            } => write!(
+                f,
+                "oxideav-magicyuv: slice {slice_index} per_slice_plane_index {got} invalid for {num_planes}-plane frame (spec/02 §7.3)"
             ),
         }
     }

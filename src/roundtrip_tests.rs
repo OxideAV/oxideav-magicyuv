@@ -2184,3 +2184,255 @@ fn encode_options_defaults_clear_full_range() {
         "default options must emit a clear FLAG_FULL_RANGE bit",
     );
 }
+
+/// Decoder honours an arbitrary on-wire `per_slice_plane_index`
+/// ordering, not just the plane-major one the vendor encoder emits
+/// (`spec/02` §7.3: "A spec-compliant decoder MUST read
+/// `per_slice_plane_index` from the preamble (not assume the
+/// plane-major ordering); the encoder's freedom to interleave is
+/// preserved by the table format.").
+///
+/// Our encoder only ever writes plane-major frames, so to exercise the
+/// interleaved path we take a plane-major frame, parse out its slice
+/// table / preamble / payloads, and re-serialise it with the global
+/// slice order permuted (and the `per_slice_plane_index` bytes +
+/// slice-table entries kept consistent with the new order). The
+/// permuted frame must decode to the exact same planes.
+mod per_slice_plane_index_ordering {
+    use super::*;
+    use crate::decoder::decode_frame;
+
+    /// Layout of a parsed plane-major v7 frame, decomposed so the test
+    /// can re-emit it with the global slice order permuted.
+    struct ParsedFrame {
+        header: Vec<u8>,           // 32-byte header, verbatim
+        plane_count_byte: u8,      // preamble[0]
+        huff_descriptors: Vec<u8>, // preamble[1 + total_slices ..]
+        // For each global slice in its original (plane-major) order:
+        slice_plane: Vec<u8>,        // the per_slice_plane_index byte
+        slice_payload: Vec<Vec<u8>>, // the raw slice bytes (prefix + body)
+        total_slices: usize,
+    }
+
+    fn parse(bytes: &[u8], total_slices: usize) -> ParsedFrame {
+        let header = bytes[..0x20].to_vec();
+        let table_off = 0x20usize;
+        let n = total_slices + 1;
+        let mut entries = Vec::with_capacity(n);
+        for i in 0..n {
+            let o = table_off + 4 * i;
+            entries.push(u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap()) as usize);
+        }
+        let table_bytes = 4 * n;
+        let preamble_start = table_off + table_bytes;
+        let preamble_end = entries[1] + table_off;
+        let preamble = &bytes[preamble_start..preamble_end];
+        let plane_count_byte = preamble[0];
+        let slice_plane = preamble[1..1 + total_slices].to_vec();
+        let huff_descriptors = preamble[1 + total_slices..].to_vec();
+
+        let mut slice_payload = Vec::with_capacity(total_slices);
+        for s in 0..total_slices {
+            let start = entries[s + 1] + table_off;
+            let end = if s + 1 < total_slices {
+                entries[s + 2] + table_off
+            } else {
+                // Last slice runs to end-of-file; strip the single
+                // even-byte pad if present so the re-emit recomputes it.
+                bytes.len()
+            };
+            slice_payload.push(bytes[start..end].to_vec());
+        }
+        ParsedFrame {
+            header,
+            plane_count_byte,
+            huff_descriptors,
+            slice_plane,
+            slice_payload,
+            total_slices,
+        }
+    }
+
+    /// Re-serialise the frame emitting its global slices in `order`
+    /// (a permutation of `0..total_slices`). The `per_slice_plane_index`
+    /// byte travels with its slice, so the decoder's running per-plane
+    /// counter still reconstructs each slice's in-plane position.
+    fn reemit_permuted(pf: &ParsedFrame, order: &[usize]) -> Vec<u8> {
+        assert_eq!(order.len(), pf.total_slices);
+        let n = pf.total_slices + 1;
+        let table_bytes = 4 * n;
+
+        // Preamble in the new order.
+        let mut preamble = Vec::new();
+        preamble.push(pf.plane_count_byte);
+        for &s in order {
+            preamble.push(pf.slice_plane[s]);
+        }
+        preamble.extend_from_slice(&pf.huff_descriptors);
+
+        // Slice-table entries: entry[0]=entry[1]=preamble end; each
+        // subsequent entry is the running payload offset.
+        let mut entries = vec![0u32; n];
+        let mut off = table_bytes + preamble.len();
+        entries[0] = off as u32;
+        entries[1] = off as u32;
+        for (i, &s) in order.iter().enumerate() {
+            entries[i + 1] = off as u32;
+            off += pf.slice_payload[s].len();
+        }
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&pf.header);
+        for &e in &entries {
+            out.extend_from_slice(&e.to_le_bytes());
+        }
+        out.extend_from_slice(&preamble);
+        for &s in order {
+            out.extend_from_slice(&pf.slice_payload[s]);
+        }
+        if out.len() % 2 == 1 {
+            out.push(0);
+        }
+        out
+    }
+
+    fn run_case(fb: u8, w: u32, h: u32, sh: u32, pattern: u8, order: &[usize]) {
+        let rec = lookup(fb).unwrap();
+        let planes_in: Vec<PlaneInput> = if rec.is_high_bit_depth() {
+            make_planes_u16(rec, w, h, pattern)
+        } else {
+            make_planes_u8(rec, w, h, pattern)
+        };
+        let bytes = encode_frame(
+            rec,
+            w,
+            h,
+            sh,
+            planes_in.clone(),
+            EncodeOptions::fixed(PredictorKind::Median),
+        )
+        .expect("encode plane-major frame");
+
+        // Reference decode of the unmodified plane-major frame.
+        let ref_dec = decode_frame(&bytes).expect("decode plane-major frame");
+
+        let slices_per_plane = (h as usize).div_ceil(sh as usize);
+        let total_slices = rec.planes as usize * slices_per_plane;
+        let pf = parse(&bytes, total_slices);
+
+        // Sanity: the original is plane-major (s / slices_per_plane).
+        for s in 0..total_slices {
+            assert_eq!(pf.slice_plane[s] as usize, s / slices_per_plane);
+        }
+
+        let permuted = reemit_permuted(&pf, order);
+        let perm_dec =
+            decode_frame(&permuted).expect("decode interleaved per_slice_plane_index frame");
+
+        assert_eq!(perm_dec.planes.len(), ref_dec.planes.len());
+        assert!(
+            samples_eq_planes(&planes_in, &perm_dec.planes),
+            "interleaved-order decode must match the source pixels",
+        );
+        // And it must equal the plane-major decode plane-for-plane.
+        for (a, b) in perm_dec.planes.iter().zip(ref_dec.planes.iter()) {
+            match (&a.samples, &b.samples) {
+                (Samples::U8(x), Samples::U8(y)) => assert_eq!(x, y),
+                (Samples::U16(x), Samples::U16(y)) => assert_eq!(x, y),
+                _ => panic!("plane sample-type mismatch"),
+            }
+        }
+    }
+
+    #[test]
+    fn round_robin_interleave_rgb_8bit() {
+        // M8RG 8×8, slice_height 4 → 2 slices/plane × 3 planes = 6.
+        // Round-robin global order: p0s0,p1s0,p2s0,p0s1,p1s1,p2s1.
+        // In plane-major indices that is [0,2,4,1,3,5].
+        run_case(0x65, 8, 8, 4, 3, &[0, 2, 4, 1, 3, 5]);
+    }
+
+    #[test]
+    fn plane_reversed_interleave_rgba_8bit() {
+        // M8RA 8×8, slice_height 4 → 2 slices/plane × 4 planes = 8.
+        // Emit the planes in reverse plane order (3,2,1,0) while
+        // preserving each plane's within-plane slice order (slice 0
+        // before slice 1). The decoder's running per-plane counter
+        // must therefore still place plane p's k-th *appearance* at
+        // in-plane row block k. A permutation that reordered slices
+        // *within* a plane would change the pixel meaning and is not a
+        // valid interleaving — only the plane-level order is free.
+        run_case(0x66, 8, 8, 4, 5, &[6, 7, 4, 5, 2, 3, 0, 1]);
+    }
+
+    #[test]
+    fn round_robin_interleave_yuv420_8bit() {
+        // M8Y0 (4:2:0) 16×16, slice_height 8 → 2 slices/plane × 3 = 6.
+        // Chroma slices use a different in-plane row stride; the
+        // running per-plane counter must still place them correctly.
+        run_case(0x69, 16, 16, 8, 3, &[0, 2, 4, 1, 3, 5]);
+    }
+
+    #[test]
+    fn round_robin_interleave_rgb_10bit() {
+        // M0RG 8×8, slice_height 4 → 2 slices/plane × 3 planes = 6.
+        run_case(0x6d, 8, 8, 4, 3, &[0, 2, 4, 1, 3, 5]);
+    }
+
+    #[test]
+    fn out_of_range_plane_index_rejected() {
+        // Corrupt one per_slice_plane_index byte to name a 4th plane in
+        // a 3-plane frame; the decoder must reject it as malformed.
+        let rec = lookup(0x65).unwrap();
+        let (w, h, sh) = (8u32, 8u32, 4u32);
+        let planes = make_planes_u8(rec, w, h, 3);
+        let bytes = encode_frame(
+            rec,
+            w,
+            h,
+            sh,
+            planes,
+            EncodeOptions::fixed(PredictorKind::Left),
+        )
+        .unwrap();
+        // Preamble byte 1 is the first per_slice_plane_index byte:
+        // 0x20 + 4*(6+1) = 0x3c, +1 for plane_count → 0x3d.
+        let mut corrupt = bytes.clone();
+        let idx = 0x20 + 4 * (6 + 1) + 1;
+        corrupt[idx] = 3; // plane 3 does not exist (0..=2)
+        match decode_frame(&corrupt) {
+            Err(crate::error::Error::BadPlaneIndex { .. }) => {}
+            Err(e) => panic!("expected BadPlaneIndex, got {e:?}"),
+            Ok(_) => panic!("expected BadPlaneIndex, got Ok"),
+        }
+    }
+
+    #[test]
+    fn over_quota_plane_index_rejected() {
+        // Name plane 0 three times in a 2-slices-per-plane frame: the
+        // quota overflow must be rejected.
+        let rec = lookup(0x65).unwrap();
+        let (w, h, sh) = (8u32, 8u32, 4u32);
+        let planes = make_planes_u8(rec, w, h, 3);
+        let bytes = encode_frame(
+            rec,
+            w,
+            h,
+            sh,
+            planes,
+            EncodeOptions::fixed(PredictorKind::Left),
+        )
+        .unwrap();
+        let mut corrupt = bytes.clone();
+        let base = 0x20 + 4 * (6 + 1) + 1;
+        // Original plane-major bytes are 0 0 1 1 2 2; set slice 2 (the
+        // first plane-1 slice) to plane 0, giving 0 0 0 1 2 2 → plane 0
+        // appears 3× but only has 2 slices.
+        corrupt[base + 2] = 0;
+        match decode_frame(&corrupt) {
+            Err(crate::error::Error::BadPlaneIndex { .. }) => {}
+            Err(e) => panic!("expected BadPlaneIndex on quota overflow, got {e:?}"),
+            Ok(_) => panic!("expected BadPlaneIndex on quota overflow, got Ok"),
+        }
+    }
+}

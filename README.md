@@ -64,7 +64,7 @@ AVI is a container, not a codec — its demux/mux (single-RIFF AVI 1.0
 | Stage                  | Source                                |
 | ---------------------- | ------------------------------------- |
 | 32-byte v7 header      | spec/01 §3 (audit-corrected aux_byte / slice_height) |
-| Slice table + preamble | spec/02 §5..§7                        |
+| Slice table + preamble | spec/02 §5..§7 (decoder honours the on-wire `per_slice_plane_index`; arbitrary interleaved orderings decode, not just plane-major) |
 | Plane-major plane order| spec/03 §4..§6 (RGB wire order audit-corrected) |
 | Per-slice predictors   | spec/04 §4 (Left, Gradient, Median; modular 8-bit Median + standard JPEG-LS at 10/12/14-bit) |
 | Interlaced field-stride| spec/04 §5.1 round-2 (top neighbour = row r-2; first 2 rows raw) |
