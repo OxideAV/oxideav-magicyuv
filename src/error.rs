@@ -91,9 +91,12 @@ pub enum Error {
         /// Slice index inside the frame.
         slice_index: usize,
     },
-    /// Header dimensions don't divide evenly by the FOURCC's chroma
-    /// subsampling factor (`spec/03` §8.2). Round-2 conservative
-    /// rejection — the encoder currently disallows odd dimensions.
+    /// Header (decode) or requested (encode) dimensions don't divide
+    /// evenly by the FOURCC's chroma subsampling factor (`spec/03`
+    /// §8.2). The ceiling-vs-floor rounding rule for chroma planes at
+    /// odd resolutions is an unverified open question, so both the
+    /// decoder and [`crate::encode_frame`] conservatively reject the
+    /// ambiguous case rather than silently flooring `dim / factor`.
     OddDimensionForSubsampling {
         /// `width` or `height`.
         what: &'static str,

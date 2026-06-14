@@ -106,11 +106,13 @@ impl FrameHeader {
 
 impl FrameHeader {
     /// `true` if the header advertises interlaced field-stride
-    /// prediction (`spec/04` §5.1 round-2 note). Round 1 surfaces
-    /// the bit but the predictor's interlaced row-stride is
-    /// deferred — calls touching it return `Error::UnsupportedFormatByte`
-    /// equivalent (the decoder rejects rather than silently
-    /// mis-reconstructing).
+    /// prediction (`spec/04` §5.1 round-2 note). The decoder honours
+    /// the bit by doubling the predictor's top-neighbour row stride
+    /// (top of row `r` is row `r-2`; the first two rows of each slice
+    /// have no top neighbour), and the encoder emits the matching
+    /// field-stride=2 residuals when [`crate::EncodeOptions::interlaced`]
+    /// is set, so interlaced streams round-trip byte-for-byte across
+    /// every FOURCC / bit-depth tier.
     pub fn is_interlaced(&self) -> bool {
         (self.flags & FLAG_INTERLACED) != 0
     }

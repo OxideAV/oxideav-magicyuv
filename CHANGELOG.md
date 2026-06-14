@@ -8,6 +8,31 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`encode_frame` rejects odd dimensions that don't divide the
+  FOURCC's chroma subsampling factor (`spec/03` §8.2), symmetric with
+  the decoder.** The decoder has refused odd subsampled dimensions
+  since round 2 (the ceiling-vs-floor chroma rounding rule at odd
+  resolutions is an unverified open question in the spec), returning
+  `OddDimensionForSubsampling`. The encoder, however, silently floored
+  `width / sub_x` (resp. `height / sub_y`) in `plane_dims_for`, so an
+  odd-width 4:2:2 / odd-height 4:2:0 request either dropped the last
+  chroma column/row or — if the caller supplied a ceil-sized chroma
+  plane — failed with a confusing `EncoderInputMismatch`. Worse, when
+  it did succeed it produced a stream the decoder then rejected. The
+  encoder now performs the same `OddDimensionForSubsampling` check at
+  the top of `encode_frame`, before any plane-length validation, so
+  the two sides accept exactly the same dimension set. Even dimensions
+  (`ceil == floor`) are unaffected. The `OddDimensionForSubsampling`
+  doc comment, which claimed the encoder already disallowed odd
+  dimensions, is now accurate. Four tests cover odd-width / odd-height
+  rejection, the even-dimension round-trip, and encoder↔decoder
+  rejection symmetry across the subsampled FOURCCs.
+- **`FrameHeader::is_interlaced` doc comment corrected.** It claimed
+  interlaced prediction was deferred and that callers touching it
+  would get a rejection error; interlaced field-stride=2 prediction
+  has shipped on both the decoder and encoder for several rounds and
+  round-trips byte-for-byte. The comment now describes the actual
+  behaviour.
 - **Decoder honours the on-wire `per_slice_plane_index` mapping
   instead of assuming plane-major order (`spec/02` §7.3).** The
   preamble carries one `per_slice_plane_index` byte per slice naming

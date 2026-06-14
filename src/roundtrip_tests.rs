@@ -569,6 +569,158 @@ fn rejects_corrupt_predictor_id() {
     assert!(matches!(r, Err(crate::Error::BadPredictorId(0x04))));
 }
 
+#[test]
+fn encoder_rejects_odd_width_for_horizontal_subsampling() {
+    // M8Y2 (4:2:2, sub_x = 2, sub_y = 1): an odd width can't be
+    // floored to a chroma width without dropping the last column, and
+    // the ceiling-vs-floor rule is unverified (spec/03 §8.2). The
+    // encoder must refuse rather than silently produce a stream the
+    // decoder then rejects.
+    let rec = lookup_round1(0x68).unwrap();
+    assert_eq!(rec.sub_x, 2);
+    assert_eq!(rec.sub_y, 1);
+    // Width 5 is odd; height 4 is fine (sub_y = 1 never divides).
+    let r = encode_frame(
+        rec,
+        5,
+        4,
+        28,
+        // Sized however — the dimension guard fires before any plane
+        // length check, so empty plane vecs are sufficient.
+        vec![
+            PlaneInput::U8(Vec::new()),
+            PlaneInput::U8(Vec::new()),
+            PlaneInput::U8(Vec::new()),
+        ],
+        EncodeOptions::fixed(PredictorKind::Left),
+    );
+    assert!(matches!(
+        r,
+        Err(crate::Error::OddDimensionForSubsampling {
+            what: "width",
+            got: 5,
+            factor: 2,
+        })
+    ));
+}
+
+#[test]
+fn encoder_rejects_odd_height_for_vertical_subsampling() {
+    // M8Y0 (4:2:0, sub_x = 2, sub_y = 2): an odd height trips the
+    // sub_y guard. Width is even here so the failure is unambiguously
+    // the height check.
+    let rec = lookup_round1(0x69).unwrap();
+    assert_eq!(rec.sub_y, 2);
+    let r = encode_frame(
+        rec,
+        8,
+        7,
+        28,
+        vec![
+            PlaneInput::U8(Vec::new()),
+            PlaneInput::U8(Vec::new()),
+            PlaneInput::U8(Vec::new()),
+        ],
+        EncodeOptions::fixed(PredictorKind::Gradient),
+    );
+    assert!(matches!(
+        r,
+        Err(crate::Error::OddDimensionForSubsampling {
+            what: "height",
+            got: 7,
+            factor: 2,
+        })
+    ));
+}
+
+#[test]
+fn encoder_accepts_even_subsampled_dimensions() {
+    // The odd-dimension guard is inert for even dimensions (ceil ==
+    // floor): a 4:2:0 frame at even width/height still encodes and
+    // round-trips byte-for-byte.
+    let rec = lookup_round1(0x69).unwrap();
+    let planes = make_planes_u8(rec, 8, 8, 1);
+    let bytes = encode_frame(
+        rec,
+        8,
+        8,
+        28,
+        planes.clone(),
+        EncodeOptions::fixed(PredictorKind::Median),
+    )
+    .unwrap();
+    let frame = decode_frame(&bytes).unwrap();
+    assert_eq!(frame.planes.len(), 3);
+    // Luma is full-size; chroma is half-size in both axes.
+    assert_eq!((frame.planes[0].width, frame.planes[0].height), (8, 8));
+    assert_eq!((frame.planes[1].width, frame.planes[1].height), (4, 4));
+    assert_eq!((frame.planes[2].width, frame.planes[2].height), (4, 4));
+}
+
+#[test]
+fn encoder_and_decoder_reject_the_same_odd_dimensions() {
+    // The encoder's odd-dimension guard is symmetric with the
+    // decoder's: any (FOURCC, width, height) the encoder refuses, a
+    // hand-built header at those dimensions would also be refused by
+    // decode_frame. We exercise the subsampled FOURCCs at odd sizes
+    // and assert both sides return OddDimensionForSubsampling.
+    for (fb, w, h) in [
+        (0x67u8, 3, 4), // M8Y4 (4:4:4) — sub_x = sub_y = 1, never odd-rejected
+        (0x68, 3, 4),   // M8Y2 (4:2:2) — odd width rejected
+        (0x69, 4, 3),   // M8Y0 (4:2:0) — odd height rejected
+        (0x6a, 3, 4),   // M8YA (4:4:4:4) — sub = 1, never rejected
+    ] {
+        let rec = lookup_round1(fb).unwrap();
+        let n = rec.planes as usize;
+        let enc = encode_frame(
+            rec,
+            w,
+            h,
+            28,
+            vec![PlaneInput::U8(Vec::new()); n],
+            EncodeOptions::fixed(PredictorKind::Left),
+        );
+        let subsampled = rec.sub_x > 1 || rec.sub_y > 1;
+        let odd_for_sub = (rec.sub_x as u32 > 1 && w % rec.sub_x as u32 != 0)
+            || (rec.sub_y as u32 > 1 && h % rec.sub_y as u32 != 0);
+        if subsampled && odd_for_sub {
+            assert!(
+                matches!(enc, Err(crate::Error::OddDimensionForSubsampling { .. })),
+                "encoder must reject odd {:?} subsampled dims {w}x{h}",
+                rec.fourcc
+            );
+            // Hand-build a header at the same dims and confirm the
+            // decoder rejects identically.
+            let mut buf = vec![0u8; 32];
+            buf[0..4].copy_from_slice(b"MAGY");
+            buf[4..8].copy_from_slice(&32u32.to_le_bytes());
+            buf[8] = 7;
+            buf[9] = fb;
+            buf[10] = rec.aux_byte;
+            buf[11] = 0x02;
+            buf[16..20].copy_from_slice(&w.to_le_bytes());
+            buf[20..24].copy_from_slice(&h.to_le_bytes());
+            buf[24..28].copy_from_slice(&w.to_le_bytes());
+            buf[28..32].copy_from_slice(&28u32.to_le_bytes());
+            let dec = decode_frame(&buf);
+            assert!(
+                matches!(dec, Err(crate::Error::OddDimensionForSubsampling { .. })),
+                "decoder must reject the same odd {:?} dims {w}x{h}",
+                rec.fourcc
+            );
+        } else {
+            // Non-subsampled FOURCCs accept odd dims (encoder may then
+            // fail on plane-length mismatch, but never with the
+            // odd-dimension error).
+            assert!(
+                !matches!(enc, Err(crate::Error::OddDimensionForSubsampling { .. })),
+                "non-subsampled {:?} must not be odd-rejected",
+                rec.fourcc
+            );
+        }
+    }
+}
+
 // ─────────────────── round-2: trace emitter ───────────────────
 //
 // Trace tests share a process-global env var, so we serialise them

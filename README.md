@@ -10,7 +10,13 @@ M8Y4, M8Y2, M8Y0, M8YA, M8G0) and 10/12/14-bit (M0RG, M0RA, M2RG,
 M2RA, M4RG, M4RA, M0Y2, M0Y4, M0Y0, M0G0). Honours
 `flags & FLAG_INTERLACED` for field-stride=2 prediction (`spec/04`
 §5.1). The public encoder API (`encode_frame`) emits wire-format
-frames the decoder round-trips byte-for-byte. Encoder strategies:
+frames the decoder round-trips byte-for-byte. The encoder rejects
+odd dimensions that don't divide a subsampled FOURCC's chroma factor
+(`spec/03` §8.2) with the same `OddDimensionForSubsampling` error the
+decoder uses, so the two sides accept exactly the same dimension set
+(the ceiling-vs-floor chroma rounding rule at odd resolutions is an
+unverified open question; both sides refuse the ambiguous case rather
+than silently flooring). Encoder strategies:
 **fixed** Left / Gradient / Median (`PredictorStrategy::Fixed`),
 **Dynamic** per-slice predictor selection by minimum residual L1
 norm (`PredictorStrategy::Dynamic`, spec/04 §3), and per-slice
