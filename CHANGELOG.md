@@ -6,6 +6,29 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/OxideAV/oxideav-magicyuv/compare/v0.0.5...v0.0.6) - 2026-06-15
+
+### Other
+
+- lock in spec/02 §4+§6 chroma slice partition (even non-28 slice_height, partial last chroma slice)
+- reject odd subsampled dimensions, symmetric with decoder (spec/03 §8.2)
+- honour on-wire per_slice_plane_index ordering (spec/02 §7.3)
+- batched single-level Huffman decode hoists per-symbol refill out of 8-bit hot loop
+- cap Huffman descriptor RLE runs at 255 reps (spec/05 §1.5 / §10 Q3)
+- spec/01 §3.1 RGB-family flags override (keep-mask 0xf1903f clears FLAG_FULL_RANGE)
+- batched Huffman-mode bit packer + packed (code,length) table
+- drop release-plz.toml — use release-plz defaults across the workspace
+- full_range knob (spec/01 §3.1 FLAG_FULL_RANGE / registry +0x78)
+- ColorMatrix nibble knob (EncodeOptions::color_matrix → flags bits 20..23)
+- typed ColorMatrix nibble accessor + FLAG_COLOR_MATRIX_MASK/SHIFT constants
+- add huffman_descriptor target driving parse_lengths + HuffmanTable::build directly
+- batched raw-mode bit packer (one drain per pixel, hoisted state)
+- per-plane scratch reuse in build_slice_residuals_u{8,16}_into
+- BitWriter direct parity tests + r217 to_be_bytes drain candidate closed
+- batched raw-mode high-bit-depth unpacker (one refill per ~floor(56/bits) pixels)
+- profile_magicyuv samply-friendly flat-loop driver
+- encoder strategy × mode × interlaced matrix (Dynamic + Auto coverage)
+
 ### Tests
 
 - **Lock in the `spec/02` §4 + §6 chroma slice-partition rule for an
