@@ -117,6 +117,18 @@ impl<'a> BitReader<'a> {
         // Same byte-by-byte loop as before — preserves the exact
         // EOF-pad-with-zero semantics that integration tests
         // (and the trace lockstep) rely on.
+        //
+        // Past EOF we keep merging *zero* bytes (without advancing
+        // `pos`, which already sits at `data.len()`) until `fill > 56`,
+        // rather than stopping after a single pad byte. Zero bytes are
+        // free and don't change the observable bit stream — every
+        // consumer (`consume`, `decode_single_level_into_u8`, the
+        // two-level path) relies on `refill` raising `fill` to ≥ 57 so
+        // that a subsequent `fill -= len` for a code length `len ≤
+        // max_length ≤ primary_bits ≤ 18` can never underflow. Breaking
+        // after one EOF byte left `fill` as low as 8, so a single-level
+        // decode with `primary_bits = 12` and `len = 12` underflowed
+        // (`fill -= len` on `fill = 8`) on a truncated Huffman slice.
         while self.fill <= 56 {
             let byte = if self.pos < self.data.len() {
                 self.data[self.pos]
@@ -127,9 +139,8 @@ impl<'a> BitReader<'a> {
             self.fill += 8;
             if self.pos < self.data.len() {
                 self.pos += 1;
-            } else {
-                break;
             }
+            // else: stay at EOF, keep zero-padding until `fill > 56`.
         }
     }
 
@@ -304,6 +315,47 @@ mod tests {
         assert_eq!(br.read_bits(7), 0);
         // Past-EOF reads keep returning zero.
         assert_eq!(br.read_bits(16), 0);
+    }
+
+    #[test]
+    fn refill_past_eof_fills_accumulator_above_56() {
+        // Regression: the slow-path refill used to stop after merging a
+        // *single* zero byte at EOF (one `break`), leaving `fill` as low
+        // as 8 — below the ≥ 57 invariant every consumer relies on. A
+        // subsequent `fill -= len` for a 12-bit single-level code then
+        // underflowed. Drain the buffer to EOF, then assert one more
+        // refill raises `fill` past 56 instead of stopping at ~8.
+        let mut br = BitReader::new(&[0xff]);
+        // Consume the only real byte plus drive past EOF.
+        let _ = br.read_bits(8);
+        br.refill();
+        assert!(
+            br.fill > 56,
+            "refill at EOF must zero-pad `fill` above 56, got {}",
+            br.fill
+        );
+    }
+
+    #[test]
+    fn single_level_decode_no_underflow_on_truncated_input() {
+        // Regression for the `fill -= len` subtract-overflow at
+        // `bitreader.rs` line 185: a single-level 12-bit Huffman table
+        // (max code length = primary_bits = 12) decoding from a
+        // near-empty buffer must not panic. Before the EOF-pad fix the
+        // refill left `fill = 8 < 12`, and the 12-bit terminal entry's
+        // `len = 12` underflowed `fill`.
+        let primary_bits: u32 = 12;
+        // Flat 1<<12 table; every entry terminal with length 12, symbol
+        // 0x42 in the high bits — a degenerate all-one-leaf table is
+        // enough to trigger the longest possible consume per symbol.
+        let primary = vec![(0x42u32 << 8) | primary_bits; 1usize << primary_bits];
+        // Two input bytes (16 bits) but we decode 8 symbols × 12 bits =
+        // 96 bits, forcing repeated EOF refills.
+        let mut br = BitReader::new(&[0xab, 0xcd]);
+        let mut out = [0u8; 8];
+        br.decode_single_level_into_u8(&primary, primary_bits, &mut out);
+        // No panic == pass; every padded symbol resolves to the leaf.
+        assert!(out.iter().all(|&s| s == 0x42));
     }
 
     /// Reference implementation of `unpack_raw_bits_to_u16` built on
