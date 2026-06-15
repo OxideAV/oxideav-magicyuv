@@ -71,6 +71,7 @@ AVI is a container, not a codec — its demux/mux (single-RIFF AVI 1.0
 | ---------------------- | ------------------------------------- |
 | 32-byte v7 header      | spec/01 §3 (audit-corrected aux_byte / slice_height) |
 | Slice table + preamble | spec/02 §5..§7 (decoder honours the on-wire `per_slice_plane_index`; arbitrary interleaved orderings decode, not just plane-major) |
+| Chroma slice partition | spec/02 §4 + §6 (per-plane slice count from the **luma** row count `ceil(H / slice_height)`; chroma slice `s` covers rows `[s·slice_height/sub_y, (s+1)·slice_height/sub_y)` clamped to the chroma plane height — covered for an even non-28 `slice_height` with a partial last chroma slice) |
 | Plane-major plane order| spec/03 §4..§6 (RGB wire order audit-corrected) |
 | Per-slice predictors   | spec/04 §4 (Left, Gradient, Median; modular 8-bit Median + standard JPEG-LS at 10/12/14-bit) |
 | Interlaced field-stride| spec/04 §5.1 round-2 (top neighbour = row r-2; first 2 rows raw) |

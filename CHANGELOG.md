@@ -6,6 +6,23 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Tests
+
+- **Lock in the `spec/02` §4 + §6 chroma slice-partition rule for an
+  even, non-28 `slice_height` with a partial last chroma slice.** The
+  existing 4:2:0 roundtrip used the v2.4.2-constant `slice_height = 28`
+  (chroma per-slice height `28/2 = 14`, tiling cleanly); the new
+  `yuv_4_2_0_partial_chroma_last_slice_even_non28_slice_height` case
+  (M8Y0 64×54, `slice_height = 10`) makes the documented last-slice
+  `.min(chroma_height)` clamp load-bearing: the luma row count drives
+  `slices_per_plane = ceil(54/10) = 6`, while the 27-row chroma plane
+  is partitioned into rows [0,5) [5,10) [10,15) [15,20) [20,25)
+  [25,30→27) — six slices summing to the full chroma height with a
+  partial final slice. Covered across all three predictors (Left /
+  Gradient / Median) and both per-slice modes (Huffman / Raw); decoder
+  and encoder derive the partition identically through
+  `plane_geom` / `plane_dims_for`.
+
 ### Fixed
 
 - **`encode_frame` rejects odd dimensions that don't divide the

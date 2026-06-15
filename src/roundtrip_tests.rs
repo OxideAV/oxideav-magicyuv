@@ -387,6 +387,36 @@ fn yuv_4_2_2_with_32x16() {
     );
 }
 
+// spec/02 §4 (slice count) + §6 (chroma slice partition, lines
+// 386..401): for subsampled YUV the per-plane slice count is derived
+// from the **luma** row count — `slices_per_plane = ceil(H /
+// slice_height)` — and a chroma slice `s` covers chroma rows
+// `[s * slice_height/sub_y, (s+1) * slice_height/sub_y)`, clamped to
+// the chroma plane height. The constant-28 v2.4.2 case is exercised
+// by `yuv_4_2_0_with_64x32_three_planes`; this case uses an even
+// non-28 `slice_height` and a height whose chroma plane does NOT
+// tile evenly, so the documented last-slice `.min(chroma_height)`
+// clamp is load-bearing (without it the final chroma slice would
+// over-run or drop rows). M8Y0 (4:2:0, sub_y = 2): 64×54, luma
+// `slices_per_plane = ceil(54/10) = 6`; chroma height 27, chroma
+// per-slice height `10/2 = 5`, so chroma slices cover rows
+// [0,5) [5,10) [10,15) [15,20) [20,25) [25,30→27) — six slices
+// summing to the full 27 chroma rows with a partial last slice.
+#[test]
+fn yuv_4_2_0_partial_chroma_last_slice_even_non28_slice_height() {
+    let rec = lookup_round1(0x69).unwrap();
+    assert_eq!(rec.sub_y, 2);
+    for &p in &[
+        PredictorKind::Left,
+        PredictorKind::Gradient,
+        PredictorKind::Median,
+    ] {
+        for &mode in &[SliceMode::Huffman, SliceMode::Raw] {
+            roundtrip("M8Y0", rec, 64, 54, 10, p, mode, 5, false);
+        }
+    }
+}
+
 // ─────────────────── round-2: 10/12/14-bit FOURCCs ───────────────────
 
 #[test]
