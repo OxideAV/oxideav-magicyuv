@@ -6,6 +6,10 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Other
+
+- pin end-to-end rejection of reserved `predictor_id = 0x00` (spec/04 §1.2 + §7.3c malformed-prefix range), complementing the existing ≥0x04 case
+
 ## [0.0.6](https://github.com/OxideAV/oxideav-magicyuv/compare/v0.0.5...v0.0.6) - 2026-06-15
 
 ### Other

@@ -600,6 +600,32 @@ fn rejects_corrupt_predictor_id() {
 }
 
 #[test]
+fn rejects_zero_predictor_id() {
+    // spec/04 §1.2 + §7.3c: the only legal per-slice `predictor_id`
+    // values are 0x01 (Left), 0x02 (Gradient), 0x03 (Median). Value
+    // 0x00 — the natural result of a zeroed or truncated slice prefix
+    // — is explicitly listed alongside ≥0x04 as malformed and MUST be
+    // rejected. The companion `rejects_corrupt_predictor_id` covers the
+    // ≥0x04 half of that range; this pins the reserved-zero half so the
+    // defined rejection path can't regress to a silent mis-decode.
+    let rec = lookup_round1(0x6b).unwrap();
+    let pixels = vec![0u8; 16 * 16];
+    let mut bytes = encode_frame(
+        rec,
+        16,
+        16,
+        28,
+        vec![PlaneInput::U8(pixels)],
+        EncodeOptions::fixed(PredictorKind::Left),
+    )
+    .unwrap();
+    let entry1 = u32::from_le_bytes(bytes[36..40].try_into().unwrap()) as usize;
+    bytes[32 + entry1 + 1] = 0x00;
+    let r = decode_frame(&bytes);
+    assert!(matches!(r, Err(crate::Error::BadPredictorId(0x00))));
+}
+
+#[test]
 fn encoder_rejects_odd_width_for_horizontal_subsampling() {
     // M8Y2 (4:2:2, sub_x = 2, sub_y = 1): an odd width can't be
     // floored to a chroma width without dropping the last column, and
