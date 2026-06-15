@@ -5,188 +5,85 @@ Pure-Rust MagicYUV lossless video codec for the
 
 ## Status
 
-**Codec-only.** Decodes the full native FOURCC set: 8-bit (M8RG, M8RA,
-M8Y4, M8Y2, M8Y0, M8YA, M8G0) and 10/12/14-bit (M0RG, M0RA, M2RG,
-M2RA, M4RG, M4RA, M0Y2, M0Y4, M0Y0, M0G0). Honours
-`flags & FLAG_INTERLACED` for field-stride=2 prediction (`spec/04`
-§5.1). The public encoder API (`encode_frame`) emits wire-format
-frames the decoder round-trips byte-for-byte. The encoder rejects
-odd dimensions that don't divide a subsampled FOURCC's chroma factor
-(`spec/03` §8.2) with the same `OddDimensionForSubsampling` error the
-decoder uses, so the two sides accept exactly the same dimension set
-(the ceiling-vs-floor chroma rounding rule at odd resolutions is an
-unverified open question; both sides refuse the ambiguous case rather
-than silently flooring). Encoder strategies:
-**fixed** Left / Gradient / Median (`PredictorStrategy::Fixed`),
-**Dynamic** per-slice predictor selection by minimum residual L1
-norm (`PredictorStrategy::Dynamic`, spec/04 §3), and per-slice
-Huffman / raw fallback (`SliceMode::Auto`, spec/05 §6.2 —
-`(pixels * bits + 7) / 8` byte-budget). `EncodeOptions::dynamic_auto()`
-combines both for the spec/04 §3 + spec/05 §6.2 always-on
-configuration the v2.4.2 encoder ships with. The per-plane Huffman
-length descriptor is run-length-emitted with the vendor's
-`spec/05` §1.5 / §10 Q3 run cap: each two-byte run carries at most
-255 repetitions (count byte `0xfe`, reserving `0xff`), so a length
-that repeats `≥ 256` times — common on the high-bit-depth
-(10/12/14-bit, N ∈ {1024, 4096, 16384}) sparse plane descriptors —
-splits into successive `(0x80|v, 0xfe)` pairs (`01 89 fe 89 fe …`)
-byte-for-byte with the v2.4.2 encoder rather than emitting a single
-out-of-range run. All three
-`spec/01` §3.1 flags-dword knobs are surfaced as
-[`EncodeOptions`](https://docs.rs/oxideav-magicyuv/latest/oxideav_magicyuv/struct.EncodeOptions.html)
-fields routed through the encoder's OR-accumulator:
-`interlaced` (bit 1), `full_range` (bit 2, registry `+0x78`), and
-the four-bit `color_matrix` nibble (bits 20..23, registry `+0x68`).
-The encoder also applies the `spec/01` §3.1 post-accumulation
-RGB-family override (keep-mask `0xf1903f` over
-`format_byte - 0x67`): RGB / RGBA FOURCCs at every bit depth get
-flags bit 2 cleared on the wire regardless of the authored
-`full_range`, so the bit is only observable on YUV / Gray streams —
-matching the v2.4.2 encoder byte-for-byte. A `trace` Cargo feature
-surfaces a JSONL trace tape for the Auditor's lockstep harness; the
-`huff.used` field is a per-symbol `{length, code}` map per the
-audit/02 §4.2 forward spec, and `preamble_trailing.extra_bytes` is
-emitted as a JSON integer count per the spec/05 §10 Q6 +
-audit/00 §8.8 canonical schema (matching the Python ref's
-`frame.py:514`).
+**Codec-only** (MagicYUV is a video codec; AVI/MOV containers live in
+their own crates). Decoder + encoder, with byte-for-byte round-trip.
 
-The implementation is built against the strict-isolation clean-room
-workspace at
-[`docs/video/magicyuv/`](https://github.com/OxideAV/docs/tree/master/video/magicyuv).
-That workspace completed six Specifier rounds, two Auditor rounds,
-an Implementer-Python reference round, and three Validator rounds
-before this orphan reset. The Implementer in this repo reads only
-`spec/00..05` plus `tables/00-fourcc-table.csv` and
-`tables/01-predictor-table.csv` — no FFmpeg source, no proprietary
-binary, no Python reference source, no `old` branch.
+Decodes the full native FOURCC set: 8-bit (M8RG, M8RA, M8Y4, M8Y2,
+M8Y0, M8YA, M8G0) and 10/12/14-bit (M0RG, M0RA, M2RG, M2RA, M4RG,
+M4RA, M0Y2, M0Y4, M0Y0, M0G0). Honours `FLAG_INTERLACED` for
+field-stride prediction.
 
-AVI is a container, not a codec — its demux/mux (single-RIFF AVI 1.0
-+ OpenDML 2.0 multi-RIFF per `spec/06`) lives in
-[`oxideav-avi`](https://github.com/OxideAV/oxideav-avi), which uses
-`oxideav-magicyuv` as a dev-dep for end-to-end roundtrip coverage.
+The encoder emits wire-format frames the decoder round-trips
+byte-for-byte. Strategies:
+
+- **Fixed** Left / Gradient / Median predictors
+  (`PredictorStrategy::Fixed`).
+- **Dynamic** per-slice predictor selection by minimum residual L1
+  norm (`PredictorStrategy::Dynamic`).
+- Per-slice Huffman / raw fallback (`SliceMode::Auto`, by byte
+  budget). `EncodeOptions::dynamic_auto()` combines both.
+
+Both sides reject odd dimensions that don't divide a subsampled
+FOURCC's chroma factor with the same `OddDimensionForSubsampling`
+error, so they accept exactly the same dimension set. The
+flags-dword knobs `interlaced` (bit 1), `full_range` (bit 2), and the
+4-bit `color_matrix` nibble (bits 20..23) are surfaced as
+[`EncodeOptions`] fields and recovered via typed `FrameHeader`
+accessors.
 
 ## Pipeline
 
-| Stage                  | Source                                |
-| ---------------------- | ------------------------------------- |
-| 32-byte v7 header      | spec/01 §3 (audit-corrected aux_byte / slice_height) |
-| Slice table + preamble | spec/02 §5..§7 (decoder honours the on-wire `per_slice_plane_index`; arbitrary interleaved orderings decode, not just plane-major) |
-| Chroma slice partition | spec/02 §4 + §6 (per-plane slice count from the **luma** row count `ceil(H / slice_height)`; chroma slice `s` covers rows `[s·slice_height/sub_y, (s+1)·slice_height/sub_y)` clamped to the chroma plane height — covered for an even non-28 `slice_height` with a partial last chroma slice) |
-| Plane-major plane order| spec/03 §4..§6 (RGB wire order audit-corrected) |
-| Per-slice predictors   | spec/04 §4 (Left, Gradient, Median; modular 8-bit Median + standard JPEG-LS at 10/12/14-bit) |
-| Interlaced field-stride| spec/04 §5.1 round-2 (top neighbour = row r-2; first 2 rows raw) |
-| Per-plane Huffman      | spec/05 §1.1 (RLE descriptor)         |
-| Canonical-code build   | spec/05 §2.0 (longest-length-first cumulative — **NOT** RFC 1951; auditor round 2 correction) |
-| Raw-mode fallback      | spec/05 §4.1                           |
+| Stage                  | Notes                                         |
+| ---------------------- | --------------------------------------------- |
+| 32-byte v7 header      | parse + emit                                  |
+| Slice table + preamble | honours on-wire `per_slice_plane_index`       |
+| Chroma slice partition | per-plane slice count from luma row count     |
+| Per-slice predictors   | Left / Gradient / Median (modular 8-bit, JPEG-LS at 10/12/14-bit) |
+| Interlaced field-stride| top neighbour = row r-2; first 2 rows raw     |
+| Per-plane Huffman      | RLE descriptor                                |
+| Canonical-code build   | longest-length-first cumulative               |
+| Raw-mode fallback      | per-slice                                     |
 
 ## Public API
 
-- [`decode_frame`] — decode a single MAGY-prefixed frame's bytes.
-  Returns one [`DecodedPlane`] per native plane; sample storage is
-  `u8` for 8-bit FOURCCs and `u16` for 10/12/14-bit FOURCCs.
-- [`decode_into`] — streaming variant. Decodes into a caller-owned
-  `DecodedFrame`, re-using the per-plane `Vec` storage from the
-  previous call when geometry matches. Skips 4-7 `Vec` allocations
-  per frame (one per plane + the prior working copy of the G plane
-  used in RGB inter-plane decorrelation reversal — that working
-  copy is also gone from `decode_frame` itself now).
-- [`encode_frame`] — encode one frame from per-plane pixel buffers.
-  Driven by [`EncodeOptions`]; in addition to the predictor strategy
-  + Huffman/raw mode + interlaced switches that have shipped since
-  round 1, `EncodeOptions::color_matrix` (a 4-bit nibble mirroring
-  the v2.4.2 encoder's `ColorMatrix` registry value at context
-  offset `+0x68`) drives the flags-dword bits 20..23 emitted in
-  the on-wire header per `spec/01` §3.1's OR-accumulation logic.
-  The encoder honours the spec's matrix-skip sentinel (`color_matrix
-  == 1`) by bypassing the OR step, so the default-`1` value
-  preserves the round-1 behavioural contract while authoring any
-  other 0..=15 value lands the nibble in the flags dword for
-  recovery via
-  [`header::FrameHeader::color_matrix_nibble`]. The pixel bytes
-  round-trip byte-exact across the full 0..=15 range — the matrix
-  knob is a header-level annotation orthogonal to the lossless
-  residual path.
-- [`header::parse`] — standalone v7 header parser.
-- [`header::FrameHeader::is_interlaced`] /
-  [`header::FrameHeader::is_full_range`] /
-  [`header::FrameHeader::color_matrix_nibble`] — typed accessors
-  over the `flags` dword's three documented bit groups
-  (`spec/01` §3.1: bit 1 Interlaced / bit 2 Full-range YUV /
-  bits 20..23 ColorMatrix nibble, mask `0x00f00000`). The
-  ColorMatrix nibble is informational at the lossless codec
-  layer — the wire bytes are returned unchanged either way —
-  and downstream colour-conversion (the GUI exposes Rec.601 and
-  Rec.709; the wire layout reserves 16 entries) is the consumer.
-  Paired with the [`header::FLAG_INTERLACED`],
-  [`header::FLAG_FULL_RANGE`], [`header::FLAG_COLOR_MATRIX_MASK`],
-  and [`header::FLAG_COLOR_MATRIX_SHIFT`] public constants for
-  callers that need direct masking against `FrameHeader::flags`.
+- [`decode_frame`] — decode one MAGY-prefixed frame; returns one
+  [`DecodedPlane`] per native plane (`u8` for 8-bit, `u16` for
+  10/12/14-bit FOURCCs).
+- [`decode_into`] — streaming variant reusing caller-owned per-plane
+  storage when geometry matches.
+- [`encode_frame`] — encode one frame from per-plane pixel buffers,
+  driven by [`EncodeOptions`].
+- [`header::parse`] — standalone v7 header parser, plus
+  `is_interlaced` / `is_full_range` / `color_matrix_nibble` typed
+  accessors and the `FLAG_*` constants.
 - [`Error`], [`Result`] — crate-local error type.
-- `register(ctx)` (default-on `registry` feature) — wire the
-  decoder into `oxideav-core`'s codec registry.
-- `output_params(rec, w, h)` — `CodecParameters` (with
-  `tag = Some(CodecTag::fourcc(rec.fourcc))`) the encoder produces;
-  muxers consume this to write the right wire FourCC.
+- `register(ctx)` (default-on `registry` feature) — wire into
+  `oxideav-core`'s codec registry.
+- `output_params(rec, w, h)` — `CodecParameters` the encoder
+  produces, for muxers writing the wire FourCC.
 
 ## Cargo features
 
-- **`registry`** (default): wire the crate into `oxideav-core`'s
-  codec registry. Standalone builds (`--no-default-features`)
-  drop the `oxideav-core` dependency entirely.
+- **`registry`** (default): wire into `oxideav-core`'s codec
+  registry. `--no-default-features` drops the `oxideav-core`
+  dependency entirely.
 - **`trace`** (off): emit JSONL trace events to the path in
-  `OXIDEAV_MAGICYUV_TRACE_FILE` during decode. Used by the round-2
-  Auditor's `jq`-line-diff lockstep harness against the cleanroom
-  Python reference codec's `--trace` output.
+  `OXIDEAV_MAGICYUV_TRACE_FILE` during decode.
 
 ## Fuzzing
 
-Three [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz) harnesses
-live under [`fuzz/`](fuzz/), all three wired into the daily `fuzz.yml`
-workflow that splits a 1800-s total budget evenly across them.
+Three [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz)
+harnesses under [`fuzz/`](fuzz/), wired into the daily fuzz workflow:
 
-**`decode_magicyuv`** drives `decode_frame` on an arbitrary byte
-buffer, exercising the whole header → slice-table → preamble →
-per-plane Huffman → raw / Huffman slice payload → Left / Gradient /
-Median predictor inverse → RGB-decorrelation-reversal chain; the
-contract under test is that decode always *returns* a `Result` and
-never panics / overflows / indexes OOB. A header pre-screen skips
-declared rasters above a 16 MiB cap so a valid-but-enormous frame (a
-resource request, not a logic bug) doesn't register as an OOM false
-positive. Seed corpus spans every FOURCC family / bit-depth tier ×
-encode mode (Huffman / raw / Dynamic+Auto / interlaced). Latest local
-baseline: ~980 k exec in 60 s, zero crashes.
-
-**`encode_magicyuv`** drives `encode_frame(rec, w, h, slice_height,
-planes, options)` across the full parameter cube — 17 native v7
-FOURCCs (8 + 10/12/14-bit RGB / RGBA / YUV / YUVA / Gray) × 4
-predictor strategies (`Fixed{Left,Gradient,Median}` + Dynamic) × 3
-per-slice modes (Huffman / Raw / Auto) × interlaced on/off. Two
-contracts are checked: (a) the encoder never panics on hostile inputs,
-(b) every `Ok(bytes)` round-trips through `decode_frame` byte-for-byte
-(the encoder is forbidden from emitting wire bytes its own decoder
-rejects). Dimensions capped at 32×32 so the budget lands on encode
-logic — canonical-Huffman builder + length-limited Package-Merge
-fallback, slice-range arithmetic, RGB decorrelate, bit-pack/unpack
-symmetry, Dynamic per-slice predictor selection, Auto per-slice mode
-comparison — rather than allocator branches. Latest local baseline:
-~210 k exec / 60 s, ~418 k / 180 s, zero crashes.
-
-**`huffman_descriptor`** pushes arbitrary bytes straight into the
-`huffman::parse_lengths` + `HuffmanTable::build` pair, bypassing the
-32-byte header / slice-table / preamble framing the full-frame target
-walks first. Concentrates fuzz pressure on `spec/05` §1.1 run-length
-descriptor decode, `spec/05` §2.0 canonical-Huffman code construction
-(the audit-corrected longest-length-first cumulative accumulator +
-Kraft check, with `1u64 << len` at `len = max_length = 18` for the
-14-bit tier), and the two-level primary/secondary table arithmetic
-(`REDIRECT_MARKER`, per-prefix subtable allocation, residual-bit
-spread). Successful builds then drive `decode_into_u{8,16}` on the
-trailing fuzz bytes so the post-build BitReader peek/consume hot loop
-sees pressure too. Input layout: byte 0 = bit-depth tier selector
-(mod 4 → `n_symbols ∈ {256, 1024, 4096, 16384}`, `max_length ∈ {12,
-14, 16, 18}`), bytes 1-2 = descriptor cap (LE u16, capped at 16 KiB),
-bytes 3.. = descriptor + trailing decode payload. Latest local
-baseline: ~830 k exec / 16 s (~51 k exec/s), zero crashes.
+- **`decode_magicyuv`** — drives `decode_frame` on arbitrary bytes;
+  contract is decode always returns a `Result` and never
+  panics / overflows / indexes OOB.
+- **`encode_magicyuv`** — drives `encode_frame` across the full
+  parameter cube; asserts no panic plus byte-exact round-trip
+  through `decode_frame`.
+- **`huffman_descriptor`** — pushes arbitrary bytes into the
+  length-descriptor parse + canonical-Huffman build + two-level
+  table arithmetic.
 
 ```sh
 cd fuzz && cargo +nightly fuzz run decode_magicyuv -- -max_total_time=60
@@ -197,57 +94,26 @@ cd fuzz && cargo +nightly fuzz run huffman_descriptor -- -max_total_time=60
 ## Profiling
 
 [`examples/profile_magicyuv.rs`](examples/profile_magicyuv.rs) is a
-flat sampling-profiler driver. The Criterion benches and
-`examples/quick_bench.rs` are timing-oriented (Criterion's warm-up +
-estimator math show up in the profile; `quick_bench` runs each
-scenario for 10-30 iterations, too short for a sampling profiler to
-settle on the codec body). `profile_magicyuv` runs each scenario in a
-single flat loop with one `Instant`-pair around it, so `samply` /
-`cargo flamegraph` / `perf record` see the codec hot paths directly.
-
-Modes: `encode`, `decode`, `roundtrip`, `dynamic` (the
-`EncodeOptions::dynamic_auto()` v2.4.2 always-on combination per
-spec/04 §3 + spec/05 §6.2), `interlaced` (spec/04 §5.1 field-stride=2
-prediction), `all`.
-
-Scenarios cover the dominant cost-axes the workspace README rows
-track: the 8-bit primary-Huffman path (M8RG / M8Y0 1280×720 +
-M8G0 1920×1080), the two-level 10-bit Huffman path (M0RG 1280×720),
-and the modular-Median 8-bit path (M8RG 256×256). Inputs are the
-same `quick_bench` gradient + 3-bit xorshift noise so profile output
-and bench numbers reference the same residual histogram.
+flat sampling-profiler driver (modes: `encode`, `decode`,
+`roundtrip`, `dynamic`, `interlaced`, `all`). Criterion benches under
+[`benches/`](benches/) cover the timing-oriented hot paths.
 
 ```sh
 cargo build --release --example profile_magicyuv
-samply record -- ./target/release/examples/profile_magicyuv encode 500
 samply record -- ./target/release/examples/profile_magicyuv decode 2000
-samply record -- ./target/release/examples/profile_magicyuv dynamic 500
-cargo flamegraph --example profile_magicyuv -- decode 2000
 ```
 
 ## Why clean-room
 
-MagicYUV is a closed-source commercial codec by Pavel Zlatev / "ignus"
-(`magicyuv.com`). Reverse-engineering it from the proprietary binary
-is permitted under 17 U.S.C. §1201(f) (DMCA interoperability
-exemption), *Sega v. Accolade* / *Sony v. Connectix*, and EU Directive
-2009/24/EC Articles 5(3) + 6. The cleanroom workspace at
-`docs/video/magicyuv/` reverse-engineered the v7 layout from the
-proprietary `magicyuv.dll` directly; the Implementer in this repo is
-wall-isolated from any FFmpeg-derived material.
+MagicYUV is a closed-source commercial codec. The implementation is
+built solely against the strict-isolation clean-room workspace at
+[`docs/video/magicyuv/`](https://github.com/OxideAV/docs/tree/master/video/magicyuv)
+(spec + FOURCC / predictor tables) — no proprietary binary, no
+reference-encoder source, no third-party decoder source. Reverse
+engineering for interoperability is permitted under 17 U.S.C.
+§1201(f), *Sega v. Accolade* / *Sony v. Connectix*, and EU Directive
+2009/24/EC Articles 5(3) + 6.
 
-## Implementer allow-list
+## License
 
-- `docs/video/magicyuv/spec/00..05`
-- `docs/video/magicyuv/tables/00-fourcc-table.csv`
-- `docs/video/magicyuv/tables/01-predictor-table.csv`
-- `oxideav-core`'s public API
-
-## Implementer forbidden-input list
-
-- FFmpeg `libavcodec/magicyuv*.c` and any FFmpeg-derived material.
-- The retired `old` branch of this repository.
-- `docs/video/magicyuv/reference/binaries/` (proprietary binary).
-- `docs/video/magicyuv/reference-impl/python/` (cleanroom Python
-  reference codec).
-- Any third-party MagicYUV decoder source.
+MIT.
