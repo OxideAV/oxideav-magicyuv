@@ -8,6 +8,7 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Other
 
+- pin EOF/truncation robustness of the two-level (10/12/14-bit) `decode_into_u16` Huffman hot loop — sibling of the single-level truncation pin from the previous round: a truncated high-bit-depth Huffman slice must decode the full geometry-derived symbol count without panicking and zero-pad past EOF (spec/05 §3.3), with the batched two-level loop agreeing byte-for-byte with the per-pixel `decode()` reference on the same short buffer
 - fix subtract-with-overflow panic in the single-level Huffman decode hot loop on truncated slices: the slow-path EOF refill stopped after one zero pad byte (`fill` as low as 8), violating the ≥57-bit post-refill invariant a 12-bit code's `fill -= len` relies on; now zero-pads `fill` above 56 past EOF without advancing the cursor (spec/05 §3 zero-pad semantics unchanged)
 - extend the `decode_magicyuv` fuzz harness to also drive the streaming `decode_into` buffer-reuse path across two sub-frames through one reused `DecodedFrame` (geometry-match short-circuit, in-place `Vec::resize`, partial-decode-after-`Err` reuse)
 - pin end-to-end rejection of reserved `predictor_id = 0x00` (spec/04 §1.2 + §7.3c malformed-prefix range), complementing the existing ≥0x04 case

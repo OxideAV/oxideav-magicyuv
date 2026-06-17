@@ -839,6 +839,42 @@ mod tests {
         assert_eq!(batch_syms, chosen_syms);
     }
 
+    /// EOF / truncation robustness guard for the **two-level**
+    /// `decode_into_u16` hot loop (the 10/12/14-bit wire path). Sibling
+    /// of `bitreader::single_level_decode_no_underflow_on_truncated_input`
+    /// (commit `fb26d05`): that one pinned the single-level 8-bit path
+    /// against the EOF `fill -= len` subtract-overflow; the two-level
+    /// high-bit-depth path — which the v7 wire actually uses for every
+    /// 10/12/14-bit FOURCC — had no equivalent truncation pin. A
+    /// truncated slice (`spec/05` §3.3: the decoder must stop at the
+    /// geometry-derived residual count and zero-pad past EOF, §3) must
+    /// decode the full requested symbol count without panicking, and the
+    /// batched path must agree byte-for-byte with the per-pixel
+    /// `decode()` reference on the same short buffer.
+    #[test]
+    fn decode_into_u16_two_level_no_underflow_on_truncated_input() {
+        // 14-bit all-length-14 alphabet ⇒ max_len_used = 14 > 12, so the
+        // two-level redirect path runs (each symbol consumes
+        // primary_bits=12 then secondary_bits=2). Kraft = 16384·2^-14 = 1.
+        let lens = vec![14u8; 16384];
+        let table = HuffmanTable::build(lens, 0).expect("build two-level");
+        assert_eq!(table.max_len(), 14);
+        // Only 3 bytes (24 bits) of input, but decode 16 symbols ×
+        // 14 bits = 224 bits — forcing repeated EOF zero-pad refills
+        // inside the two-level branch (consume 12 + peek 2 + consume 2
+        // per symbol, each past EOF after the first ~1.7 symbols).
+        let bytes = [0xab_u8, 0xcd, 0xef];
+        let mut br_ref = BitReader::new(&bytes);
+        let ref_syms: Vec<u16> = (0..16).map(|_| table.decode(&mut br_ref) as u16).collect();
+        let mut br_batch = BitReader::new(&bytes);
+        let mut batch_syms = vec![0u16; 16];
+        // No panic == the `fill -= len` underflow guard holds; equality
+        // pins the batched two-level loop to the per-pixel reference's
+        // EOF zero-pad behaviour.
+        assert!(table.decode_into_u16(&mut br_batch, &mut batch_syms, 0x3fff));
+        assert_eq!(batch_syms, ref_syms);
+    }
+
     /// Round-191 parity guard for the *single-level* branch of the
     /// inlined `decode_into_u16` hot loop. A well-formed-but-shallow
     /// 10-bit alphabet whose realised `max_len_used` lands at
