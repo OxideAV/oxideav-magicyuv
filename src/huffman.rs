@@ -344,10 +344,14 @@ impl HuffmanTable {
 
     /// `true` if no symbol carries a positive length — i.e. the
     /// descriptor was entirely unused. v2.4.2 doesn't produce this
-    /// (every fixture has Kraft = 1.0 per `spec/05` §1.3) but a
-    /// well-formed-but-degenerate descriptor parses without raising
-    /// `HuffmanOverfull`. Calling `decode` on such a table will
-    /// never make progress, so the caller should reject.
+    /// (every fixture has Kraft = 1.0 per `spec/05` §1.3). As of the
+    /// completeness check in [`Self::build`], a degenerate
+    /// (`max_len == 0`) or under-full descriptor is rejected with
+    /// [`Error::HuffmanIncomplete`] before a table is ever returned,
+    /// so a built table is always complete and `is_empty()` is `false`
+    /// in practice. The accessor and the `max_len == 0` short-circuits
+    /// in [`Self::decode`] / [`Self::decode_into_u8`] are retained as
+    /// defence in depth.
     pub fn is_empty(&self) -> bool {
         self.max_len == 0
     }
@@ -386,11 +390,15 @@ impl HuffmanTable {
     /// inline so the compiler keeps the BitReader state (`acc`, `fill`,
     /// `pos`) in registers across iterations.
     ///
-    /// Returns early with `false` if `max_len == 0` (degenerate
-    /// all-unused descriptor — no progress can be made; the caller
-    /// has already validated this case is unreachable). The 8-bit
-    /// alphabet always has `max_len ≤ 12 = PRIMARY_BITS`, so the
-    /// secondary table is empty and this loop only takes the
+    /// Returns `false` if the descriptor was degenerate
+    /// (`max_len == 0`, all-unused) or if any decoded symbol indexed an
+    /// **unused-codespace** lookup slot — a zero-length entry left over
+    /// from an under-full descriptor (`spec/05` §2.1). In both cases no
+    /// progress can be made / the bitstream is invalid, and the caller
+    /// surfaces it as malformed input rather than emitting garbage. A
+    /// `true` return means every symbol decoded to a real `len ≥ 1`
+    /// code. The 8-bit alphabet always has `max_len ≤ 12 = PRIMARY_BITS`,
+    /// so the secondary table is empty and this loop only takes the
     /// single-level fast path.
     #[inline]
     pub fn decode_into_u8(&self, br: &mut BitReader<'_>, out: &mut [u8]) -> bool {
@@ -415,13 +423,57 @@ impl HuffmanTable {
             // `peek_bits` + `consume` body — the EOF zero-pad + 8-byte
             // fast load are delegated to `BitReader::refill` unchanged,
             // pinned by `decode_into_u8_matches_per_pixel_decode`.
-            br.decode_single_level_into_u8(primary, primary_bits, out);
+            br.decode_single_level_into_u8(primary, primary_bits, out)
         } else {
+            // Defensive two-level fallback (unreachable for native 8-bit
+            // FOURCCs, whose `max_len ≤ 12 = PRIMARY_BITS`). Fold the
+            // per-symbol unused-codespace check through `decode_checked`.
+            let mut all_valid = true;
             for px in out.iter_mut() {
-                *px = self.decode(br) as u8;
+                let (sym, valid) = self.decode_checked(br);
+                all_valid &= valid;
+                *px = sym as u8;
             }
+            all_valid
         }
-        true
+    }
+
+    /// Like [`Self::decode`] but also reports whether the symbol came
+    /// from a real `len ≥ 1` code. A `false` validity flag means the
+    /// peeked prefix landed on an unused-codespace slot (an under-full
+    /// descriptor's zero-init entry, `spec/05` §2.1) — the symbol is
+    /// meaningless and no bits were consumed. Kept separate from the
+    /// `#[inline(always)]` [`Self::decode`] so the validity bookkeeping
+    /// is opt-in and the per-pixel decode fast path stays branch-light.
+    #[inline]
+    fn decode_checked(&self, br: &mut BitReader<'_>) -> (u32, bool) {
+        if self.max_len == 0 {
+            return (0, false);
+        }
+        let key = br.peek_bits(self.primary_bits as u32) as usize;
+        let entry = self.primary[key];
+        let len = (entry & 0xff) as u8;
+        let sym_or_sub = entry >> 8;
+        if len == 0 {
+            // Unused-codespace slot in an under-full primary table.
+            return (sym_or_sub, false);
+        }
+        if len != REDIRECT_MARKER {
+            br.consume(len as u32);
+            (sym_or_sub, true)
+        } else {
+            br.consume(self.primary_bits as u32);
+            let secondary_bits = self.max_len - self.primary_bits;
+            let key2 = br.peek_bits(secondary_bits as u32) as usize;
+            let sub_entry = self.secondary[sym_or_sub as usize][key2];
+            let l_in_sub = (sub_entry & 0xff) as u8;
+            if l_in_sub == 0 {
+                // Unused-codespace slot in a secondary subtable.
+                return (sub_entry >> 8, false);
+            }
+            br.consume(l_in_sub as u32);
+            (sub_entry >> 8, true)
+        }
     }
 
     /// Decode `out.len()` symbols into `out` as `u16`, mask-ANDing each
@@ -445,6 +497,11 @@ impl HuffmanTable {
         }
         let primary_bits = self.primary_bits as u32;
         let primary = self.primary.as_slice();
+        // `all_valid` clears if any symbol indexes an unused-codespace
+        // (`len == 0`) slot — an under-full descriptor's zero-init entry
+        // (`spec/05` §2.1). The fold is a single AND per symbol so the
+        // hot loop stays branch-light; a complete book never trips it.
+        let mut all_valid = true;
         if self.max_len <= self.primary_bits {
             // Single-level fast path. The 10/12/14-bit alphabets in
             // practice hit `max_len > primary_bits` (the two-level
@@ -457,6 +514,7 @@ impl HuffmanTable {
                 let key = br.peek_bits(primary_bits) as usize;
                 let entry = primary[key];
                 let len = entry & 0xff;
+                all_valid &= len != 0;
                 br.consume(len);
                 *px = ((entry >> 8) as u16) & mask;
             }
@@ -469,7 +527,11 @@ impl HuffmanTable {
                 let key = br.peek_bits(primary_bits) as usize;
                 let entry = primary[key];
                 let len = entry & 0xff;
-                if len != REDIRECT_MARKER as u32 {
+                if len == 0 {
+                    // Unused-codespace slot in the primary table.
+                    all_valid = false;
+                    *px = ((entry >> 8) as u16) & mask;
+                } else if len != REDIRECT_MARKER as u32 {
                     br.consume(len);
                     *px = ((entry >> 8) as u16) & mask;
                 } else {
@@ -479,12 +541,13 @@ impl HuffmanTable {
                     let key2 = br.peek_bits(secondary_bits) as usize;
                     let sub_entry = secondary[sub_idx][key2];
                     let l_in_sub = sub_entry & 0xff;
+                    all_valid &= l_in_sub != 0;
                     br.consume(l_in_sub);
                     *px = ((sub_entry >> 8) as u16) & mask;
                 }
             }
         }
-        true
+        all_valid
     }
 
     /// Borrow the per-symbol length array (debug / cross-validation).
@@ -548,6 +611,66 @@ mod tests {
         lens[1] = 1;
         let r = HuffmanTable::build(lens, 0);
         assert!(matches!(r, Err(Error::HuffmanOverfull { plane: 0 })));
+    }
+
+    #[test]
+    fn build_accepts_underfull_book() {
+        // One length-1 symbol only: Kraft = 1/2 < 1 (under-full). The
+        // encoder legitimately produces this for a single-symbol plane
+        // (e.g. an all-zero-residual plane — the most common case), and
+        // the binary's constructor accepts it, so `build` must too. The
+        // unused codespace surfaces at *decode* time (see
+        // `decode_underfull_unused_slot_flags_invalid`), not at build.
+        let mut lens = vec![0u8; 256];
+        lens[0] = 1;
+        assert!(HuffmanTable::build(lens, 3).is_ok());
+    }
+
+    #[test]
+    fn decode_underfull_valid_path_makes_progress() {
+        // The encoder's single-symbol plane: symbol 0 length 1, code 0.
+        // A conformant stream of all-`0` bits decodes every pixel to
+        // symbol 0 and never peeks the unused `primary[1]` slot, so the
+        // batch decoder reports `all_valid == true`.
+        let mut lens = vec![0u8; 256];
+        lens[0] = 1;
+        let table = HuffmanTable::build(lens, 0).expect("build under-full");
+        let bytes = [0x00u8; 8];
+        let mut br = BitReader::new(&bytes);
+        let mut out = [0u8; 16];
+        assert!(table.decode_into_u8(&mut br, &mut out));
+        assert!(out.iter().all(|&s| s == 0));
+    }
+
+    #[test]
+    fn decode_underfull_unused_slot_flags_invalid() {
+        // Same single-symbol-length-1 under-full book. A `1` bit indexes
+        // the unused `primary[1]` slot (zero-init `(sym 0, len 0)`),
+        // which would consume no bits and silently mis-decode. The batch
+        // decoder must report `all_valid == false` so the decoder can
+        // reject the slice (`spec/05` §2.1 + §10 Q1) — the malformed-
+        // input hardening this round adds.
+        let mut lens = vec![0u8; 256];
+        lens[0] = 1;
+        let table = HuffmanTable::build(lens, 0).expect("build under-full");
+        let bytes = [0xffu8; 8]; // all `1` bits → always hits primary[1]
+        let mut br = BitReader::new(&bytes);
+        let mut out = [0u8; 16];
+        assert!(!table.decode_into_u8(&mut br, &mut out));
+    }
+
+    #[test]
+    fn decode_into_u16_underfull_unused_slot_flags_invalid() {
+        // u16 single-level path: 1024-symbol alphabet, only symbol 0 at
+        // length 10 (Kraft = 1/1024 < 1). All-`1` bits index an unused
+        // primary slot; the batch decoder reports invalid.
+        let mut lens = vec![0u8; 1024];
+        lens[0] = 10;
+        let table = HuffmanTable::build(lens, 0).expect("build under-full u16");
+        let bytes = [0xffu8; 16];
+        let mut br = BitReader::new(&bytes);
+        let mut out = [0u16; 16];
+        assert!(!table.decode_into_u16(&mut br, &mut out, 0x03ff));
     }
 
     #[test]

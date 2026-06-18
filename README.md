@@ -41,7 +41,8 @@ accessors.
 | Per-slice predictors   | Left / Gradient / Median (modular 8-bit, JPEG-LS at 10/12/14-bit) |
 | Interlaced field-stride| top neighbour = row r-2; first 2 rows raw     |
 | Per-plane Huffman      | RLE descriptor                                |
-| Canonical-code build   | longest-length-first cumulative               |
+| Canonical-code build   | longest-length-first cumulative; over-full books rejected at build, under-full (Kraft < 1) books accepted (encoder emits them for single-symbol planes) |
+| Under-full hardening   | a malformed slice peeking unused codespace → `HuffmanIncomplete` (spec/05 §2.1), not a silent mis-decode |
 | Raw-mode fallback      | per-slice                                     |
 
 ## Public API

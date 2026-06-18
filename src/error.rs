@@ -74,6 +74,25 @@ pub enum Error {
         /// canonical order).
         plane: usize,
     },
+    /// A per-plane Huffman slice's bitstream indexed an
+    /// **unused-codespace** slot of an *under-full* descriptor
+    /// (Σ 2⁻ᴸ < 1 — the assigned codes leave part of the codespace
+    /// unused), or the descriptor was the degenerate all-unused book
+    /// (`max_len == 0`). The decoder *accepts* under-full descriptors
+    /// at table-build time (the encoder legitimately produces them for
+    /// single-symbol planes, e.g. an all-zero-residual plane, and the
+    /// vendor binary's constructor accepts them too) — a conformant
+    /// stream only ever peeks the assigned codes' prefixes and never
+    /// trips this. But a malformed slice can peek into the unused
+    /// codespace, whose flat-table slot is the zero-init
+    /// `(symbol 0, length 0)` entry: decoding it would consume no bits
+    /// and silently mis-decode (`spec/05` §2.1 + §10 Q1). The decoder
+    /// surfaces that as this error rather than emitting garbage,
+    /// complementing the build-time [`Self::HuffmanOverfull`] guard.
+    HuffmanIncomplete {
+        /// 0-based plane index inside the frame.
+        plane: usize,
+    },
     /// Per-plane Huffman descriptor declared a code length above
     /// `max_length` for the plane's bit-depth tier (`spec/05` §1.1
     /// table). 8-bit caps at 12.
@@ -177,6 +196,10 @@ impl fmt::Display for Error {
             Self::HuffmanOverfull { plane } => write!(
                 f,
                 "oxideav-magicyuv: plane {plane} Huffman descriptor over-full (spec/05 §2.0.3)"
+            ),
+            Self::HuffmanIncomplete { plane } => write!(
+                f,
+                "oxideav-magicyuv: plane {plane} Huffman descriptor incomplete / under-full (spec/05 §2.1)"
             ),
             Self::HuffmanLengthExceedsMax { plane, got, max } => write!(
                 f,

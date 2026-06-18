@@ -165,18 +165,32 @@ impl<'a> BitReader<'a> {
     /// bit stream is byte-identical to the per-symbol path. The slice
     /// state (`acc`, `fill`, `pos`) is written back so a subsequent
     /// reader call resumes exactly where this left off.
+    ///
+    /// Returns `false` if the peeked prefix ever indexed an
+    /// **unused-codespace** slot (a zero-init `(symbol 0, length 0)`
+    /// entry left over from an under-full descriptor per `spec/05`
+    /// §2.1) — such a `len == 0` lookup would consume no bits and make
+    /// no progress, so the caller must surface it as malformed input
+    /// rather than emit garbage. A complete code book (`Kraft = 1`)
+    /// fills every slot with `len ≥ 1`, so the flag is always `true`
+    /// for conformant streams; an under-full-but-valid book (e.g. the
+    /// encoder's single-symbol all-zero-residual plane) only ever
+    /// peeks the one assigned code's prefix and likewise never trips
+    /// it. The check is a single `len == 0` OR fold per symbol — no
+    /// branch, no extra memory traffic in the hot path.
     #[inline]
     pub fn decode_single_level_into_u8(
         &mut self,
         primary: &[u32],
         primary_bits: u32,
         out: &mut [u8],
-    ) {
+    ) -> bool {
         // Pull the bit state into locals so the inner loop keeps it in
         // registers; only the refill path touches the `self` fields.
         let mut acc = self.acc;
         let mut fill = self.fill;
         let shift = 64 - primary_bits;
+        let mut all_valid = true;
         for px in out.iter_mut() {
             if fill < primary_bits {
                 // Spill back, refill via the canonical path (handles
@@ -192,12 +206,14 @@ impl<'a> BitReader<'a> {
             let key = (acc >> shift) as usize;
             let entry = primary[key];
             let len = entry & 0xff;
+            all_valid &= len != 0;
             acc <<= len;
             fill -= len;
             *px = (entry >> 8) as u8;
         }
         self.acc = acc;
         self.fill = fill;
+        all_valid
     }
 }
 

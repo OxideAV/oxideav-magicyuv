@@ -546,8 +546,13 @@ fn decode_eight_bit(
             // tight loop so the compiler keeps BitReader state in
             // registers across iterations. Same observable bit stream
             // as the per-symbol `decode` call (kept as the slow
-            // fallback inside `decode_into_u8`).
-            table.decode_into_u8(&mut br, buf);
+            // fallback inside `decode_into_u8`). A `false` return means
+            // a symbol indexed an unused-codespace slot of an under-full
+            // descriptor (`spec/05` §2.1) — reject the slice as
+            // malformed rather than emit garbage.
+            if !table.decode_into_u8(&mut br, buf) {
+                return Err(Error::HuffmanIncomplete { plane });
+            }
         }
 
         #[cfg(feature = "trace")]
@@ -664,7 +669,11 @@ fn decode_high_bit_depth(
             mode_str = "huffman";
             let mut br = BitReader::new(&payload[2..]);
             let table = &huff_tables[plane];
-            table.decode_into_u16(&mut br, buf, mask);
+            // `false` ⇒ a symbol hit an unused-codespace slot of an
+            // under-full descriptor (`spec/05` §2.1); reject as malformed.
+            if !table.decode_into_u16(&mut br, buf, mask) {
+                return Err(Error::HuffmanIncomplete { plane });
+            }
         }
 
         #[cfg(feature = "trace")]
