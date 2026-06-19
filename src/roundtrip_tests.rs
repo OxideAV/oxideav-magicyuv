@@ -98,6 +98,78 @@ fn pixel_for_u16(pattern: u8, plane: usize, r: usize, c: usize, mask: u16) -> u1
     (v as u16) & mask
 }
 
+/// Seeded SplitMix64-style scrambler over `(seed, plane, r, c)`. Used by
+/// the cartesian property sweep so each `(fourcc, predictor, mode, dims,
+/// seed)` cell gets a *distinct* pseudo-random pixel field rather than
+/// reusing one of the six fixed `pixel_for_*` patterns. The output is a
+/// reproducible function of its inputs (no global RNG state), so a sweep
+/// failure is bit-for-bit replayable from the printed seed.
+fn scramble(seed: u64, plane: usize, r: usize, c: usize) -> u64 {
+    let mut x = seed
+        ^ (plane as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        ^ (r as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9)
+        ^ (c as u64).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
+}
+
+fn make_planes_u8_seeded(rec: FourccRecord, width: u32, height: u32, seed: u64) -> Vec<PlaneInput> {
+    let w = width as usize;
+    let h = height as usize;
+    let num_planes = rec.planes as usize;
+    (0..num_planes)
+        .map(|p| {
+            let (sub_x, sub_y) = match rec.family {
+                Family::Yuv | Family::Yuva if p == 1 || p == 2 => {
+                    (rec.sub_x as usize, rec.sub_y as usize)
+                }
+                _ => (1usize, 1usize),
+            };
+            let pw = w / sub_x;
+            let ph = h / sub_y;
+            let mut buf = vec![0u8; pw * ph];
+            for r in 0..ph {
+                for c in 0..pw {
+                    buf[r * pw + c] = (scramble(seed, p, r, c) & 0xff) as u8;
+                }
+            }
+            PlaneInput::U8(buf)
+        })
+        .collect()
+}
+
+fn make_planes_u16_seeded(
+    rec: FourccRecord,
+    width: u32,
+    height: u32,
+    seed: u64,
+) -> Vec<PlaneInput> {
+    let w = width as usize;
+    let h = height as usize;
+    let num_planes = rec.planes as usize;
+    let mask = rec.sample_mask() as u16;
+    (0..num_planes)
+        .map(|p| {
+            let (sub_x, sub_y) = match rec.family {
+                Family::Yuv | Family::Yuva if p == 1 || p == 2 => {
+                    (rec.sub_x as usize, rec.sub_y as usize)
+                }
+                _ => (1usize, 1usize),
+            };
+            let pw = w / sub_x;
+            let ph = h / sub_y;
+            let mut buf = vec![0u16; pw * ph];
+            for r in 0..ph {
+                for c in 0..pw {
+                    buf[r * pw + c] = (scramble(seed, p, r, c) as u16) & mask;
+                }
+            }
+            PlaneInput::U16(buf)
+        })
+        .collect()
+}
+
 fn samples_eq_planes(planes_in: &[PlaneInput], decoded: &[crate::decoder::DecodedPlane]) -> bool {
     if planes_in.len() != decoded.len() {
         return false;
@@ -2391,6 +2463,125 @@ fn encode_options_defaults_clear_full_range() {
         0,
         "default options must emit a clear FLAG_FULL_RANGE bit",
     );
+}
+
+/// Seeded variant of [`roundtrip`]: builds the source planes from
+/// [`scramble`] (a distinct pseudo-random field per `(seed, plane, r,
+/// c)`) instead of one of the six fixed patterns, then asserts the
+/// encode→decode pipeline recovers them bit-for-bit. The seed is woven
+/// into every panic message so a sweep failure is replayable.
+#[allow(clippy::too_many_arguments)]
+fn roundtrip_seeded(
+    fourcc_label: &str,
+    rec: FourccRecord,
+    width: u32,
+    height: u32,
+    slice_height: u32,
+    predictor: PredictorKind,
+    mode: SliceMode,
+    seed: u64,
+    interlaced: bool,
+) {
+    let planes_in: Vec<PlaneInput> = if rec.is_high_bit_depth() {
+        make_planes_u16_seeded(rec, width, height, seed)
+    } else {
+        make_planes_u8_seeded(rec, width, height, seed)
+    };
+    let bytes = encode_frame(
+        rec,
+        width,
+        height,
+        slice_height,
+        planes_in.clone(),
+        EncodeOptions {
+            strategy: PredictorStrategy::Fixed(predictor),
+            predictor,
+            mode,
+            interlaced,
+            color_matrix: 1,
+            full_range: false,
+        },
+    )
+    .unwrap_or_else(|e| {
+        panic!(
+            "{fourcc_label} {width}x{height} sh={slice_height} {predictor:?} {mode:?} seed={seed:#018x} interlaced={interlaced}: encode failed: {e}"
+        )
+    });
+    let dec = decode_frame(&bytes).unwrap_or_else(|e| {
+        panic!(
+            "{fourcc_label} {width}x{height} sh={slice_height} {predictor:?} {mode:?} seed={seed:#018x} interlaced={interlaced}: decode failed: {e}"
+        )
+    });
+    assert_eq!(dec.width, width);
+    assert_eq!(dec.height, height);
+    assert!(
+        samples_eq_planes(&planes_in, &dec.planes),
+        "{fourcc_label} {width}x{height} sh={slice_height} {predictor:?} {mode:?} seed={seed:#018x} interlaced={interlaced}: plane mismatch"
+    );
+}
+
+/// Full cartesian property sweep proving bit-exact lossless recovery
+/// across the **entire** valid input space the codec advertises:
+/// every native FOURCC (all three 8-bit + 10/12/14-bit families) ×
+/// every predictor (Left / Gradient / Median) × every slice mode
+/// (Huffman / Raw) × a dimension/slice-height set chosen to stress
+/// single-slice, multi-slice, and partial-last-slice geometry × four
+/// distinct pseudo-random seeds.
+///
+/// This is intentionally exhaustive where the per-feature tests above
+/// are pinned: each of those fixes one dimension+pattern combo, so a
+/// regression that only manifests at, say, Median+Raw on a 4:2:0
+/// FOURCC with a partial last chroma slice and a non-zero residual
+/// distribution could slip between them. The seeded fields exercise
+/// the Huffman descriptor + canonical-code paths over high-entropy
+/// data (forcing near-flat codebooks) as well as the predictor LSB /
+/// sign handling over arbitrary residuals.
+///
+/// All combinations use even dimensions so they satisfy every
+/// subsampled FOURCC's chroma-divisibility constraint (spec/03 §8.2);
+/// odd-dimension rejection is covered separately by the
+/// `encoder_rejects_*` tests.
+#[test]
+fn cartesian_property_sweep_all_fourccs_predictors_modes() {
+    // (width, height, slice_height) triples:
+    //  - 16×16 / sh=28 → single slice per plane (sh > height).
+    //  - 32×64 / sh=28 → 3 slices/plane (64 = 28+28+8 partial last).
+    //  - 24×20 / sh=8  → 4:2:0 chroma = 12×10, last slice partial.
+    const DIMS: &[(u32, u32, u32)] = &[(16, 16, 28), (32, 64, 28), (24, 20, 8)];
+    const PREDICTORS: &[PredictorKind] = &[
+        PredictorKind::Left,
+        PredictorKind::Gradient,
+        PredictorKind::Median,
+    ];
+    const MODES: &[SliceMode] = &[SliceMode::Huffman, SliceMode::Raw];
+    const SEEDS: &[u64] = &[
+        0x0000_0000_0000_0001,
+        0xdead_beef_cafe_babe,
+        0x0123_4567_89ab_cdef,
+        0xffff_ffff_ffff_fffe,
+    ];
+
+    let all_fourccs = ROUND1_FOURCCS.iter().chain(ROUND2_HIGH_FOURCCS.iter());
+    let mut cases = 0usize;
+    for (label, fb) in all_fourccs {
+        let rec = lookup(*fb).unwrap_or_else(|| panic!("lookup {label} ({fb:#04x})"));
+        for &(w, h, sh) in DIMS {
+            for &pred in PREDICTORS {
+                for &mode in MODES {
+                    for (i, &seed) in SEEDS.iter().enumerate() {
+                        // Vary interlaced across seeds so both the
+                        // progressive and field-stride=2 prediction
+                        // paths are exercised for every FOURCC/predictor.
+                        let interlaced = i % 2 == 1 && h >= 4;
+                        roundtrip_seeded(label, rec, w, h, sh, pred, mode, seed, interlaced);
+                        cases += 1;
+                    }
+                }
+            }
+        }
+    }
+    // 17 fourccs × 3 dims × 3 predictors × 2 modes × 4 seeds.
+    assert_eq!(cases, 17 * 3 * 3 * 2 * 4, "sweep case count");
 }
 
 /// Decoder honours an arbitrary on-wire `per_slice_plane_index`
