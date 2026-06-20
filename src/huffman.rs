@@ -604,6 +604,52 @@ mod tests {
     }
 
     #[test]
+    fn build_spec_example_code_values_match_2_0_1_table() {
+        // Pin the *exact* assigned code values from the spec/05 §2.0.1
+        // worked-example table for descriptor `01 89 5d 08 89 9f`:
+        //
+        //   symbol 0           → code 1   (length 1)
+        //   symbol 95          → code 127 (length 8)
+        //   symbols 1..94      → codes 0..93  (length 9, index order)
+        //   symbols 96..255    → codes 94..253 (length 9, index order)
+        //
+        // This is a strict lock on the length-descending cumulative
+        // construction (spec/05 §2) vs RFC 1951 §3.2.2 (which would
+        // assign symbol 0 the code `0`, making an all-symbol-0 stream
+        // emit `00` bytes instead of the observed `ff` — see §2.0.2 /
+        // §7.1). The earlier `…assigns_code_1_to_symbol_0` test only
+        // checks decode output; this asserts the raw code table itself,
+        // so a future regression to RFC-1951 ordering can't hide behind
+        // a self-consistent encode→decode pair.
+        let desc = [0x01, 0x89, 0x5d, 0x08, 0x89, 0x9f];
+        let (lens, _) = parse_lengths(&desc, 256, 12, 0).unwrap();
+        let table = HuffmanTable::build(lens, 0).expect("build");
+        let codes = table.codes();
+        let lengths = table.lengths();
+
+        assert_eq!(lengths[0], 1, "symbol 0 length");
+        assert_eq!(codes[0], 1, "symbol 0 code (§2.0.1: code 1)");
+        assert_eq!(lengths[95], 8, "symbol 95 length");
+        assert_eq!(codes[95], 127, "symbol 95 code (§2.0.1: code 127)");
+
+        // The 254 length-9 symbols receive codes 0..253 in symbol-index
+        // order, skipping symbol 95.
+        let mut next = 0u32;
+        for s in 0..256 {
+            if s == 0 || s == 95 {
+                continue;
+            }
+            assert_eq!(lengths[s], 9, "symbol {s} length must be 9");
+            assert_eq!(
+                codes[s], next,
+                "symbol {s} length-9 code must be {next} (§2.0.1 index order)"
+            );
+            next += 1;
+        }
+        assert_eq!(next, 254, "exactly 254 length-9 symbols assigned");
+    }
+
+    #[test]
     fn build_rejects_overfull() {
         // Two length-1 symbols + 254 length-9 symbols → Kraft > 1.
         let mut lens = vec![9u8; 256];
