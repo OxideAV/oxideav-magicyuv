@@ -2835,3 +2835,157 @@ mod per_slice_plane_index_ordering {
         }
     }
 }
+
+/// Decode-against-proprietary-ground-truth fixtures.
+///
+/// Unlike the encode→decode self-roundtrips above (which can only
+/// catch a bug present on *one* side of our own pipeline), these
+/// tests feed the decoder a frame assembled **byte-for-byte from the
+/// hex documented in the clean-room spec** for streams emitted by the
+/// proprietary v2.4.2 encoder. A shared encoder+decoder bug (e.g. a
+/// wrong canonical-Huffman recipe, or RFC-1951 instead of the
+/// length-descending cumulative construction) would survive every
+/// self-roundtrip but is caught here, because the input bytes are the
+/// real encoder's output, not ours.
+///
+/// The canonical fixture is `m8rg_64x64_zero.bin` — a 64×64 solid-zero
+/// RGB frame whose complete 1670-byte (`0x686`) layout is pinned in
+/// `spec/02 §5.2` (header + slice table + preamble) and `spec/05 §7`
+/// (the all-`0xff` Huffman bitstream and why an all-zero residual
+/// plane encodes that way).
+mod spec_fixture_decode {
+    use crate::decoder::{decode_frame, Samples};
+
+    /// Assemble the exact bytes of `m8rg_64x64_zero.bin` from the hex
+    /// transcribed in `spec/02 §5.2` and `spec/05 §7`.
+    ///
+    /// Total = 1670 bytes (`0x686`):
+    /// - `0x00..0x20`  32-byte v7 header (`spec/01 §3` / `spec/02 §5.2`)
+    /// - `0x20..0x48`  slice table: 10 LE uint32 (`total_slices+1`)
+    /// - `0x48..0x64`  preamble: plane_count + per-slice plane index
+    ///   plus three 6-byte Huffman descriptors
+    /// - `0x64..0x686` nine slice payloads (each `00 01` prefix plus
+    ///   the all-`0xff` zero-residual bitstream; the final slice
+    ///   carries even-byte trailing pad, `spec/05 §3.5`)
+    fn build_m8rg_64x64_zero() -> Vec<u8> {
+        let mut f = Vec::with_capacity(0x686);
+
+        // Header, spec/02 §5.2 rows 0x0000..0x001f.
+        #[rustfmt::skip]
+        let header: [u8; 32] = [
+            0x4d, 0x41, 0x47, 0x59, 0x20, 0x00, 0x00, 0x00, // 'MAGY', header_size=0x20
+            0x07, 0x65, 0x0c, 0x02, 0x00, 0x00, 0x20, 0x00, // ver=7 fmt=M8RG aux=12 var=2 flags=0x00200000
+            0x40, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, // width=64 height=64
+            0x40, 0x00, 0x00, 0x00, 0x1c, 0x00, 0x00, 0x00, // width_extra=64 slice_height=28
+        ];
+        f.extend_from_slice(&header);
+
+        // Slice table: 10 LE uint32 entries, spec/02 §5.2.
+        let entries: [u32; 10] = [
+            0x44, 0x44, 0x126, 0x208, 0x24a, 0x32c, 0x40e, 0x450, 0x532, 0x614,
+        ];
+        for e in entries {
+            f.extend_from_slice(&e.to_le_bytes());
+        }
+
+        // Preamble (28 B), spec/02 §5.2 / spec/05 §7.
+        #[rustfmt::skip]
+        let preamble: [u8; 28] = [
+            0x03,                                           // plane_count = 3
+            0x00, 0x00, 0x00, 0x01, 0x01, 0x01, 0x02, 0x02, 0x02, // per-slice plane index
+            0x01, 0x89, 0x5d, 0x08, 0x89, 0x9f,             // plane 0 (G) Huffman descriptor
+            0x01, 0x89, 0x5d, 0x08, 0x89, 0x9f,             // plane 1 (B) descriptor
+            0x01, 0x89, 0x5d, 0x08, 0x89, 0x9f,             // plane 2 (R) descriptor
+        ];
+        f.extend_from_slice(&preamble);
+        assert_eq!(f.len(), 0x64, "preamble must end at file offset 0x64");
+
+        // Nine slice payloads. Each starts at `entry[k+1] + 0x20`; the
+        // boundaries (spec/02 §5.2) yield three slices per plane sized
+        // 226 / 226 / 66 bytes, except the final (plane-2 last) slice
+        // which is 82 bytes — 66 of content plus 16 even-byte pad
+        // bytes carried in the last slice (spec/05 §3.5).
+        //
+        // Content of every slice: `00 01` prefix (slice_flags=0,
+        // predictor_id=Left) followed by the all-`0xff` zero-residual
+        // Huffman bitstream (spec/05 §7.1: each zero residual is the
+        // length-1 code `1`, so `h_slice*w` one-bits → `0xff` bytes).
+        // Full slice (28 rows × 64 cols = 1792 px) = 224 bitstream
+        // bytes. Last-of-plane slice (8 rows × 64 = 512 px) = 64
+        // bitstream bytes.
+        let push_slice = |f: &mut Vec<u8>, bitstream_bytes: usize, pad: usize| {
+            f.push(0x00); // slice_flags
+            f.push(0x01); // predictor_id = Left
+            f.extend(std::iter::repeat_n(0xffu8, bitstream_bytes));
+            f.extend(std::iter::repeat_n(0x00u8, pad));
+        };
+        // Slices 0..8 in plane-major order (3 planes × 3 slices).
+        for plane in 0..3 {
+            push_slice(&mut f, 224, 0); // slice 0: rows 0..27
+            push_slice(&mut f, 224, 0); // slice 1: rows 28..55
+                                        // slice 2: rows 56..63 (8 rows). The plane-2 last slice
+                                        // carries 16 trailing pad bytes to make the frame even.
+            let pad = if plane == 2 { 16 } else { 0 };
+            push_slice(&mut f, 64, pad);
+        }
+
+        assert_eq!(f.len(), 0x686, "assembled fixture must be 1670 bytes");
+        f
+    }
+
+    /// The decoder must reconstruct the proprietary-encoded
+    /// `m8rg_64x64_zero.bin` into three 64×64 all-zero 8-bit planes.
+    ///
+    /// This exercises, end to end against ground-truth bytes:
+    /// header parse, slice-table walk, preamble plane-index +
+    /// descriptor parse, the length-descending canonical-Huffman
+    /// construction (spec/05 §2 — NOT RFC 1951), MSB-first bit
+    /// reading, the Left predictor, and RGB inter-plane decorrelation.
+    #[test]
+    fn decodes_spec_m8rg_64x64_zero_to_all_zero_planes() {
+        let bytes = build_m8rg_64x64_zero();
+        let frame = decode_frame(&bytes).expect("spec m8rg_64x64_zero.bin must decode");
+
+        assert_eq!(frame.width, 64, "width");
+        assert_eq!(frame.height, 64, "height");
+        assert_eq!(frame.planes.len(), 3, "M8RG has 3 planes (G,B,R)");
+
+        for (i, plane) in frame.planes.iter().enumerate() {
+            assert_eq!(plane.width, 64, "plane {i} width");
+            assert_eq!(plane.height, 64, "plane {i} height");
+            assert_eq!(plane.bit_depth, 8, "plane {i} bit depth");
+            match &plane.samples {
+                Samples::U8(v) => {
+                    assert_eq!(v.len(), 64 * 64, "plane {i} sample count");
+                    assert!(
+                        v.iter().all(|&s| s == 0),
+                        "plane {i} must reconstruct to all-zero \
+                         (proprietary all-zero RGB input)"
+                    );
+                }
+                Samples::U16(_) => panic!("M8RG plane {i} must be 8-bit U8"),
+            }
+        }
+    }
+
+    /// Sanity guard on the fixture builder: the header's typed
+    /// accessors recovered by our parser must match the documented
+    /// field values (spec/02 §5.2), so a future edit to the byte
+    /// table can't silently drift the geometry the decode test relies
+    /// on.
+    #[test]
+    fn spec_m8rg_fixture_header_fields_match_doc() {
+        let bytes = build_m8rg_64x64_zero();
+        let frame = decode_frame(&bytes).expect("decode");
+        assert_eq!(frame.header.format_byte, 0x65, "format_byte = M8RG");
+        assert_eq!(frame.header.aux_byte, 0x0c, "aux_byte = max_huff_len 12");
+        assert_eq!(frame.header.codec_variant, 0x02, "codec_variant = 2");
+        assert_eq!(frame.header.width, 64);
+        assert_eq!(frame.header.height, 64);
+        assert_eq!(frame.header.slice_height, 28, "v2.4.2 slice_height");
+        assert!(
+            !frame.header.is_interlaced(),
+            "fixture flags dword has the interlaced bit clear"
+        );
+    }
+}
