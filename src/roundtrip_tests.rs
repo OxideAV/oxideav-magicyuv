@@ -2988,4 +2988,134 @@ mod spec_fixture_decode {
             "fixture flags dword has the interlaced bit clear"
         );
     }
+
+    /// Assemble a 4×8 M8RG **interlaced raw-mode** frame whose wire
+    /// planes carry the proprietary-encoder residual bytes documented
+    /// in `spec/04 §5.1.1` (the doubled-predictor-row-stride worked
+    /// example).
+    ///
+    /// `spec/04 §5.1.1` states that for a 4×8 M8RG vertical-ramp
+    /// B-plane in raw mode with the Left predictor and the interlaced
+    /// flag set, the proprietary encoder stores the residual stream
+    /// `07 00 00 00  06 00 00 00  fe 00 00 00 ×6`. We place that exact
+    /// stream on **all three** wire planes (B', G, R'); each predicts
+    /// independently (prediction is per-plane), so each reconstructs to
+    /// the same field-interleaved vertical ramp.
+    ///
+    /// Layout (172 bytes, even — no pad needed):
+    /// - `0x00..0x20` header (M8RG, 4×8, interlaced bit set, sh=28)
+    /// - `0x20..0x30` slice table: 4 LE uint32 (total_slices=3)
+    /// - `0x30..0x46` preamble: plane_count + `00 01 02` index +
+    ///   three (unused, raw mode) valid Huffman descriptors
+    /// - `0x46..0xac` three raw slices, each `01 01` prefix
+    ///   (slice_flags raw-bit set, predictor_id=Left) + 32 residuals
+    fn build_m8rg_4x8_interlaced_raw() -> Vec<u8> {
+        let mut f = Vec::with_capacity(0xac);
+
+        // Header: M8RG (0x65), aux=12, codec_variant=2, flags interlaced
+        // bit 1 set (0x00000002), width=4, height=8, slice_height=28.
+        #[rustfmt::skip]
+        let header: [u8; 32] = [
+            0x4d, 0x41, 0x47, 0x59, 0x20, 0x00, 0x00, 0x00, // 'MAGY', header_size=0x20
+            0x07, 0x65, 0x0c, 0x02, 0x02, 0x00, 0x00, 0x00, // ver=7 fmt aux var; flags=0x02 (interlaced)
+            0x04, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, // width=4 height=8
+            0x04, 0x00, 0x00, 0x00, 0x1c, 0x00, 0x00, 0x00, // width_extra=4 slice_height=28
+        ];
+        f.extend_from_slice(&header);
+
+        // Slice table: total_slices = 3 (1 per plane). entry[0]==entry[1]
+        // = preamble end relative = 4*(3+1) + 22 = 0x26. Each raw slice
+        // is 34 bytes (2 prefix + 32 residuals).
+        let entries: [u32; 4] = [0x26, 0x26, 0x48, 0x6a];
+        for e in entries {
+            f.extend_from_slice(&e.to_le_bytes());
+        }
+
+        // Preamble: plane_count=3, per-slice plane index 00 01 02, then
+        // three valid 6-byte Huffman descriptors. The descriptors are
+        // never consulted (all slices are raw) but the decoder always
+        // parses them (spec/05 §6.2: the Huffman table is per-frame; raw
+        // is a per-slice fallback). Reuse the Kraft=1.0 descriptor from
+        // spec/05 §1.2.
+        #[rustfmt::skip]
+        let preamble: [u8; 22] = [
+            0x03,                                           // plane_count = 3
+            0x00, 0x01, 0x02,                               // per-slice plane index
+            0x01, 0x89, 0x5d, 0x08, 0x89, 0x9f,             // plane 0 descriptor
+            0x01, 0x89, 0x5d, 0x08, 0x89, 0x9f,             // plane 1 descriptor
+            0x01, 0x89, 0x5d, 0x08, 0x89, 0x9f,             // plane 2 descriptor
+        ];
+        f.extend_from_slice(&preamble);
+        assert_eq!(f.len(), 0x46, "preamble must end at file offset 0x46");
+
+        // Three raw slices (one per plane), each carrying the spec/04
+        // §5.1.1 residual stream. Raw prefix: slice_flags bit 0 = 1
+        // (raw), predictor_id = 0x01 (Left).
+        #[rustfmt::skip]
+        let residuals: [u8; 32] = [
+            0x07, 0x00, 0x00, 0x00, // row 0 (top-field first, no top)
+            0x06, 0x00, 0x00, 0x00, // row 1 (bottom-field first, no top)
+            0xfe, 0x00, 0x00, 0x00, // row 2: col0 = row0[0] + (-2)
+            0xfe, 0x00, 0x00, 0x00, // row 3: col0 = row1[0] + (-2)
+            0xfe, 0x00, 0x00, 0x00, // row 4
+            0xfe, 0x00, 0x00, 0x00, // row 5
+            0xfe, 0x00, 0x00, 0x00, // row 6
+            0xfe, 0x00, 0x00, 0x00, // row 7
+        ];
+        for _plane in 0..3 {
+            f.push(0x01); // slice_flags: raw
+            f.push(0x01); // predictor_id: Left
+            f.extend_from_slice(&residuals);
+        }
+
+        assert_eq!(f.len(), 0xac, "assembled fixture must be 172 bytes");
+        f
+    }
+
+    /// The interlaced (field-stride=2) Left predictor must reconstruct
+    /// the `spec/04 §5.1.1` residual stream into a field-interleaved
+    /// vertical ramp, end to end against proprietary-documented bytes.
+    ///
+    /// Per §5.1.1, each wire plane decodes to the column-constant ramp:
+    ///   row 0 = 7, row 1 = 6, row 2 = 5, … row 7 = 0
+    /// (top field even rows 7,5,3,1; bottom field odd rows 6,4,2,0 —
+    /// each `[r-2] - 2`). With all three wire planes (B', G, R')
+    /// carrying the same residuals, RGB decorrelation reversal
+    /// (B = B'+G, R = R'+G; spec/04 §5.1) yields output planes
+    /// (G, B, R) = (ramp, 2·ramp, 2·ramp).
+    ///
+    /// This is the crate's first ground-truth coverage of the
+    /// interlaced predictor path (previously only self-roundtrip).
+    #[test]
+    fn decodes_spec_interlaced_raw_to_field_ramp() {
+        let bytes = build_m8rg_4x8_interlaced_raw();
+        let frame = decode_frame(&bytes).expect("spec interlaced raw must decode");
+
+        assert_eq!(frame.width, 4);
+        assert_eq!(frame.height, 8);
+        assert!(frame.header.is_interlaced(), "header interlaced bit set");
+        assert_eq!(frame.planes.len(), 3);
+
+        // Per-plane wire reconstruction (spec/04 §5.1.1): a
+        // column-constant ramp 7,6,5,4,3,2,1,0 down the 8 rows.
+        let wire_ramp: [u8; 8] = [7, 6, 5, 4, 3, 2, 1, 0];
+        let expect_plane = |scale: u8| -> Vec<u8> {
+            let mut v = Vec::with_capacity(32);
+            for &row_val in &wire_ramp {
+                for _c in 0..4 {
+                    v.push(row_val.wrapping_mul(scale));
+                }
+            }
+            v
+        };
+
+        // Output order is (G, B, R). G = P1 (ramp). B = B'+G = 2·ramp.
+        // R = R'+G = 2·ramp.
+        let g = frame.planes[0].samples.as_u8().expect("G is u8");
+        let b = frame.planes[1].samples.as_u8().expect("B is u8");
+        let r = frame.planes[2].samples.as_u8().expect("R is u8");
+        assert_eq!(g, expect_plane(1).as_slice(), "G plane = wire ramp");
+        assert_eq!(b, expect_plane(2).as_slice(), "B = B'+G = 2·ramp");
+        assert_eq!(r, expect_plane(2).as_slice(), "R = R'+G = 2·ramp");
+    }
 }
