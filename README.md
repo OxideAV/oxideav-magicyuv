@@ -45,6 +45,26 @@ accessors.
 | Under-full hardening   | a malformed slice peeking unused codespace → `HuffmanIncomplete` (spec/05 §2.1), not a silent mis-decode |
 | Raw-mode fallback      | per-slice                                     |
 
+## Conformance
+
+Beyond the encode→decode self-roundtrip suite, the decoder is pinned
+against **proprietary-encoder ground-truth bytes** reconstructed
+byte-for-byte from the clean-room spec's worked-example hex (no
+reference binary in-tree):
+
+- `m8rg_64x64_zero.bin` — the canonical all-zero 64×64 RGB frame
+  whose complete 1670-byte layout is documented in spec/02 §5.2 +
+  spec/05 §7. Decodes to three all-zero GBR planes, exercising the
+  full Huffman path (descriptor parse, length-descending canonical
+  code build, MSB-first read, Left predictor, RGB decorrelation).
+- The exact §2.0.1 canonical code-assignment table (symbol 0 → code
+  `1`; symbol 95 → code `127`; 254 length-9 symbols → codes
+  `0..253`) is asserted directly, locking the construction against
+  RFC-1951 ordering.
+- `4×8 M8RG interlaced raw` — the spec/04 §5.1.1 doubled-row-stride
+  residual stream, decoding to the documented field-interleaved
+  vertical ramp (ground-truth coverage of the interlaced predictor).
+
 ## Public API
 
 - [`decode_frame`] — decode one MAGY-prefixed frame; returns one
