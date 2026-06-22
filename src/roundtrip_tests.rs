@@ -2836,6 +2836,146 @@ mod per_slice_plane_index_ordering {
     }
 }
 
+/// Malformed-input robustness on the **high-bit-depth** (10/12/14-bit)
+/// decode path specifically.
+///
+/// The existing decoder-error tests above
+/// (`out_of_range_plane_index_rejected`, `over_quota_plane_index_…`,
+/// `rejects_*_predictor_id`) all run against 8-bit (`0x65`) fixtures,
+/// which exercise the guards inside `decode_eight_bit`. The
+/// high-bit-depth slice loop in `decode_high_bit_depth` has its **own
+/// distinct** copies of those guards with **different arithmetic** —
+/// most notably the raw-mode payload-length check is
+/// `2 + (pixels * bits).div_ceil(8)` (bit-packed at `bits` bits per
+/// sample, `spec/05` §4.1) rather than the 8-bit path's
+/// `2 + pixels` (one byte per sample). A regression that loosened or
+/// dropped the HBD-side guard would slip past every 8-bit test. These
+/// tests pin each HBD-path rejection directly.
+mod high_bit_depth_malformed_input {
+    use super::*;
+
+    /// Encode a single-slice-per-plane HBD frame in the requested
+    /// mode. `slice_height >= height` keeps it to one slice per plane,
+    /// so the final on-wire slice (whose `slice_end` is `bytes.len()`)
+    /// is exactly the one we truncate.
+    fn encode_single_slice_hbd(
+        fb: u8,
+        mode: SliceMode,
+        pred: PredictorKind,
+    ) -> (FourccRecord, Vec<u8>) {
+        let rec = lookup_round2(fb).unwrap();
+        let (w, h) = (16u32, 16u32);
+        let planes = make_planes_u16(rec, w, h, 7);
+        let mut opts = EncodeOptions::fixed(pred);
+        opts.mode = mode;
+        let bytes =
+            encode_frame(rec, w, h, 64, planes, opts).expect("encode single-slice HBD frame");
+        // Sanity: the unmodified frame must decode.
+        assert!(
+            decode_frame(&bytes).is_ok(),
+            "baseline HBD frame must decode"
+        );
+        (rec, bytes)
+    }
+
+    /// Byte offset where the final on-wire slice begins, derived from
+    /// the v7 slice table: 32-byte header, then `(total_slices + 1)`
+    /// little-endian `u32` offsets relative to the table base (`0x20`).
+    /// Entry `[total_slices]` is the last slice's start.
+    fn final_slice_start(bytes: &[u8], total_slices: usize) -> usize {
+        let table_off = 0x20usize;
+        let o = table_off + 4 * total_slices;
+        let rel = u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap()) as usize;
+        table_off + rel
+    }
+
+    #[test]
+    fn hbd_raw_mode_truncated_payload_rejected() {
+        // Trip the `2 + (pixels * bits).div_ceil(8)` raw-mode length
+        // guard (`decoder.rs` HBD path). Dropping bytes off the end
+        // shrinks the final slice's payload below the bit-packed
+        // requirement; the HBD path must surface `SliceTruncated`
+        // rather than read past the buffer or zero-fill silently.
+        for (_label, fb) in ROUND2_HIGH_FOURCCS {
+            let (_rec, bytes) = encode_single_slice_hbd(*fb, SliceMode::Raw, PredictorKind::Left);
+            // Drop the last 4 bytes: a 16×16 plane at ≥10 bits packs to
+            // ≥320 bytes, so 4 fewer bytes is always below the guard.
+            let truncated = &bytes[..bytes.len() - 4];
+            match decode_frame(truncated) {
+                Err(crate::error::Error::SliceTruncated { .. }) => {}
+                Err(e) => {
+                    panic!("fb={fb:#x} HBD raw truncation must give SliceTruncated, got {e:?}")
+                }
+                Ok(_) => panic!("fb={fb:#x} HBD raw truncation must be rejected, got Ok"),
+            }
+        }
+    }
+
+    #[test]
+    fn hbd_slice_prefix_missing_rejected() {
+        // Keep only the first byte of the final slice so its 2-byte
+        // (slice_flags, predictor_id) prefix is incomplete. The HBD
+        // path's `payload.len() < 2` check must surface
+        // `SlicePrefixMissing`.
+        for (_label, fb) in ROUND2_HIGH_FOURCCS {
+            let (rec, bytes) = encode_single_slice_hbd(*fb, SliceMode::Raw, PredictorKind::Left);
+            let total_slices = rec.planes as usize; // 1 slice/plane here.
+            let last_start = final_slice_start(&bytes, total_slices);
+            let truncated = &bytes[..last_start + 1];
+            match decode_frame(truncated) {
+                Err(crate::error::Error::SlicePrefixMissing { .. }) => {}
+                Err(e) => panic!(
+                    "fb={fb:#x} HBD single-byte final slice must give SlicePrefixMissing, got {e:?}"
+                ),
+                Ok(_) => panic!("fb={fb:#x} HBD single-byte final slice must be rejected, got Ok"),
+            }
+        }
+    }
+
+    #[test]
+    fn hbd_bad_predictor_id_rejected() {
+        // Corrupt the final slice's predictor_id byte to an
+        // out-of-range value (≥0x04). The HBD slice loop calls the same
+        // `lookup_predictor`; we assert it fires on the HBD branch.
+        for (_label, fb) in ROUND2_HIGH_FOURCCS {
+            let (rec, bytes) = encode_single_slice_hbd(*fb, SliceMode::Raw, PredictorKind::Left);
+            let total_slices = rec.planes as usize;
+            let last_start = final_slice_start(&bytes, total_slices);
+            let mut corrupt = bytes.clone();
+            // predictor_id is payload[1] = the 2nd byte of the slice.
+            corrupt[last_start + 1] = 0x7f;
+            match decode_frame(&corrupt) {
+                Err(crate::error::Error::BadPredictorId(0x7f)) => {}
+                Err(e) => {
+                    panic!("fb={fb:#x} HBD bad predictor_id must give BadPredictorId, got {e:?}")
+                }
+                Ok(_) => panic!("fb={fb:#x} HBD bad predictor_id must be rejected, got Ok"),
+            }
+        }
+    }
+
+    #[test]
+    fn hbd_reserved_predictor_id_zero_rejected() {
+        // `predictor_id = 0x00` is reserved (`spec/04` §1.2 + §7.3c).
+        // Symmetric with the 8-bit `rejects_zero_predictor_id` test but
+        // on the HBD slice loop.
+        for (_label, fb) in ROUND2_HIGH_FOURCCS {
+            let (rec, bytes) = encode_single_slice_hbd(*fb, SliceMode::Raw, PredictorKind::Left);
+            let total_slices = rec.planes as usize;
+            let last_start = final_slice_start(&bytes, total_slices);
+            let mut corrupt = bytes.clone();
+            corrupt[last_start + 1] = 0x00;
+            match decode_frame(&corrupt) {
+                Err(crate::error::Error::BadPredictorId(0x00)) => {}
+                Err(e) => panic!(
+                    "fb={fb:#x} HBD reserved predictor_id 0 must give BadPredictorId(0), got {e:?}"
+                ),
+                Ok(_) => panic!("fb={fb:#x} HBD reserved predictor_id 0 must be rejected, got Ok"),
+            }
+        }
+    }
+}
+
 /// Decode-against-proprietary-ground-truth fixtures.
 ///
 /// Unlike the encode→decode self-roundtrips above (which can only
