@@ -2584,6 +2584,96 @@ fn cartesian_property_sweep_all_fourccs_predictors_modes() {
     assert_eq!(cases, 17 * 3 * 3 * 2 * 4, "sweep case count");
 }
 
+/// Degenerate **minimal-geometry** roundtrip sweep — the boundary
+/// complement of `cartesian_property_sweep_all_fourccs_predictors_modes`,
+/// whose smallest tile is 16×16. Every dimension here is the smallest
+/// the FOURCC's chroma subsampling admits (`spec/03` §8.2: a subsampled
+/// plane needs `width % sub_x == 0` / `height % sub_y == 0`), so the
+/// cases reach down to `1×1` for RGB / Gray and `sub_x × sub_y` for the
+/// 4:2:x families.
+///
+/// These geometries exercise predictor / Huffman / raw boundaries the
+/// 16×16-and-up sweep never hits:
+///
+/// * **single column** (`width == sub_x`): every reconstructed pixel
+///   past row 0 has only the top neighbour — the Left term in
+///   Gradient / Median reduces to `cur[-1]`-absent, so the `c == 0`
+///   first-column arm (`cur[0] = cur[0] + prev[0]`) is the *only* arm
+///   that runs on the data rows. A regression that mishandled the
+///   "no left neighbour in a 1-wide plane" case (e.g. read `cur[c-1]`
+///   at `c == 0`) would corrupt here and nowhere else.
+/// * **single row** (`height == sub_y`): the plane is one header row —
+///   `apply_*_with_stride` returns after the `header_rows` loop without
+///   ever taking a top neighbour, and the encoder's reverse pass must
+///   agree.
+/// * **`1×1`**: a single sample — both the column loop and the row
+///   loop bodies are skipped entirely; the lone pixel is emitted raw
+///   (predictor residual == pixel) and the Huffman descriptor degrades
+///   to a single-symbol (under-full, Kraft = 1/2) book (`spec/05` §2.1)
+///   whose decode must still recover the byte bit-exactly.
+/// * **interlaced on a `≤ field_stride`-row plane**: with `interlaced
+///   = true` the field stride is 2, but a 1- or 2-row plane has `rows
+///   ≤ header_rows` so `apply_*_with_stride` short-circuits in the
+///   header-rows arm (`spec/04` §5.1 "first two rows have no top
+///   neighbour"). This pins that early-return against the field-stride
+///   subtraction that would otherwise underflow `r - 2`.
+///
+/// All 17 FOURCCs × {1×1, 1-col, 1-row, 2-row, odd 3×5} × all three
+/// predictors × both slice modes × interlaced on/off, with a seeded
+/// scrambled pixel field per cell so the Huffman path sees a non-trivial
+/// (multi-symbol where pixels > 1) histogram. Bit-exact recovery is the
+/// witness; any failure prints the FOURCC + geometry + seed for replay.
+#[test]
+fn minimal_geometry_property_sweep_all_fourccs() {
+    const PREDICTORS: &[PredictorKind] = &[
+        PredictorKind::Left,
+        PredictorKind::Gradient,
+        PredictorKind::Median,
+    ];
+    const MODES: &[SliceMode] = &[SliceMode::Huffman, SliceMode::Raw];
+    const SEEDS: &[u64] = &[0x0000_0000_0000_0003, 0x9e37_79b9_7f4a_7c15];
+
+    let all_fourccs = ROUND1_FOURCCS.iter().chain(ROUND2_HIGH_FOURCCS.iter());
+    let mut cases = 0usize;
+    for (label, fb) in all_fourccs {
+        let rec = lookup(*fb).unwrap_or_else(|| panic!("lookup {label} ({fb:#04x})"));
+        let sx = (rec.sub_x as u32).max(1);
+        let sy = (rec.sub_y as u32).max(1);
+        // Smallest geometries the chroma subsampling admits. For RGB /
+        // Gray (sub == 1) these are literally 1×1 / 1×N / N×1; for
+        // subsampled YUV they scale to the (sub_x, sub_y) lattice so the
+        // chroma plane stays whole-sample.
+        let dims: [(u32, u32); 5] = [
+            (sx, sy),         // 1×1 luma (smallest possible)
+            (sx, sy * 4),     // single luma column, 4 luma rows
+            (sx * 4, sy),     // single luma row, 4 luma columns
+            (sx * 2, sy * 2), // 2×2 luma — interlaced header-rows boundary
+            (sx * 3, sy * 5), // odd-ish 3×5 luma — partial-everything
+        ];
+        for &(w, h) in &dims {
+            // slice_height ≥ h so every plane is a single slice; the
+            // multi-slice partitioning is the cartesian sweep's job.
+            let sh = h;
+            for &pred in PREDICTORS {
+                for &mode in MODES {
+                    for &interlaced in &[false, true] {
+                        for &seed in SEEDS {
+                            roundtrip_seeded(label, rec, w, h, sh, pred, mode, seed, interlaced);
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // 17 fourccs × 5 dims × 3 predictors × 2 modes × 2 interlaced × 2 seeds.
+    assert_eq!(
+        cases,
+        17 * 5 * 3 * 2 * 2 * 2,
+        "minimal-geometry sweep case count"
+    );
+}
+
 /// Decoder honours an arbitrary on-wire `per_slice_plane_index`
 /// ordering, not just the plane-major one the vendor encoder emits
 /// (`spec/02` §7.3: "A spec-compliant decoder MUST read
