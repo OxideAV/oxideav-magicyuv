@@ -65,6 +65,23 @@ reference binary in-tree):
   residual stream, decoding to the documented field-interleaved
   vertical ramp (ground-truth coverage of the interlaced predictor).
 
+The encode→decode self-roundtrip suite is driven by two complementary
+property sweeps proving bit-exact lossless recovery:
+
+- **Cartesian sweep** — all 17 native FOURCCs × all 3 predictors ×
+  both slice modes × single-slice / multi-slice / partial-chroma
+  geometry × interlaced on/off, seeded so the Huffman descriptor and
+  predictor paths see high-entropy residuals.
+- **Minimal-geometry sweep** — the boundary complement, with every
+  dimension the smallest the FOURCC's chroma subsampling admits (down
+  to `1×1` for RGB / Gray and `sub_x × sub_y` for the 4:2:x families).
+  Single-column (first-column-only predictor arm), single-row (one
+  header row, no top neighbour), `1×1` (single-symbol under-full
+  Huffman book), and interlaced `≤ field_stride`-row (header-rows
+  early-return) boundaries are each pinned, for both the fixed and
+  the `dynamic_auto()` strategies. The same boundary shapes seed the
+  decode fuzz corpus.
+
 ## Public API
 
 - [`decode_frame`] — decode one MAGY-prefixed frame; returns one
