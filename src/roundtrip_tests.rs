@@ -1625,6 +1625,93 @@ fn dynamic_plus_auto_round_trips_combined() {
     }
 }
 
+/// `dynamic_auto()` (per-slice predictor selection by minimum residual
+/// L1 norm + per-slice raw/Huffman byte-budget) at **minimal
+/// geometries**, across all 17 FOURCCs and interlaced on/off.
+///
+/// This is the combined-strategy complement of
+/// `minimal_geometry_property_sweep_all_fourccs` (which fixes one
+/// predictor + one mode per cell). The Dynamic and Auto decisions both
+/// run per-slice arithmetic that degenerates at tiny sizes in ways the
+/// 64×64 `dynamic_plus_auto_round_trips_combined` never reaches:
+///
+/// * **Dynamic L1 score on a 1×1 / single-column / single-row slice** —
+///   the predictor-selection scan sums `|residual|` over a slice that
+///   may be a single pixel (every candidate predictor yields the same
+///   raw residual, so the tie-break picks the first-checked predictor)
+///   or a single column (Left and Gradient collapse to the same
+///   first-column term). The chosen `predictor_id` must still be one
+///   the decoder can invert, and the residuals must reconstruct
+///   bit-exactly.
+/// * **Auto byte-budget at tiny payloads** — for a 1×1 plane the
+///   Huffman path's descriptor overhead dwarfs the single-pixel
+///   payload, so Auto should fall back to raw; the decoder must accept
+///   whichever the encoder picked. The raw bit-packed HBD path
+///   (`spec/05` §4.1) at one sample is the narrowest possible raw
+///   slice.
+///
+/// All 17 FOURCCs × {1×1, 1-col, 1-row, 2×2, 3×5 minimal-lattice} ×
+/// interlaced on/off, each filled by the seeded scrambler, must
+/// round-trip bit-exact through `EncodeOptions::dynamic_auto()`.
+#[test]
+fn minimal_geometry_dynamic_auto_all_fourccs() {
+    let all_fourccs = ROUND1_FOURCCS.iter().chain(ROUND2_HIGH_FOURCCS.iter());
+    let mut cases = 0usize;
+    for (label, fb) in all_fourccs {
+        let rec = lookup(*fb).unwrap_or_else(|| panic!("lookup {label} ({fb:#04x})"));
+        let sx = (rec.sub_x as u32).max(1);
+        let sy = (rec.sub_y as u32).max(1);
+        let dims: [(u32, u32); 5] = [
+            (sx, sy),
+            (sx, sy * 4),
+            (sx * 4, sy),
+            (sx * 2, sy * 2),
+            (sx * 3, sy * 5),
+        ];
+        for &(w, h) in &dims {
+            for &interlaced in &[false, true] {
+                let planes_in: Vec<PlaneInput> = if rec.is_high_bit_depth() {
+                    make_planes_u16_seeded(rec, w, h, 0x5123_c4f5_9e37_79b9)
+                } else {
+                    make_planes_u8_seeded(rec, w, h, 0x5123_c4f5_9e37_79b9)
+                };
+                let bytes = encode_frame(
+                    rec,
+                    w,
+                    h,
+                    h,
+                    planes_in.clone(),
+                    EncodeOptions {
+                        interlaced,
+                        ..EncodeOptions::dynamic_auto()
+                    },
+                )
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "{label} {w}x{h} dynamic_auto interlaced={interlaced}: encode failed: {e}"
+                    )
+                });
+                let dec = decode_frame(&bytes).unwrap_or_else(|e| {
+                    panic!(
+                        "{label} {w}x{h} dynamic_auto interlaced={interlaced}: decode failed: {e}"
+                    )
+                });
+                assert!(
+                    samples_eq_planes(&planes_in, &dec.planes),
+                    "{label} {w}x{h} dynamic_auto interlaced={interlaced}: plane mismatch"
+                );
+                cases += 1;
+            }
+        }
+    }
+    // 17 fourccs × 5 dims × 2 interlaced.
+    assert_eq!(
+        cases,
+        17 * 5 * 2,
+        "minimal-geometry dynamic_auto case count"
+    );
+}
+
 #[test]
 fn dynamic_is_no_larger_than_worst_fixed_on_mixed_content() {
     // Sanity: on a mixed-content frame, Dynamic should produce a frame
