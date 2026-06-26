@@ -466,6 +466,43 @@ impl MagicYuvEncoder {
             Ok(PlaneInput::U16(samples))
         }
     }
+
+    /// De-interleave a single 8-bit RGB / RGBA [`VideoPlane`]
+    /// (`R,G,B[,A]` byte order — the exact layout the registry decoder
+    /// emits) into the planar `G,B,R[,A]` [`PlaneInput`]s the encoder
+    /// consumes. Inverse of the interleaving in `map_to_video_frame`,
+    /// closing the registry decode→re-encode loop for these families.
+    fn deinterleave_rgb8(&self, plane: &VideoPlane) -> CoreResult<Vec<PlaneInput>> {
+        let pixels = (self.width as usize) * (self.height as usize);
+        let nch = self.rec.planes as usize; // 3 (RGB) or 4 (RGBA)
+        if plane.data.len() != pixels * nch {
+            return Err(CoreError::invalid(format!(
+                "oxideav-magicyuv: interleaved {}-channel plane expected {} bytes, got {}",
+                nch,
+                pixels * nch,
+                plane.data.len(),
+            )));
+        }
+        let mut r = Vec::with_capacity(pixels);
+        let mut g = Vec::with_capacity(pixels);
+        let mut b = Vec::with_capacity(pixels);
+        let mut a = Vec::with_capacity(pixels);
+        for px in plane.data.chunks_exact(nch) {
+            // Interleaved order is R,G,B[,A] (see map_to_video_frame).
+            r.push(px[0]);
+            g.push(px[1]);
+            b.push(px[2]);
+            if nch == 4 {
+                a.push(px[3]);
+            }
+        }
+        // Encoder plane order is G,B,R[,A] (spec/03 §4 user-facing order).
+        let mut out = vec![PlaneInput::U8(g), PlaneInput::U8(b), PlaneInput::U8(r)];
+        if nch == 4 {
+            out.push(PlaneInput::U8(a));
+        }
+        Ok(out)
+    }
 }
 
 impl Encoder for MagicYuvEncoder {
@@ -489,17 +526,30 @@ impl Encoder for MagicYuvEncoder {
             ));
         };
         let want_planes = self.rec.planes as usize;
-        if v.planes.len() != want_planes {
-            return Err(CoreError::invalid(format!(
-                "oxideav-magicyuv: FourCC {:?} needs {want_planes} planar planes, got {}",
-                std::str::from_utf8(&self.rec.fourcc).unwrap_or("????"),
-                v.planes.len(),
-            )));
-        }
-        let mut inputs: Vec<PlaneInput> = Vec::with_capacity(want_planes);
-        for (i, plane) in v.planes.iter().enumerate() {
-            inputs.push(self.plane_to_input(i, plane)?);
-        }
+        // 8-bit RGB / RGBA may arrive as a single **interleaved** plane —
+        // exactly the layout the registry decoder emits for these
+        // families (R,G,B[,A] bytes). De-interleave it back to planar
+        // G,B,R[,A] so a registry decode→re-encode round-trips. Planar
+        // input (one plane per channel) is still accepted as-is.
+        let interleaved = self.rec.is_8bit()
+            && matches!(self.rec.family, Family::Rgb | Family::Rgba)
+            && v.planes.len() == 1;
+        let inputs = if interleaved {
+            self.deinterleave_rgb8(&v.planes[0])?
+        } else {
+            if v.planes.len() != want_planes {
+                return Err(CoreError::invalid(format!(
+                    "oxideav-magicyuv: FourCC {:?} needs {want_planes} planar planes, got {}",
+                    std::str::from_utf8(&self.rec.fourcc).unwrap_or("????"),
+                    v.planes.len(),
+                )));
+            }
+            let mut inputs: Vec<PlaneInput> = Vec::with_capacity(want_planes);
+            for (i, plane) in v.planes.iter().enumerate() {
+                inputs.push(self.plane_to_input(i, plane)?);
+            }
+            inputs
+        };
         // slice_height = full image height → a single slice per plane.
         // The decoder reconstructs the same pixels regardless of the
         // slice partition; one slice keeps the wire bytes minimal and is
@@ -1134,5 +1184,56 @@ mod tests {
         assert!(names.contains(&"predictor"));
         assert!(names.contains(&"slice_mode"));
         assert!(names.contains(&"interlaced"));
+    }
+
+    /// Close the loop for the 8-bit RGB / RGBA families: the registry
+    /// decoder emits a single **interleaved** plane; feeding that exact
+    /// plane straight back into the registry encoder (which now
+    /// de-interleaves it) must reproduce the same interleaved output on a
+    /// second decode — a full decode→re-encode→decode fixed point.
+    #[test]
+    fn registry_8bit_rgb_interleaved_reencode_round_trip() {
+        let (w, h) = (16usize, 16usize);
+        let mut ctx = RuntimeContext::new();
+        register(&mut ctx);
+
+        for fb in [0x65u8, 0x66] {
+            // M8RG (RGB), M8RA (RGBA)
+            let rec = lookup(fb).unwrap();
+            // Encode a source frame (planar G,B,R[,A]) once.
+            let src = make_video_frame(rec, w, h);
+            let params = enc_params(rec, w as u32, h as u32);
+            let mut enc = ctx.codecs.first_encoder(&params).expect("encoder");
+            enc.send_frame(&Frame::Video(src)).expect("send planar");
+            let pkt0 = enc.receive_packet().expect("pkt0");
+
+            // Decode → interleaved single plane.
+            let mut dec_params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+            dec_params.media_type = MediaType::Video;
+            let mut dec = ctx.codecs.first_decoder(&dec_params).expect("dec");
+            dec.send_packet(&pkt0).expect("send pkt0");
+            let Frame::Video(interleaved) = dec.receive_frame().expect("decode0") else {
+                panic!("video");
+            };
+            assert_eq!(interleaved.planes.len(), 1, "8-bit RGB decodes interleaved");
+
+            // Re-encode the interleaved plane directly (de-interleave path).
+            let mut enc2 = ctx.codecs.first_encoder(&params).expect("encoder2");
+            enc2.send_frame(&Frame::Video(interleaved.clone()))
+                .expect("send interleaved");
+            let pkt1 = enc2.receive_packet().expect("pkt1");
+
+            // Decode again → must equal the first interleaved output.
+            let mut dec2 = ctx.codecs.first_decoder(&dec_params).expect("dec2");
+            dec2.send_packet(&pkt1).expect("send pkt1");
+            let Frame::Video(interleaved2) = dec2.receive_frame().expect("decode1") else {
+                panic!("video");
+            };
+            assert_eq!(
+                interleaved2.planes[0].data, interleaved.planes[0].data,
+                "{:?}: interleaved re-encode is a fixed point",
+                rec.fourcc,
+            );
+        }
     }
 }
