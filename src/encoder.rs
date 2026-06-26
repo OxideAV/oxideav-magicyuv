@@ -278,7 +278,61 @@ pub fn output_params(rec: FourccRecord, width: u32, height: u32) -> oxideav_core
         .with_tag(CodecTag::fourcc(&rec.fourcc));
     p.width = Some(width);
     p.height = Some(height);
+    p.pixel_format = pixel_format_for(rec);
     p
+}
+
+/// Map a native MagicYUV FOURCC to the `oxideav-core` [`PixelFormat`]
+/// the registry decoder *emits* for it, when an exact variant exists.
+///
+/// Reflects the decoder's plane layout (see `registry::map_to_video_frame`):
+/// 8-bit RGB / RGBA decode to **interleaved** `Rgb24` / `Rgba`; the
+/// 10/12/14-bit RGB families decode to **planar GBR** (`Gbrp*Le` /
+/// `Gbrap*Le`, `spec/03` §4 wire order); YUV / Gray families decode to
+/// the matching planar `Yuv*P*` / `Gray*` formats.
+///
+/// Returns `None` for FOURCCs with no exact core variant — currently only
+/// `M8YA` (YUVA 4:4:4:4 8-bit, no `Yuva444P` in core). Muxers that need a
+/// label for these fall back to their own synthesis; the planes are still
+/// carried verbatim.
+#[cfg(feature = "registry")]
+pub(crate) fn pixel_format_for(rec: FourccRecord) -> Option<oxideav_core::PixelFormat> {
+    use oxideav_core::PixelFormat as Pf;
+    let (sub_x, sub_y) = (rec.sub_x, rec.sub_y);
+    Some(match (rec.family, rec.bit_depth) {
+        (Family::Gray, 8) => Pf::Gray8,
+        (Family::Gray, 10) => Pf::Gray10Le,
+        (Family::Gray, 12) => Pf::Gray12Le,
+        (Family::Gray, 14) => Pf::Gray16Le, // 14-bit gray has no exact variant; nearest 16-bit word
+        (Family::Rgb, 8) => Pf::Rgb24,
+        (Family::Rgba, 8) => Pf::Rgba,
+        (Family::Rgb, 10) => Pf::Gbrp10Le,
+        (Family::Rgba, 10) => Pf::Gbrap10Le,
+        (Family::Rgb, 12) => Pf::Gbrp12Le,
+        (Family::Rgba, 12) => Pf::Gbrap12Le,
+        (Family::Rgb, 14) => Pf::Gbrp14Le,
+        (Family::Rgba, 14) => Pf::Gbrap14Le,
+        (Family::Yuv, 8) => match (sub_x, sub_y) {
+            (1, 1) => Pf::Yuv444P,
+            (2, 1) => Pf::Yuv422P,
+            (2, 2) => Pf::Yuv420P,
+            _ => return None,
+        },
+        (Family::Yuv, 10) => match (sub_x, sub_y) {
+            (1, 1) => Pf::Yuv444P10Le,
+            (2, 1) => Pf::Yuv422P10Le,
+            (2, 2) => Pf::Yuv420P10Le,
+            _ => return None,
+        },
+        (Family::Yuv, 12) => match (sub_x, sub_y) {
+            (1, 1) => Pf::Yuv444P12Le,
+            (2, 1) => Pf::Yuv422P12Le,
+            (2, 2) => Pf::Yuv420P12Le,
+            _ => return None,
+        },
+        // M8YA (YUVA 4:4:4:4 8-bit) — no exact core variant.
+        _ => return None,
+    })
 }
 
 /// Per-plane input buffer for the encoder.

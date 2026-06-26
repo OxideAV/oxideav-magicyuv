@@ -1263,6 +1263,42 @@ mod tests {
     }
 
     #[test]
+    fn output_params_set_exact_pixel_format() {
+        use crate::encoder::output_params;
+        use oxideav_core::PixelFormat as Pf;
+        // (format_byte, expected pixel_format)
+        let want: &[(u8, Option<Pf>)] = &[
+            (0x65, Some(Pf::Rgb24)),       // M8RG
+            (0x66, Some(Pf::Rgba)),        // M8RA
+            (0x67, Some(Pf::Yuv444P)),     // M8Y4
+            (0x68, Some(Pf::Yuv422P)),     // M8Y2
+            (0x69, Some(Pf::Yuv420P)),     // M8Y0
+            (0x6a, None),                  // M8YA — no exact variant
+            (0x6b, Some(Pf::Gray8)),       // M8G0
+            (0x6c, Some(Pf::Yuv422P10Le)), // M0Y2
+            (0x6d, Some(Pf::Gbrp10Le)),    // M0RG
+            (0x6e, Some(Pf::Gbrap10Le)),   // M0RA
+            (0x6f, Some(Pf::Gbrp12Le)),    // M2RG
+            (0x70, Some(Pf::Gbrap12Le)),   // M2RA
+            (0x71, Some(Pf::Gbrp14Le)),    // M4RG
+            (0x72, Some(Pf::Gbrap14Le)),   // M4RA
+            (0x73, Some(Pf::Gray10Le)),    // M0G0
+            (0x76, Some(Pf::Yuv444P10Le)), // M0Y4
+            (0x7b, Some(Pf::Yuv420P10Le)), // M0Y0
+        ];
+        for &(fb, pf) in want {
+            let rec = lookup(fb).unwrap_or_else(|| panic!("missing 0x{fb:02x}"));
+            let p = output_params(rec, 16, 16);
+            assert_eq!(
+                p.pixel_format,
+                pf,
+                "FourCC {:?} (0x{fb:02x}) pixel_format mismatch",
+                std::str::from_utf8(&rec.fourcc).unwrap_or("????"),
+            );
+        }
+    }
+
+    #[test]
     fn registry_encoder_multi_slice_round_trips() {
         // Drive the registry encoder with a non-trivial `slice_height`
         // so each plane is partitioned into several slices (spec/02 §4),

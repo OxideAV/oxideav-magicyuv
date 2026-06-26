@@ -35,7 +35,10 @@ configurable through `CodecParameters::options` (`predictor` ∈
 left/gradient/median/dynamic, `slice_mode` ∈ huffman/raw/auto,
 `interlaced`, and `slice_height` for the `spec/02` §4 slice partition);
 defaults reproduce `EncodeOptions::dynamic_auto()` with a single
-full-frame slice.
+full-frame slice. `output_params()` also reports the exact
+`PixelFormat` for each FourCC (interleaved `Rgb24`/`Rgba` at 8-bit,
+planar `Gbrp*Le`/`Yuv*P*Le`/`Gray*Le` otherwise; `None` for the one
+FourCC with no exact core variant).
 
 Both sides reject odd dimensions that don't divide a subsampled
 FOURCC's chroma factor with the same `OddDimensionForSubsampling`
