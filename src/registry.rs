@@ -9,14 +9,17 @@
 #![cfg(feature = "registry")]
 
 use oxideav_core::{
-    CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecRegistry, CodecTag, Decoder,
-    Encoder, Error as CoreError, Frame, MediaType, Packet, PixelFormat, Result as CoreResult,
-    RuntimeContext, TimeBase, VideoFrame, VideoPlane,
+    parse_options, CodecCapabilities, CodecId, CodecInfo, CodecOptionsStruct, CodecParameters,
+    CodecRegistry, CodecTag, Decoder, Encoder, Error as CoreError, Frame, MediaType, OptionField,
+    OptionKind, OptionValue, Packet, PixelFormat, Result as CoreResult, RuntimeContext, TimeBase,
+    VideoFrame, VideoPlane,
 };
 
 use crate::decoder::{decode_frame, DecodedFrame, Samples};
-use crate::encoder::{encode_frame, output_params, EncodeOptions, PlaneInput};
-use crate::tables::{lookup, Family, FourccRecord};
+use crate::encoder::{
+    encode_frame, output_params, EncodeOptions, PlaneInput, PredictorStrategy, SliceMode,
+};
+use crate::tables::{lookup, Family, FourccRecord, PredictorKind};
 
 /// Canonical codec id. `oxideav-meta::register_all` calls
 /// `crate::__oxideav_entry`, which delegates here.
@@ -43,6 +46,7 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
             .capabilities(caps)
             .decoder(make_decoder)
             .encoder(make_encoder)
+            .encoder_options::<MagicYuvEncoderOptions>()
             .tags([
                 // 8-bit families (spec/01 §4.1)
                 CodecTag::fourcc(b"M8RG"),
@@ -253,15 +257,107 @@ fn make_encoder(params: &CodecParameters) -> CoreResult<Box<dyn Encoder>> {
             "oxideav-magicyuv: encoder requires non-zero width and height",
         ));
     }
+    let opts: MagicYuvEncoderOptions = parse_options(&params.options)?;
     Ok(Box::new(MagicYuvEncoder {
         rec,
         width,
         height,
         out_params: output_params(rec, width, height),
-        options: EncodeOptions::dynamic_auto(),
+        options: opts.to_encode_options(),
         pending: None,
         next_pts: 0,
     }))
+}
+
+/// Typed encoder options surfaced through `CodecParameters::options`
+/// (`spec/04` predictor strategies + `spec/05` §6.2 slice modes).
+///
+/// Defaults match [`EncodeOptions::dynamic_auto`] — per-slice predictor
+/// selection by minimum residual (`predictor = "dynamic"`) and per-slice
+/// Huffman/raw byte-budget selection (`slice_mode = "auto"`),
+/// progressive (`interlaced = false`). Every combination produces a
+/// stream the decoder round-trips bit-exact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MagicYuvEncoderOptions {
+    /// `"left"` / `"gradient"` / `"median"` (fixed predictor) or
+    /// `"dynamic"` (per-slice minimum-residual selection, `spec/04` §3).
+    pub predictor: String,
+    /// `"huffman"` / `"raw"` / `"auto"` (per-slice byte-budget fallback,
+    /// `spec/05` §6.2).
+    pub slice_mode: String,
+    /// Emit interlaced field-stride=2 prediction (`spec/04` §5.1).
+    pub interlaced: bool,
+}
+
+impl Default for MagicYuvEncoderOptions {
+    fn default() -> Self {
+        Self {
+            predictor: "dynamic".to_owned(),
+            slice_mode: "auto".to_owned(),
+            interlaced: false,
+        }
+    }
+}
+
+impl MagicYuvEncoderOptions {
+    fn to_encode_options(&self) -> EncodeOptions {
+        let strategy = match self.predictor.as_str() {
+            "left" => PredictorStrategy::Fixed(PredictorKind::Left),
+            "gradient" => PredictorStrategy::Fixed(PredictorKind::Gradient),
+            "median" => PredictorStrategy::Fixed(PredictorKind::Median),
+            // "dynamic" (the default) and any value the SCHEMA already
+            // validated against the allow-list.
+            _ => PredictorStrategy::Dynamic,
+        };
+        let mode = match self.slice_mode.as_str() {
+            "huffman" => SliceMode::Huffman,
+            "raw" => SliceMode::Raw,
+            _ => SliceMode::Auto,
+        };
+        // Seed from dynamic_auto() (carries the spec-default color_matrix
+        // / full_range knobs) then override the three configurable axes.
+        let mut e = EncodeOptions::dynamic_auto();
+        e.strategy = strategy;
+        e.mode = mode;
+        e.interlaced = self.interlaced;
+        if let PredictorStrategy::Fixed(k) = strategy {
+            e.predictor = k;
+        }
+        e
+    }
+}
+
+impl CodecOptionsStruct for MagicYuvEncoderOptions {
+    const SCHEMA: &'static [OptionField] = &[
+        OptionField {
+            name: "predictor",
+            kind: OptionKind::Enum(&["left", "gradient", "median", "dynamic"]),
+            default: OptionValue::String(String::new()),
+            help: "per-slice predictor: left/gradient/median (fixed) or dynamic (min-residual)",
+        },
+        OptionField {
+            name: "slice_mode",
+            kind: OptionKind::Enum(&["huffman", "raw", "auto"]),
+            default: OptionValue::String(String::new()),
+            help: "per-slice entropy mode: huffman/raw (fixed) or auto (byte-budget fallback)",
+        },
+        OptionField {
+            name: "interlaced",
+            kind: OptionKind::Bool,
+            default: OptionValue::Bool(false),
+            help: "emit interlaced field-stride=2 prediction (spec/04 §5.1)",
+        },
+    ];
+
+    fn apply(&mut self, key: &str, value: &OptionValue) -> CoreResult<()> {
+        match key {
+            "predictor" => self.predictor = value.as_str()?.to_owned(),
+            "slice_mode" => self.slice_mode = value.as_str()?.to_owned(),
+            "interlaced" => self.interlaced = value.as_bool()?,
+            _ => unreachable!("guarded by SCHEMA"),
+        }
+        Ok(())
+    }
 }
 
 /// Resolve the native-FourCC [`FourccRecord`] from a parameter set's
@@ -909,5 +1005,134 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ─────────────────── typed encoder options ───────────────────
+
+    use oxideav_core::CodecOptions;
+
+    #[test]
+    fn options_default_is_dynamic_auto_progressive() {
+        let o = MagicYuvEncoderOptions::default();
+        let e = o.to_encode_options();
+        let baseline = EncodeOptions::dynamic_auto();
+        assert_eq!(e.strategy, baseline.strategy);
+        assert_eq!(e.mode, baseline.mode);
+        assert!(!e.interlaced);
+    }
+
+    #[test]
+    fn options_map_each_predictor_and_slice_mode() {
+        use crate::encoder::{PredictorStrategy, SliceMode};
+        let cases: &[(&str, PredictorStrategy)] = &[
+            ("left", PredictorStrategy::Fixed(PredictorKind::Left)),
+            (
+                "gradient",
+                PredictorStrategy::Fixed(PredictorKind::Gradient),
+            ),
+            ("median", PredictorStrategy::Fixed(PredictorKind::Median)),
+            ("dynamic", PredictorStrategy::Dynamic),
+        ];
+        for (s, want) in cases {
+            let o = MagicYuvEncoderOptions {
+                predictor: (*s).to_owned(),
+                ..Default::default()
+            };
+            assert_eq!(o.to_encode_options().strategy, *want, "predictor {s}");
+        }
+        let modes: &[(&str, SliceMode)] = &[
+            ("huffman", SliceMode::Huffman),
+            ("raw", SliceMode::Raw),
+            ("auto", SliceMode::Auto),
+        ];
+        for (s, want) in modes {
+            let o = MagicYuvEncoderOptions {
+                slice_mode: (*s).to_owned(),
+                ..Default::default()
+            };
+            assert_eq!(o.to_encode_options().mode, *want, "slice_mode {s}");
+        }
+    }
+
+    #[test]
+    fn options_schema_rejects_unknown_key_and_bad_value() {
+        // Unknown key.
+        let bag = CodecOptions::new().set("nonsense", "1");
+        assert!(parse_options::<MagicYuvEncoderOptions>(&bag).is_err());
+        // Bad enum value.
+        let bag = CodecOptions::new().set("predictor", "paeth");
+        assert!(parse_options::<MagicYuvEncoderOptions>(&bag).is_err());
+        let bag = CodecOptions::new().set("slice_mode", "arith");
+        assert!(parse_options::<MagicYuvEncoderOptions>(&bag).is_err());
+        // Valid combination parses.
+        let bag = CodecOptions::new()
+            .set("predictor", "median")
+            .set("slice_mode", "raw")
+            .set("interlaced", "true");
+        let o = parse_options::<MagicYuvEncoderOptions>(&bag).expect("valid options");
+        assert_eq!(o.predictor, "median");
+        assert_eq!(o.slice_mode, "raw");
+        assert!(o.interlaced);
+    }
+
+    #[test]
+    fn registry_encoder_honours_options_across_modes() {
+        // Drive the framework encoder with every (predictor, slice_mode,
+        // interlaced) combination through CodecParameters::options and
+        // confirm each still round-trips bit-exact through the decoder.
+        // Use M8Y0 (4:2:0 8-bit, 3 planes) — interlaced exercises the
+        // field-stride path on a subsampled family.
+        let rec = lookup(0x69).unwrap(); // M8Y0
+        let (w, h) = (16usize, 16usize);
+        let mut ctx = RuntimeContext::new();
+        register(&mut ctx);
+        let src = make_video_frame(rec, w, h);
+
+        for predictor in ["left", "gradient", "median", "dynamic"] {
+            for slice_mode in ["huffman", "raw", "auto"] {
+                for interlaced in ["false", "true"] {
+                    let mut params = enc_params(rec, w as u32, h as u32);
+                    params.options = CodecOptions::new()
+                        .set("predictor", predictor)
+                        .set("slice_mode", slice_mode)
+                        .set("interlaced", interlaced);
+                    let mut enc = ctx.codecs.first_encoder(&params).expect("first_encoder");
+                    enc.send_frame(&Frame::Video(src.clone()))
+                        .unwrap_or_else(|e| panic!("{predictor}/{slice_mode}/{interlaced}: {e}"));
+                    let pkt = enc.receive_packet().expect("receive_packet");
+
+                    let mut dec_params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+                    dec_params.media_type = MediaType::Video;
+                    let mut dec = ctx
+                        .codecs
+                        .first_decoder(&dec_params)
+                        .expect("first_decoder");
+                    dec.send_packet(&pkt).expect("send_packet");
+                    let Frame::Video(out) = dec.receive_frame().expect("receive_frame") else {
+                        panic!("expected video");
+                    };
+                    assert_eq!(out.planes.len(), src.planes.len());
+                    for (o, s) in out.planes.iter().zip(src.planes.iter()) {
+                        assert_eq!(
+                            o.data, s.data,
+                            "{predictor}/{slice_mode}/{interlaced}: plane bytes differ",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn registry_exposes_encoder_options_schema() {
+        let mut reg = CodecRegistry::new();
+        register_codecs(&mut reg);
+        let schema = reg
+            .encoder_options_schema(&CodecId::new(CODEC_ID_STR))
+            .expect("encoder options schema must be registered");
+        let names: Vec<&str> = schema.iter().map(|f| f.name).collect();
+        assert!(names.contains(&"predictor"));
+        assert!(names.contains(&"slice_mode"));
+        assert!(names.contains(&"interlaced"));
     }
 }
