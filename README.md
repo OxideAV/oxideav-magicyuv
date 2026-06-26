@@ -23,6 +23,15 @@ byte-for-byte. Strategies:
 - Per-slice Huffman / raw fallback (`SliceMode::Auto`, by byte
   budget). `EncodeOptions::dynamic_auto()` combines both.
 
+Both directions are wired into `oxideav-core`'s codec registry (the
+default-on `registry` feature): the codec entry declares
+`with_decode()` **and** `with_encode()`, registering a `Decoder` and
+an `Encoder` factory plus all 17 native v7 FourCC tags. The registry
+`Encoder` recovers the output FourCC from `CodecParameters::tag` and
+consumes planar `Frame::Video`s (one plane per codec plane, in the
+family order the decoder emits), so a framework-level encode→decode
+loop round-trips bit-exact for every native FourCC.
+
 Both sides reject odd dimensions that don't divide a subsampled
 FOURCC's chroma factor with the same `OddDimensionForSubsampling`
 error, so they accept exactly the same dimension set. The
