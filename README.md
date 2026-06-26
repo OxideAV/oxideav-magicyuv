@@ -38,7 +38,9 @@ defaults reproduce `EncodeOptions::dynamic_auto()` with a single
 full-frame slice. `output_params()` also reports the exact
 `PixelFormat` for each FourCC (interleaved `Rgb24`/`Rgba` at 8-bit,
 planar `Gbrp*Le`/`Yuv*P*Le`/`Gray*Le` otherwise; `None` for the one
-FourCC with no exact core variant).
+FourCC with no exact core variant). A content probe validates a FourCC
+claim against the `MAGY` magic (`spec/01` §1): decisive `1.0`/`0.0` when
+a packet/header is peekable, `0.9` on the FourCC alone otherwise.
 
 Both sides reject odd dimensions that don't divide a subsampled
 FOURCC's chroma factor with the same `OddDimensionForSubsampling`

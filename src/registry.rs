@@ -47,6 +47,7 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
             .decoder(make_decoder)
             .encoder(make_encoder)
             .encoder_options::<MagicYuvEncoderOptions>()
+            .probe(probe_magicyuv)
             .tags([
                 // 8-bit families (spec/01 §4.1)
                 CodecTag::fourcc(b"M8RG"),
@@ -76,6 +77,39 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
 /// Unified entry point invoked by the macro-generated wrapper.
 pub fn register(ctx: &mut RuntimeContext) {
     register_codecs(&mut ctx.codecs);
+}
+
+/// Content probe disambiguating a FourCC claim against the actual
+/// bitstream (`spec/01` §1 — every MagicYUV v7 frame opens with the
+/// 4-byte `MAGY` magic).
+///
+/// The registry only invokes this for a tag that already matched one of
+/// our registered FourCCs, so the tag itself is strong evidence: with no
+/// peeked bytes available (the common case — demuxers resolve at
+/// stream-discovery time before any packet exists) the probe returns a
+/// high `0.9` confidence. When the demuxer *has* read a first packet,
+/// the magic is decisive: `MAGY` → `1.0` (certainly us), anything else →
+/// `0.0` (a mis-tagged stream we must not claim). A header blob, when
+/// present, is checked the same way so a `BITMAPINFOHEADER` carrying the
+/// raw frame doesn't slip a foreign stream past the FourCC match.
+fn probe_magicyuv(ctx: &oxideav_core::ProbeContext) -> oxideav_core::Confidence {
+    use crate::header::MAGY_MAGIC;
+    let check = |bytes: &[u8]| -> Option<oxideav_core::Confidence> {
+        if bytes.len() >= 4 {
+            Some(if bytes[0..4] == MAGY_MAGIC { 1.0 } else { 0.0 })
+        } else {
+            None
+        }
+    };
+    // Prefer the packet payload; fall back to a container header blob.
+    if let Some(c) = ctx.packet.and_then(check) {
+        return c;
+    }
+    if let Some(c) = ctx.header.and_then(check) {
+        return c;
+    }
+    // No bytes to inspect — the FourCC match alone is strong evidence.
+    0.9
 }
 
 // ──────────────────────── Decoder impl ────────────────────────
@@ -1260,6 +1294,78 @@ mod tests {
                 rec.fourcc,
             );
         }
+    }
+
+    #[test]
+    fn probe_confidence_by_magic() {
+        use crate::header::MAGY_MAGIC;
+        let tag = CodecTag::fourcc(b"M8RG");
+
+        // No bytes → strong FourCC-only confidence (not 0, so the codec
+        // still wins; demuxers resolve before any packet exists).
+        let bare = ProbeContext::new(&tag);
+        assert!(probe_magicyuv(&bare) > 0.0 && probe_magicyuv(&bare) < 1.0);
+
+        // Packet starting with MAGY → decisive.
+        let mut good = [0u8; 8];
+        good[0..4].copy_from_slice(&MAGY_MAGIC);
+        let ctx = ProbeContext::new(&tag).packet(&good);
+        assert_eq!(probe_magicyuv(&ctx), 1.0);
+
+        // Packet with wrong magic → reject (0.0), so a mis-tagged stream
+        // is not claimed.
+        let bad = *b"RIFF\x00\x00\x00\x00";
+        let ctx = ProbeContext::new(&tag).packet(&bad);
+        assert_eq!(probe_magicyuv(&ctx), 0.0);
+
+        // Header blob path checked the same way.
+        let ctx = ProbeContext::new(&tag).header(&good);
+        assert_eq!(probe_magicyuv(&ctx), 1.0);
+
+        // Too-short packet → fall through to FourCC-only confidence.
+        let short = [b'M', b'A'];
+        let ctx = ProbeContext::new(&tag).packet(&short);
+        assert!(probe_magicyuv(&ctx) > 0.0 && probe_magicyuv(&ctx) < 1.0);
+    }
+
+    #[test]
+    fn probe_lets_valid_stream_resolve_and_rejects_mistag() {
+        // End-to-end through the registry: a registered FourCC with a
+        // real MAGY packet resolves to magicyuv; the same FourCC with a
+        // foreign packet does not (probe returns 0.0 → skipped).
+        use crate::encoder::{output_params, PlaneInput};
+        use crate::tables::PredictorKind;
+
+        let rec = lookup(0x6b).unwrap(); // M8G0
+        let pixels: Vec<u8> = (0..(8 * 8)).map(|i| (i & 0xff) as u8).collect();
+        let frame_bytes = encode_frame(
+            rec,
+            8,
+            8,
+            8,
+            vec![PlaneInput::U8(pixels)],
+            EncodeOptions::fixed(PredictorKind::Left),
+        )
+        .expect("encode");
+
+        let mut reg = CodecRegistry::new();
+        register_codecs(&mut reg);
+        let tag = output_params(rec, 8, 8).tag.unwrap();
+
+        let good = ProbeContext::new(&tag).packet(&frame_bytes);
+        assert_eq!(
+            reg.resolve_tag_ref(&good).map(|c| c.as_str()),
+            Some(CODEC_ID_STR),
+            "valid MAGY stream must resolve to magicyuv",
+        );
+
+        let foreign = [0u8; 16];
+        let bad = ProbeContext::new(&tag).packet(&foreign);
+        assert_eq!(
+            reg.resolve_tag_ref(&bad).map(|c| c.as_str()),
+            None,
+            "a non-MAGY packet under our FourCC must not resolve to magicyuv",
+        );
     }
 
     #[test]
