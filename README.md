@@ -33,7 +33,9 @@ family order the decoder emits), so a framework-level encode→decode
 loop round-trips bit-exact for every native FourCC. Encode strategy is
 configurable through `CodecParameters::options` (`predictor` ∈
 left/gradient/median/dynamic, `slice_mode` ∈ huffman/raw/auto,
-`interlaced`); defaults reproduce `EncodeOptions::dynamic_auto()`.
+`interlaced`, and `slice_height` for the `spec/02` §4 slice partition);
+defaults reproduce `EncodeOptions::dynamic_auto()` with a single
+full-frame slice.
 
 Both sides reject odd dimensions that don't divide a subsampled
 FOURCC's chroma factor with the same `OddDimensionForSubsampling`

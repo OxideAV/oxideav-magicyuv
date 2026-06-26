@@ -258,10 +258,18 @@ fn make_encoder(params: &CodecParameters) -> CoreResult<Box<dyn Encoder>> {
         ));
     }
     let opts: MagicYuvEncoderOptions = parse_options(&params.options)?;
+    // `0` → single full-frame slice; otherwise clamp to the frame
+    // height (a slice taller than the frame degenerates to one slice).
+    let slice_height = if opts.slice_height == 0 {
+        height
+    } else {
+        opts.slice_height.min(height)
+    };
     Ok(Box::new(MagicYuvEncoder {
         rec,
         width,
         height,
+        slice_height,
         out_params: output_params(rec, width, height),
         options: opts.to_encode_options(),
         pending: None,
@@ -287,6 +295,12 @@ pub struct MagicYuvEncoderOptions {
     pub slice_mode: String,
     /// Emit interlaced field-stride=2 prediction (`spec/04` §5.1).
     pub interlaced: bool,
+    /// Luma rows per slice (`spec/02` §4 slice-table partition). `0`
+    /// (the default) means "one slice spanning the whole frame". A
+    /// positive value partitions each plane into `ceil(height / N)`
+    /// slices; the decoder reconstructs identically regardless of the
+    /// partition, so this only affects the wire slice layout.
+    pub slice_height: u32,
 }
 
 impl Default for MagicYuvEncoderOptions {
@@ -295,6 +309,7 @@ impl Default for MagicYuvEncoderOptions {
             predictor: "dynamic".to_owned(),
             slice_mode: "auto".to_owned(),
             interlaced: false,
+            slice_height: 0,
         }
     }
 }
@@ -347,6 +362,12 @@ impl CodecOptionsStruct for MagicYuvEncoderOptions {
             default: OptionValue::Bool(false),
             help: "emit interlaced field-stride=2 prediction (spec/04 §5.1)",
         },
+        OptionField {
+            name: "slice_height",
+            kind: OptionKind::U32,
+            default: OptionValue::U32(0),
+            help: "luma rows per slice (spec/02 §4); 0 = single full-frame slice",
+        },
     ];
 
     fn apply(&mut self, key: &str, value: &OptionValue) -> CoreResult<()> {
@@ -354,6 +375,7 @@ impl CodecOptionsStruct for MagicYuvEncoderOptions {
             "predictor" => self.predictor = value.as_str()?.to_owned(),
             "slice_mode" => self.slice_mode = value.as_str()?.to_owned(),
             "interlaced" => self.interlaced = value.as_bool()?,
+            "slice_height" => self.slice_height = value.as_u32()?,
             _ => unreachable!("guarded by SCHEMA"),
         }
         Ok(())
@@ -413,6 +435,9 @@ struct MagicYuvEncoder {
     rec: FourccRecord,
     width: u32,
     height: u32,
+    /// Luma rows per slice (`spec/02` §4); resolved from the
+    /// `slice_height` option (`0` → full frame).
+    slice_height: u32,
     out_params: CodecParameters,
     options: EncodeOptions,
     pending: Option<Packet>,
@@ -550,15 +575,14 @@ impl Encoder for MagicYuvEncoder {
             }
             inputs
         };
-        // slice_height = full image height → a single slice per plane.
-        // The decoder reconstructs the same pixels regardless of the
-        // slice partition; one slice keeps the wire bytes minimal and is
-        // always valid (`spec/02` §4).
+        // Slice partition per the resolved `slice_height` (`spec/02`
+        // §4). The decoder reconstructs the same pixels regardless of
+        // the partition, so this only changes the wire slice layout.
         let bytes = encode_frame(
             self.rec,
             self.width,
             self.height,
-            self.height,
+            self.slice_height,
             inputs,
             self.options,
         )
@@ -1184,6 +1208,7 @@ mod tests {
         assert!(names.contains(&"predictor"));
         assert!(names.contains(&"slice_mode"));
         assert!(names.contains(&"interlaced"));
+        assert!(names.contains(&"slice_height"));
     }
 
     /// Close the loop for the 8-bit RGB / RGBA families: the registry
@@ -1234,6 +1259,41 @@ mod tests {
                 "{:?}: interleaved re-encode is a fixed point",
                 rec.fourcc,
             );
+        }
+    }
+
+    #[test]
+    fn registry_encoder_multi_slice_round_trips() {
+        // Drive the registry encoder with a non-trivial `slice_height`
+        // so each plane is partitioned into several slices (spec/02 §4),
+        // and confirm the decoder reconstructs the same pixels. 32 rows
+        // / slice_height 12 → 3 slices/plane (two full + a 8-row tail).
+        let rec = lookup(0x67).unwrap(); // M8Y4 (4:4:4, 3 planes)
+        let (w, h) = (16usize, 32usize);
+        let mut ctx = RuntimeContext::new();
+        register(&mut ctx);
+        let src = make_video_frame(rec, w, h);
+
+        for sh in [0u32, 1, 8, 12, 32, 64] {
+            // 64 > height → clamped to a single slice.
+            let mut params = enc_params(rec, w as u32, h as u32);
+            params.options = CodecOptions::new().set("slice_height", sh.to_string());
+            let mut enc = ctx.codecs.first_encoder(&params).expect("encoder");
+            enc.send_frame(&Frame::Video(src.clone()))
+                .unwrap_or_else(|e| panic!("slice_height={sh}: {e}"));
+            let pkt = enc.receive_packet().expect("packet");
+
+            let mut dec_params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+            dec_params.media_type = MediaType::Video;
+            let mut dec = ctx.codecs.first_decoder(&dec_params).expect("decoder");
+            dec.send_packet(&pkt).expect("send");
+            let Frame::Video(out) = dec.receive_frame().expect("decode") else {
+                panic!("video");
+            };
+            assert_eq!(out.planes.len(), src.planes.len(), "slice_height={sh}");
+            for (o, s) in out.planes.iter().zip(src.planes.iter()) {
+                assert_eq!(o.data, s.data, "slice_height={sh}: plane differs");
+            }
         }
     }
 }
