@@ -44,11 +44,17 @@ a packet/header is peekable, `0.9` on the FourCC alone otherwise.
 
 Both sides reject odd dimensions that don't divide a subsampled
 FOURCC's chroma factor with the same `OddDimensionForSubsampling`
-error, so they accept exactly the same dimension set. The
-flags-dword knobs `interlaced` (bit 1), `full_range` (bit 2), and the
-4-bit `color_matrix` nibble (bits 20..23) are surfaced as
-[`EncodeOptions`] fields and recovered via typed `FrameHeader`
-accessors.
+error, so they accept exactly the same dimension set. They likewise
+reject a `slice_height` that doesn't divide the vertical chroma factor
+(`sub_y`) cleanly on a 4:2:0 family with `SliceHeightNotDivisibleBySubsampling`
+(`spec/02` §6): the chroma row-partition reuses the luma slice count and
+floors `slice_height / sub_y`, so an indivisible value would leave the
+bottom chroma rows outside every slice — a silent chroma-row drop, now
+refused symmetrically by encoder, decoder, and the registry encoder
+(inert for `sub_y == 1`). The flags-dword knobs `interlaced` (bit 1),
+`full_range` (bit 2), and the 4-bit `color_matrix` nibble (bits 20..23)
+are surfaced as [`EncodeOptions`] fields and recovered via typed
+`FrameHeader` accessors.
 
 ## Pipeline
 
@@ -56,8 +62,8 @@ accessors.
 | ---------------------- | --------------------------------------------- |
 | 32-byte v7 header      | parse + emit                                  |
 | Slice table + preamble | honours on-wire `per_slice_plane_index`       |
-| Chroma slice partition | per-plane slice count from luma row count     |
-| Per-slice predictors   | Left / Gradient / Median (modular 8-bit, JPEG-LS at 10/12/14-bit) |
+| Chroma slice partition | per-plane slice count from luma row count; `slice_height` indivisible by `sub_y` on 4:2:0 rejected (would drop bottom chroma rows, `spec/02` §6) |
+| Per-slice predictors   | Left / Gradient / Median (modular 8-bit, JPEG-LS at 10/12/14-bit); §4.4 formula divergence + §4 column-0 top-fallback pinned against spec worked examples |
 | Interlaced field-stride| top neighbour = row r-2; first 2 rows raw     |
 | Per-plane Huffman      | RLE descriptor                                |
 | Canonical-code build   | longest-length-first cumulative; over-full books rejected at build, under-full (Kraft < 1) books accepted (encoder emits them for single-symbol planes) |
