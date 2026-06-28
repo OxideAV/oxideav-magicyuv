@@ -250,6 +250,18 @@ pub fn encode_frame(
             factor: rec.sub_y as u32,
         });
     }
+    // Reject a `slice_height` the §6 chroma partition can't tile (an
+    // indivisible-by-`sub_y` value floors `slice_height / sub_y` and
+    // drops the bottom chroma rows). Symmetric with the decoder guard;
+    // inert for `sub_y == 1`. `slice_height == 0` is normalised to a
+    // single full-frame slice by the callers below before reaching the
+    // partition arithmetic, so it's exempt here.
+    if rec.sub_y as u32 > 1 && slice_height != 0 && (slice_height % rec.sub_y as u32) != 0 {
+        return Err(Error::SliceHeightNotDivisibleBySubsampling {
+            slice_height,
+            factor: rec.sub_y as u32,
+        });
+    }
     if rec.is_high_bit_depth() {
         encode_frame_u16(rec, width, height, slice_height, planes, options)
     } else {

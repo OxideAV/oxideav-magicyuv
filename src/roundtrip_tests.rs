@@ -489,6 +489,133 @@ fn yuv_4_2_0_partial_chroma_last_slice_even_non28_slice_height() {
     }
 }
 
+/// `slice_height` indivisible by `sub_y` on a 4:2:0 family is rejected
+/// by **both** directions (`spec/02` §6 partition is undefined for it —
+/// `chroma_psh = slice_height / sub_y` floors and the bottom chroma
+/// rows fall outside every slice). The encoder refuses to emit such a
+/// stream and the decoder refuses to consume a hostile header that
+/// carries one, the same defensive posture as the odd-dimension guard.
+mod slice_height_subsampling_divisibility {
+    use super::*;
+    use crate::error::Error;
+    use crate::header::HEADER_SIZE;
+
+    /// Encoder: an odd `slice_height` on a 4:2:0 family (`sub_y = 2`)
+    /// is rejected with the dedicated error, across both 8-bit (M8Y0)
+    /// and 10-bit (M0Y0) and every predictor / slice-mode.
+    #[test]
+    fn encoder_rejects_indivisible_slice_height_on_420() {
+        for &(label, fb) in &[("M8Y0", 0x69u8), ("M0Y0", 0x7bu8)] {
+            let rec = lookup_round2(fb).unwrap();
+            assert_eq!(rec.sub_y, 2, "{label} must be 4:2:0");
+            // 14 rows so a height%sub_y==0 frame is the only variable;
+            // odd slice_height ∈ {7, 9, 13} all trip the guard.
+            for &sh in &[7u32, 9, 13] {
+                let planes = if rec.is_high_bit_depth() {
+                    make_planes_u16(rec, 16, 14, 5)
+                } else {
+                    make_planes_u8(rec, 16, 14, 5)
+                };
+                let r = encode_frame(rec, 16, 14, sh, planes, EncodeOptions::dynamic_auto());
+                match r {
+                    Err(Error::SliceHeightNotDivisibleBySubsampling {
+                        slice_height,
+                        factor: 2,
+                    }) if slice_height == sh => {}
+                    other => panic!(
+                        "{label} slice_height={sh}: expected SliceHeightNotDivisibleBySubsampling, got {other:?}"
+                    ),
+                }
+            }
+        }
+    }
+
+    /// A 4:2:2 / 4:4:4 / RGB / Gray family (`sub_y == 1`) accepts an
+    /// odd `slice_height` unchanged — the guard is inert there — and
+    /// still round-trips bit-exact. This proves the guard targets only
+    /// the vertical-subsampled families, not every odd slice_height.
+    #[test]
+    fn odd_slice_height_ok_when_sub_y_is_one() {
+        // M8Y2 (4:2:2, sub_y=1), M8Y4 (4:4:4), M8RG (RGB), M8G0 (Gray).
+        for &(label, fb) in &[
+            ("M8Y2", 0x68u8),
+            ("M8Y4", 0x67),
+            ("M8RG", 0x65),
+            ("M8G0", 0x6b),
+        ] {
+            let rec = lookup_round2(fb).unwrap();
+            assert_eq!(rec.sub_y, 1, "{label} must have sub_y=1");
+            for &sh in &[7u32, 9, 13] {
+                roundtrip(
+                    label,
+                    rec,
+                    16,
+                    13,
+                    sh,
+                    PredictorKind::Median,
+                    SliceMode::Auto,
+                    5,
+                    false,
+                );
+            }
+        }
+    }
+
+    /// Decoder: a hand-built header carrying an indivisible
+    /// `slice_height` on M8Y0 is rejected before any slice work, so a
+    /// hostile stream cannot drive the decoder into emitting a
+    /// silently-zero-padded chroma plane. We mutate a *valid* encoded
+    /// frame's header `slice_height` field (`+0x1c`) to an odd value
+    /// and confirm the parse-stage guard fires. (The frame body is no
+    /// longer self-consistent, but the guard rejects the header before
+    /// the body matters — exactly the intent.)
+    #[test]
+    fn decoder_rejects_indivisible_slice_height_header_on_420() {
+        let rec = lookup_round2(0x69).unwrap(); // M8Y0
+        let planes = make_planes_u8(rec, 16, 14, 5);
+        // A clean, even slice_height frame the decoder would accept.
+        let mut bytes = encode_frame(rec, 16, 14, 14, planes, EncodeOptions::dynamic_auto())
+            .expect("even slice_height must encode");
+        // Sanity: it decodes cleanly before the mutation.
+        assert!(decode_frame(&bytes).is_ok());
+        // slice_height lives at header bytes +0x1c..+0x20 (LE u32).
+        assert!(bytes.len() >= HEADER_SIZE);
+        bytes[0x1c..0x20].copy_from_slice(&7u32.to_le_bytes());
+        match decode_frame(&bytes).err() {
+            Some(Error::SliceHeightNotDivisibleBySubsampling {
+                slice_height: 7,
+                factor: 2,
+            }) => {}
+            other => panic!("decoder must reject odd slice_height=7 on M8Y0, got err {other:?}"),
+        }
+    }
+
+    /// Even-`slice_height` 4:2:0 values that the guard *permits* must
+    /// still tile the chroma plane completely and round-trip bit-exact
+    /// — including the smallest legal even value (2) and values whose
+    /// chroma partition leaves a short final chroma slice. This is the
+    /// positive complement that proves the guard isn't over-broad: a
+    /// `slice_height` like 6 on a 14-row 4:2:0 frame gives chroma_psh=3
+    /// and chroma slices [0,3),[3,6),[6,7) — the partition the rejected
+    /// odd values fail to produce.
+    #[test]
+    fn even_slice_height_420_tiles_chroma_completely() {
+        for &(label, fb) in &[("M8Y0", 0x69u8), ("M0Y0", 0x7bu8)] {
+            let rec = lookup_round2(fb).unwrap();
+            // height 14 (chroma height 7); even slice_heights only.
+            for &sh in &[2u32, 4, 6, 8, 14] {
+                for &p in &[
+                    PredictorKind::Left,
+                    PredictorKind::Gradient,
+                    PredictorKind::Median,
+                ] {
+                    roundtrip(label, rec, 16, 14, sh, p, SliceMode::Auto, 5, false);
+                }
+            }
+        }
+    }
+}
+
 // ─────────────────── round-2: 10/12/14-bit FOURCCs ───────────────────
 
 #[test]

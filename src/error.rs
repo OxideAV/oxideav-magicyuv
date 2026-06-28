@@ -124,6 +124,32 @@ pub enum Error {
         /// Subsampling factor (2 for 4:2:x, 4:2:0).
         factor: u32,
     },
+    /// `slice_height` does not divide cleanly by the chroma vertical
+    /// subsampling factor on a subsampled YUV family (`spec/02` §6).
+    ///
+    /// The §6 chroma row-partition rule maps a chroma slice to rows
+    /// `[s × slice_height / sub_y, (s + 1) × slice_height / sub_y)`
+    /// of the chroma plane, reusing the **luma** slice count
+    /// `slices_per_plane = ceil(height / slice_height)`. That tiling
+    /// only covers the whole chroma plane when `sub_y` divides
+    /// `slice_height` — otherwise `slices_per_plane × (slice_height /
+    /// sub_y)` floors below the chroma height and the bottom chroma
+    /// rows are never assigned to any slice (the decoder would emit a
+    /// silently-truncated, partly-zero chroma plane). The v2.4.2
+    /// encoder only ever writes `slice_height = 28`, which divides
+    /// every native `sub_y ∈ {1, 2}` cleanly, so the spec leaves the
+    /// indivisible case unverified. Both directions reject it — the
+    /// same defensive posture as
+    /// [`Self::OddDimensionForSubsampling`] — so the encoder never
+    /// emits a stream it cannot itself round-trip and the decoder
+    /// never silently drops chroma rows from a hostile header. For
+    /// `sub_y == 1` (RGB / Gray / 4:4:4 / 4:2:2) the guard is inert.
+    SliceHeightNotDivisibleBySubsampling {
+        /// The `slice_height` header / argument value.
+        slice_height: u32,
+        /// The vertical subsampling factor (`sub_y`, 2 for 4:2:0).
+        factor: u32,
+    },
     /// The encoder API was called with a planes vector whose lengths
     /// don't match the per-FOURCC plane geometry.
     EncoderInputMismatch {
@@ -212,6 +238,13 @@ impl fmt::Display for Error {
             Self::OddDimensionForSubsampling { what, got, factor } => write!(
                 f,
                 "oxideav-magicyuv: {what} {got} is not divisible by chroma subsampling factor {factor} (spec/03 §8.2)"
+            ),
+            Self::SliceHeightNotDivisibleBySubsampling {
+                slice_height,
+                factor,
+            } => write!(
+                f,
+                "oxideav-magicyuv: slice_height {slice_height} is not divisible by chroma vertical subsampling factor {factor} — the spec/02 §6 chroma partition would drop the bottom chroma rows"
             ),
             Self::EncoderInputMismatch {
                 plane,

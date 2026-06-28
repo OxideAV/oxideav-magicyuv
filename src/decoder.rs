@@ -227,6 +227,22 @@ pub fn decode_into(bytes: &[u8], dst: &mut DecodedFrame) -> Result<()> {
             factor: rec.sub_y as u32,
         });
     }
+    // Reject a `slice_height` the §6 chroma partition can't tile. With
+    // `chroma_psh = slice_height / sub_y` (floor) and the chroma plane
+    // reusing the luma `slices_per_plane`, an indivisible `slice_height`
+    // leaves `slices_per_plane × chroma_psh < chroma_height`, so the
+    // bottom chroma rows are never assigned to any slice and would be
+    // emitted silently zero-padded. The v2.4.2 encoder only ever writes
+    // `slice_height = 28` (divisible by every native `sub_y`), so the
+    // indivisible case is a malformed / out-of-spec header; reject it
+    // rather than mis-decode (symmetric with the encoder guard and with
+    // `OddDimensionForSubsampling`). Inert for `sub_y == 1`.
+    if rec.sub_y as u32 > 1 && (hdr.slice_height % rec.sub_y as u32) != 0 {
+        return Err(Error::SliceHeightNotDivisibleBySubsampling {
+            slice_height: hdr.slice_height,
+            factor: rec.sub_y as u32,
+        });
+    }
 
     // Slice table: (total_slices + 1) u32 LE entries at offset 0x20.
     let table_off = header::HEADER_SIZE;
