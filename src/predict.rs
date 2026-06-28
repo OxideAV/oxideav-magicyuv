@@ -572,4 +572,175 @@ mod tests {
             );
         }
     }
+
+    /// Direct assertions of the `spec/04` §4.4 bit-depth-conditional
+    /// Median formula — the subtlest rule in the codec, where the
+    /// 8-bit path uses the **modular** gradient `(left + top - top_left)
+    /// & 0xff` and the 10/12/14-bit path uses the **full-precision**
+    /// JPEG-LS gradient `left + top - top_left`. The two diverge only
+    /// when the raw gradient falls outside `[0, 2^bits)`; the round-trip
+    /// sweeps prove self-consistency but cannot distinguish the two
+    /// formulas (an encoder/decoder pair would round-trip with *either*
+    /// rule). These tests pin the absolute reconstructed value against
+    /// the spec's own worked examples, so a regression that swapped the
+    /// 8-bit path to standard JPEG-LS (or the HBD path to modular) would
+    /// fail here even though every round-trip test still passed.
+    mod median_formula_spec_4_4 {
+        use super::*;
+
+        /// Drive a 2×2 plane so that decoding row 1 column 1 sees the
+        /// exact `(left, top, top_left)` triple, with a zero residual at
+        /// `[1,1]` so the reconstructed pixel *is* the predictor.
+        /// Returns `px[1,1]`. `MAX = (1<<bits)-1`.
+        fn med_pred_u8(left: u8, top: u8, top_left: u8) -> u8 {
+            // px[0,0] = res[0,0]                 = top_left
+            // px[0,1] = px[0,0] + res[0,1]       = top
+            // px[1,0] = px[0,0] + res[1,0]       = left
+            // px[1,1] = MED(left, top, top_left) + res[1,1] (=0)
+            let mut buf = vec![
+                top_left,
+                top.wrapping_sub(top_left),
+                left.wrapping_sub(top_left),
+                0,
+            ];
+            apply_u8(PredictorKind::Median, &mut buf, 2, 2);
+            assert_eq!(buf[0], top_left);
+            assert_eq!(buf[1], top);
+            assert_eq!(buf[2], left);
+            buf[3]
+        }
+
+        fn med_pred_u16(left: u16, top: u16, top_left: u16, mask: u16) -> u16 {
+            let mut buf = vec![
+                top_left & mask,
+                top.wrapping_sub(top_left) & mask,
+                left.wrapping_sub(top_left) & mask,
+                0,
+            ];
+            apply_u16(PredictorKind::Median, &mut buf, 2, 2, mask);
+            assert_eq!(buf[0], top_left & mask);
+            assert_eq!(buf[1], top & mask);
+            assert_eq!(buf[2], left & mask);
+            buf[3]
+        }
+
+        /// `spec/04` §4.4 8-bit worked example:
+        /// `left=10, top=20, top_left=200`. Modular gradient
+        /// `(10 + 20 - 200) & 0xff = 86`; `86 > max(10,20)=20` ⇒ clip
+        /// to 20. (Standard JPEG-LS would give `clip(-170, 10, 20) = 10`,
+        /// so this value distinguishes the two formulas.)
+        #[test]
+        fn modular_8bit_worked_example() {
+            assert_eq!(
+                med_pred_u8(10, 20, 200),
+                20,
+                "8-bit Median must use the modular gradient (spec/04 §4.4)"
+            );
+        }
+
+        /// `spec/04` §4.4 14-bit worked example, *scaled into range*.
+        /// The spec illustrates the JPEG-LS clip with the triple
+        /// `a=24576, b=16384, c=12288` (values chosen for arithmetic
+        /// clarity; they exceed the 14-bit max `0x3fff = 16383`, so they
+        /// are not valid in-range samples and cannot be reproduced as
+        /// literal decode neighbours). The *rule* the example
+        /// demonstrates is "`top_left ≤ min(left, top)` ⇒ return
+        /// `max(left, top)`". We pin that exact branch with an in-range
+        /// 14-bit triple that triggers it: `left=12000, top=8000,
+        /// top_left=4000` — `top_left=4000 ≤ min=8000` ⇒ `max=12000`.
+        /// (The modular rule would compute `(12000+8000-4000) & 0x3fff =
+        /// 16000`, then `16000 > max=12000` ⇒ clip to 12000 — agreeing
+        /// here — so for a divergence point see `hbd_diverges_from_modular`.)
+        #[test]
+        fn jpegls_14bit_clip_on_underflow() {
+            assert_eq!(
+                med_pred_u16(12000, 8000, 4000, 0x3fff),
+                12000,
+                "14-bit Median: top_left ≤ min ⇒ return max (spec/04 §4.4)"
+            );
+        }
+
+        /// A triple where the modular and JPEG-LS rules genuinely
+        /// diverge at high bit depth, proving the impl uses JPEG-LS.
+        /// `left=2, top=3, top_left=16380` at mask `0x3fff`:
+        /// - JPEG-LS: `top_left=16380 ≥ max(2,3)=3` ⇒ return `min=2`.
+        /// - Modular: `(2 + 3 - 16380) & 0x3fff = (-16375) & 0x3fff =
+        ///   9` (`-16375 + 2·16384 = 16393`; `16393 & 0x3fff = 9`),
+        ///   then `9 > max=3` ⇒ clip to `3`.
+        ///
+        /// The impl must return `2` (JPEG-LS), not `3` (modular).
+        #[test]
+        fn hbd_diverges_from_modular() {
+            assert_eq!(
+                med_pred_u16(2, 3, 16380, 0x3fff),
+                2,
+                "14-bit Median must follow JPEG-LS (return 2), not modular (3)"
+            );
+        }
+
+        /// All three JPEG-LS branches at every HBD mask.
+        #[test]
+        fn hbd_all_three_branches() {
+            for &mask in &[0x3ffu16, 0xfff, 0x3fff] {
+                // top_left ≥ max ⇒ return min. left=5,top=7,top_left=10.
+                assert_eq!(
+                    med_pred_u16(5, 7, 10, mask),
+                    5,
+                    "JPEG-LS top_left≥max branch (mask {mask:#x}) ⇒ min(left,top)"
+                );
+                // top_left ≤ min ⇒ return max. left=mask,top=mask-1,tl=0.
+                assert_eq!(
+                    med_pred_u16(mask, mask - 1, 0, mask),
+                    mask,
+                    "JPEG-LS top_left≤min branch (mask {mask:#x}) ⇒ max(left,top)"
+                );
+                // In-range ⇒ return left+top-top_left.
+                // left=100,top=120,top_left=110 ⇒ 110 ∈ (100,120) ⇒ 110.
+                assert_eq!(
+                    med_pred_u16(100, 120, 110, mask),
+                    110,
+                    "JPEG-LS in-range branch (mask {mask:#x}) ⇒ left+top-top_left"
+                );
+            }
+        }
+
+        /// Column 0 of every subsequent row uses the **top** neighbour
+        /// (`prev[0]`) as the predictor for all three predictors
+        /// (`spec/04` §4.2–4.4 column-0 fallback) — `spec/04` §8 open
+        /// question 1 flags this as the least-observed path because every
+        /// vendor fixture's column 0 sits in a zero-residual region. A
+        /// non-zero column-0 residual makes the rule observable: with
+        /// `res[0,0]=100, res[1,0]=7` the reconstruction is
+        /// `px[1,0] = (px[0,0] + 7) & MAX = 107`, identical for Left,
+        /// Gradient and Median (none has a left or top-left neighbour at
+        /// column 0).
+        #[test]
+        fn column0_subsequent_row_uses_top_all_predictors() {
+            for kind in [
+                PredictorKind::Left,
+                PredictorKind::Gradient,
+                PredictorKind::Median,
+            ] {
+                // 1-wide, 2-row plane isolates the column-0 path.
+                let mut buf = vec![100u8, 7u8];
+                apply_u8(kind, &mut buf, 2, 1);
+                assert_eq!(buf[0], 100, "{kind:?} row 0 col 0 = res");
+                assert_eq!(
+                    buf[1], 107,
+                    "{kind:?} row 1 col 0 must be (top + res) = 107 (spec/04 §4 col-0 fallback)"
+                );
+            }
+            // Same rule at high bit depth (mask path).
+            for kind in [
+                PredictorKind::Left,
+                PredictorKind::Gradient,
+                PredictorKind::Median,
+            ] {
+                let mut buf = vec![1000u16, 50u16];
+                apply_u16(kind, &mut buf, 2, 1, 0x3fff);
+                assert_eq!(buf[0], 1000);
+                assert_eq!(buf[1], 1050, "{kind:?} HBD col-0 fallback = top + res");
+            }
+        }
+    }
 }
