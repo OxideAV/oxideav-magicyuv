@@ -1438,4 +1438,53 @@ mod tests {
             }
         }
     }
+
+    /// The registry encoder surfaces the new `spec/02` §6 slice-height
+    /// divisibility guard *cleanly* (a `CoreError`, never a panic) when a
+    /// caller drives a 4:2:0 stream (`sub_y = 2`) with an odd
+    /// `slice_height` option, and still round-trips every **even**
+    /// slice_height (which the §6 chroma partition tiles completely).
+    #[test]
+    fn registry_encoder_rejects_odd_slice_height_on_420() {
+        let rec = lookup(0x69).unwrap(); // M8Y0 (4:2:0)
+        assert_eq!(rec.sub_y, 2);
+        let (w, h) = (16usize, 14usize);
+        let mut ctx = RuntimeContext::new();
+        register(&mut ctx);
+        let src = make_video_frame(rec, w, h);
+
+        // Odd slice_height ⇒ encode errors cleanly (no panic).
+        for sh in [7u32, 9, 13] {
+            let mut params = enc_params(rec, w as u32, h as u32);
+            params.options = CodecOptions::new().set("slice_height", sh.to_string());
+            let mut enc = ctx.codecs.first_encoder(&params).expect("encoder");
+            let r = enc.send_frame(&Frame::Video(src.clone()));
+            assert!(
+                r.is_err(),
+                "odd slice_height={sh} on 4:2:0 must be rejected by the registry encoder"
+            );
+        }
+
+        // Even slice_height ⇒ clean round-trip (the guard is not
+        // over-broad). `0` resolves to a single full-frame slice.
+        for sh in [0u32, 2, 6, 14] {
+            let mut params = enc_params(rec, w as u32, h as u32);
+            params.options = CodecOptions::new().set("slice_height", sh.to_string());
+            let mut enc = ctx.codecs.first_encoder(&params).expect("encoder");
+            enc.send_frame(&Frame::Video(src.clone()))
+                .unwrap_or_else(|e| panic!("even slice_height={sh}: {e}"));
+            let pkt = enc.receive_packet().expect("packet");
+
+            let mut dec_params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+            dec_params.media_type = MediaType::Video;
+            let mut dec = ctx.codecs.first_decoder(&dec_params).expect("decoder");
+            dec.send_packet(&pkt).expect("send");
+            let Frame::Video(out) = dec.receive_frame().expect("decode") else {
+                panic!("video");
+            };
+            for (o, s) in out.planes.iter().zip(src.planes.iter()) {
+                assert_eq!(o.data, s.data, "even slice_height={sh}: plane differs");
+            }
+        }
+    }
 }
