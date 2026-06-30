@@ -127,6 +127,30 @@ impl FrameHeader {
         (self.flags & FLAG_FULL_RANGE) != 0
     }
 
+    /// The redundant width copy at header `+0x18` (`spec/01` §3.2 —
+    /// the encoder writes the ICCompress argument width into *both*
+    /// `+0x10` and `+0x18`). In every v2.4.2 stream this equals
+    /// [`Self::width`]; its semantic when it differs (a
+    /// display/coded-width distinction or a stride hint) is `spec/01`
+    /// §6 open-question 1 and is not yet pinned, so the decoder treats
+    /// it as informational and derives all plane geometry from
+    /// [`Self::width`] alone. Exposed as a typed accessor so a consumer
+    /// can observe the field (and detect a mismatch) without reaching
+    /// into the raw struct field.
+    pub fn coded_width(&self) -> u32 {
+        self.width_extra
+    }
+
+    /// `true` iff the redundant `+0x18` width copy matches the
+    /// authoritative `+0x10` width — the invariant every v2.4.2
+    /// encoder upholds (`spec/01` §3.2). A `false` here flags a stream
+    /// the surveyed encoder never produces; the decoder still decodes
+    /// it (geometry comes from [`Self::width`]), so this is a
+    /// diagnostic signal, not a rejection trigger.
+    pub fn width_fields_agree(&self) -> bool {
+        self.width == self.width_extra
+    }
+
     /// Raw 4-bit ColorMatrix nibble carried in the `flags` dword
     /// (`spec/01` §3.1 — bits 20..23, mask `0x00f00000`). The value
     /// is informational at the lossless codec layer: the wire bytes
@@ -379,6 +403,45 @@ mod tests {
         // No overlap with the two other documented flag bits.
         assert_eq!(FLAG_COLOR_MATRIX_MASK & FLAG_INTERLACED, 0);
         assert_eq!(FLAG_COLOR_MATRIX_MASK & FLAG_FULL_RANGE, 0);
+    }
+
+    /// `spec/01` §3.2: the canonical fixture has `width == width_extra
+    /// == 64`, so [`FrameHeader::coded_width`] returns the same value
+    /// as `width` and [`FrameHeader::width_fields_agree`] is `true`.
+    #[test]
+    fn coded_width_matches_width_on_canonical_fixture() {
+        let buf = [
+            0x4d, 0x41, 0x47, 0x59, 0x20, 0x00, 0x00, 0x00, 0x07, 0x65, 0x0c, 0x02, 0x00, 0x00,
+            0x20, 0x00, 0x40, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00,
+            0x1c, 0x00, 0x00, 0x00,
+        ];
+        let h = parse(&buf).expect("canonical fixture must parse");
+        assert_eq!(h.coded_width(), 64);
+        assert_eq!(h.coded_width(), h.width);
+        assert!(h.width_fields_agree());
+    }
+
+    /// A header whose `+0x18` width copy differs from `+0x10` (the
+    /// `spec/01` §6 open-question 1 case) still *parses* — the decoder
+    /// does not reject on the mismatch — but the diagnostic accessor
+    /// reports the divergence. Geometry consumers must use
+    /// [`FrameHeader::width`], not [`FrameHeader::coded_width`].
+    #[test]
+    fn width_fields_disagree_is_diagnostic_not_fatal() {
+        let mut buf = [
+            0x4d, 0x41, 0x47, 0x59, 0x20, 0x00, 0x00, 0x00, 0x07, 0x65, 0x0c, 0x02, 0x00, 0x00,
+            0x20, 0x00, 0x40, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00,
+            0x1c, 0x00, 0x00, 0x00,
+        ];
+        // Set width_extra (+0x18..+0x1b) to 80 while width (+0x10) stays 64.
+        buf[0x18..0x1c].copy_from_slice(&80u32.to_le_bytes());
+        let h = parse(&buf).expect("mismatched width_extra must still parse");
+        assert_eq!(h.width, 64);
+        assert_eq!(h.coded_width(), 80);
+        assert!(
+            !h.width_fields_agree(),
+            "accessor must flag the width/width_extra divergence"
+        );
     }
 
     #[test]

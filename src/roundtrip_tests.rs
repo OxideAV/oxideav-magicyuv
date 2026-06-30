@@ -853,6 +853,66 @@ fn eight_bit_raw_slice_byte_sizes_match_spec_4_1() {
     );
 }
 
+/// `spec/01` §3.2 + §6 open-question 1: the decoder derives all plane
+/// geometry from the authoritative `+0x10` width and treats the
+/// redundant `+0x18` width copy (`width_extra`) as informational. A
+/// stream whose `+0x18` field disagrees with `+0x10` is one the
+/// surveyed v2.4.2 encoder never produces, but since its semantic is
+/// unresolved the decoder must remain robust: decode the body using
+/// `+0x10` and surface the divergence diagnostically rather than
+/// rejecting or mis-sizing. This mutates a *valid* encoded frame's
+/// `+0x18` field to a different value and asserts (a) decode still
+/// succeeds bit-exact and (b) the parsed header reports the mismatch.
+#[test]
+fn decoder_tolerates_width_extra_mismatch() {
+    for &(label, fb) in &[("M8RG", 0x65u8), ("M0RG", 0x6du8), ("M8Y0", 0x69u8)] {
+        let rec = lookup_round2(fb).unwrap();
+        let (w, h) = (16u32, 16u32);
+        let planes_in = if rec.is_high_bit_depth() {
+            make_planes_u16(rec, w, h, 5)
+        } else {
+            make_planes_u8(rec, w, h, 5)
+        };
+        let mut bytes = encode_frame(
+            rec,
+            w,
+            h,
+            28,
+            planes_in.clone(),
+            EncodeOptions::dynamic_auto(),
+        )
+        .unwrap_or_else(|e| panic!("{label} encode failed: {e}"));
+        // Baseline: the encoder writes width into both +0x10 and +0x18.
+        assert_eq!(
+            &bytes[0x10..0x14],
+            &bytes[0x18..0x1c],
+            "{label} encoder mirrors width"
+        );
+
+        // Mutate +0x18 (width_extra) to a different value; +0x10 (the
+        // authoritative width) is left untouched.
+        bytes[0x18..0x1c].copy_from_slice(&(w + 4).to_le_bytes());
+
+        // Header reports the divergence diagnostically.
+        let hdr = crate::header::parse(&bytes).expect("mutated header still parses");
+        assert_eq!(hdr.width, w);
+        assert_eq!(hdr.coded_width(), w + 4);
+        assert!(
+            !hdr.width_fields_agree(),
+            "{label}: accessor must flag mismatch"
+        );
+
+        // Decode still succeeds and reconstructs bit-exact (geometry
+        // comes from +0x10, not +0x18).
+        let dec = decode_frame(&bytes)
+            .unwrap_or_else(|e| panic!("{label} decode must tolerate width_extra mismatch: {e}"));
+        assert!(
+            samples_eq_planes(&planes_in, &dec.planes),
+            "{label}: width_extra mismatch must not perturb the decode"
+        );
+    }
+}
+
 #[test]
 fn high_bit_depth_64x64_multi_slice() {
     // 64×64 with slice_height=28 → 3 slices per plane.
