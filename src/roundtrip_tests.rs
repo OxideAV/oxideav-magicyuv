@@ -690,6 +690,169 @@ fn high_bit_depth_raw_mode() {
     }
 }
 
+/// Pin the **on-wire byte size** of every high-bit-depth raw-mode
+/// slice to the `spec/05` §4.1 packing formula `2 + (pixels * bits +
+/// 7) / 8` — the formula `05` §10 open-question 2 flags as
+/// "not behaviourally exercised by the fixtures surveyed".
+///
+/// The existing `high_bit_depth_raw_mode` round-trip proves the
+/// packer and unpacker are mutual inverses, but a pair that agreed on
+/// a *wrong* field width (say, byte-aligned each sample to 16 bits)
+/// would still round-trip — the absolute byte count is the only thing
+/// that ties the wire layout to the documented `bits`-bit MSB-first
+/// packing. This test reads the slice-offset table directly and
+/// asserts each slice payload spans exactly the spec-predicted byte
+/// count, reproducing the `spec/05` §4.1 table rows:
+///
+/// | `bits` | 28-row slice (`28·64·bits/8 + 2`) | 8-row tail (`8·64·bits/8 + 2`) |
+/// | ------ | --------------------------------- | ------------------------------ |
+/// | 10     | 2242                              | 642                            |
+/// | 12     | 2690                              | 770                            |
+/// | 14     | 3138                              | 898                            |
+///
+/// for a 64×64 single-plane-width RGB frame with `slice_height = 28`
+/// (3 slices/plane: 28, 28, 8 rows). The whole-frame final slice
+/// carries `spec/02` §8 even-byte trailing padding, so it is excluded
+/// from the exact-size check (its bitstream length is still validated
+/// transitively by the bit-exact round-trip).
+#[test]
+fn high_bit_depth_raw_slice_byte_sizes_match_spec_4_1() {
+    // (label, format_byte, bits) — the three HBD RGB tiers (3 planes,
+    // each plane width == frame width == 64, so the §4.1 per-plane
+    // arithmetic uses w = 64 directly).
+    for &(label, fb, bits) in &[
+        ("M0RG", 0x6du8, 10u32),
+        ("M2RG", 0x6f, 12),
+        ("M4RG", 0x71, 14),
+    ] {
+        let rec = lookup_round2(fb).unwrap();
+        let (w, h, sh) = (64u32, 64u32, 28u32);
+        let planes_in = make_planes_u16_seeded(rec, w, h, 0xA5);
+        let bytes = encode_frame(
+            rec,
+            w,
+            h,
+            sh,
+            planes_in.clone(),
+            EncodeOptions {
+                strategy: PredictorStrategy::Fixed(PredictorKind::Left),
+                mode: SliceMode::Raw,
+                ..EncodeOptions::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("{label} raw encode failed: {e}"));
+
+        // 3 slices per plane (ceil(64/28) = 3): rows 28, 28, 8.
+        let slices_per_plane = (h as usize).div_ceil(sh as usize);
+        let num_planes = rec.planes as usize;
+        let total_slices = num_planes * slices_per_plane;
+        assert_eq!(slices_per_plane, 3, "{label}: expected 3 slices/plane");
+
+        // Every slice is raw mode (we forced SliceMode::Raw).
+        let flags = extract_per_slice_flags(&bytes, num_planes, slices_per_plane);
+        assert!(
+            flags.iter().all(|&f| f & 0x01 == 1),
+            "{label}: every slice must carry slice_flags bit 0 (raw)"
+        );
+
+        // Slice-offset table: entry[k+1] is slice k's payload start
+        // relative to the header end (offset 32). Slice k's byte span
+        // is entry[k+2] - entry[k+1]; the whole-frame last slice has
+        // no following entry's worth of unpadded length (it carries
+        // §02 §8 even-byte padding), so check all but the last.
+        let read_entry = |k: usize| -> usize {
+            let off = 32 + 4 * (k + 1);
+            u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()) as usize
+        };
+        for s in 0..total_slices - 1 {
+            let span = read_entry(s + 1) - read_entry(s);
+            // rows in this slice: full sh, except the 3rd (index 2)
+            // slice of each plane which holds the 8-row tail.
+            let within_plane = s % slices_per_plane;
+            let rows = if within_plane == slices_per_plane - 1 {
+                (h - sh * (slices_per_plane as u32 - 1)) as usize // 8
+            } else {
+                sh as usize
+            };
+            let pixels = rows * w as usize;
+            let expected = 2 + (pixels * bits as usize).div_ceil(8);
+            assert_eq!(
+                span, expected,
+                "{label} slice {s} ({rows} rows, {bits}-bit): \
+                 on-wire payload {span} B != spec/05 §4.1 {expected} B"
+            );
+        }
+
+        // And the whole thing still round-trips bit-exact.
+        let dec = decode_frame(&bytes).unwrap_or_else(|e| panic!("{label} raw decode failed: {e}"));
+        assert!(
+            samples_eq_planes(&planes_in, &dec.planes),
+            "{label}: HBD raw round-trip must be bit-exact"
+        );
+    }
+}
+
+/// The 8-bit counterpart of the §4.1 byte-size pin, reproducing the
+/// `spec/05` §4.1 *behavioural confirmation* (lines 662..673): a 64×64
+/// M8RG frame in raw mode with `slice_height = 28` yields per-plane
+/// slice payloads of `28·64·8/8 + 2 = 1794` bytes (full 28-row slices)
+/// and `8·64·8/8 + 2 = 514` bytes (the 8-row tail). The whole-frame
+/// final slice carries `spec/02` §8 even-byte padding (the doc's
+/// `529 = 514 + 15`), so it is excluded from the exact-size check.
+#[test]
+fn eight_bit_raw_slice_byte_sizes_match_spec_4_1() {
+    let rec = lookup_round1(0x65).unwrap(); // M8RG, 8-bit RGB, 3 planes.
+    let (w, h, sh) = (64u32, 64u32, 28u32);
+    let planes_in = make_planes_u8(rec, w, h, 4); // pseudo-random pattern.
+    let bytes = encode_frame(
+        rec,
+        w,
+        h,
+        sh,
+        planes_in.clone(),
+        EncodeOptions {
+            strategy: PredictorStrategy::Fixed(PredictorKind::Left),
+            mode: SliceMode::Raw,
+            ..EncodeOptions::default()
+        },
+    )
+    .expect("M8RG raw encode failed");
+
+    let slices_per_plane = (h as usize).div_ceil(sh as usize); // 3
+    let num_planes = rec.planes as usize; // 3
+    let total_slices = num_planes * slices_per_plane; // 9
+    let flags = extract_per_slice_flags(&bytes, num_planes, slices_per_plane);
+    assert!(
+        flags.iter().all(|&f| f & 0x01 == 1),
+        "every M8RG slice must be raw"
+    );
+
+    let read_entry = |k: usize| -> usize {
+        let off = 32 + 4 * (k + 1);
+        u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()) as usize
+    };
+    for s in 0..total_slices - 1 {
+        let span = read_entry(s + 1) - read_entry(s);
+        let within_plane = s % slices_per_plane;
+        let rows = if within_plane == slices_per_plane - 1 {
+            (h - sh * (slices_per_plane as u32 - 1)) as usize // 8
+        } else {
+            sh as usize // 28
+        };
+        let expected = 2 + rows * w as usize; // 1 byte/sample at 8-bit.
+        assert_eq!(
+            span, expected,
+            "M8RG slice {s} ({rows} rows): {span} B != spec/05 §4.1 {expected} B"
+        );
+    }
+
+    let dec = decode_frame(&bytes).expect("M8RG raw decode failed");
+    assert!(
+        samples_eq_planes(&planes_in, &dec.planes),
+        "M8RG raw round-trip must be bit-exact"
+    );
+}
+
 #[test]
 fn high_bit_depth_64x64_multi_slice() {
     // 64×64 with slice_height=28 → 3 slices per plane.
