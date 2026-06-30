@@ -25,10 +25,11 @@ pub enum Error {
     BadHeaderSize(u32),
     /// The `version` field at `+0x08` was greater than 7 (`spec/01` §2).
     BadVersion(u8),
-    /// The `format_byte` at `+0x09` is outside the round-1 supported
-    /// 8-bit native FOURCC set (`{0x65, 0x66, 0x67, 0x68, 0x69, 0x6a,
-    /// 0x6b}` per `spec/01` §4.1). Higher-bit-depth formats are
-    /// spec-feasible but deferred to a later round.
+    /// The `format_byte` at `+0x09` is not one of the 17 native v7
+    /// FOURCCs enumerated in `tables/00-fourcc-table.csv` (`spec/01`
+    /// §4.1). The full 8-bit and 10/12/14-bit native set is supported;
+    /// this error is for bytes outside that enumeration (reserved /
+    /// VFW-negotiation-only IDs and corrupt headers).
     UnsupportedFormatByte(u8),
     /// The `aux_byte` at `+0x0a` did not match the format-byte's
     /// expected `max_huffman_code_length` per `spec/01` §3.0

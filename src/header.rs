@@ -15,9 +15,11 @@
 //!    `spec/02` §intro is purely encoder-side and does not affect the
 //!    decoder; we just note it.
 //! 5. The `flags` dword carries `Interlaced` at bit 1 — the predictor
-//!    layer consumes that flag (currently informational; `spec/04`
-//!    §5.1 round-2 corrected note's interlaced row stride is deferred
-//!    beyond round 1, see README "deferred").
+//!    layer consumes that flag and applies the `spec/04` §5.1
+//!    field-stride=2 row stride (top of row `r` is row `r-2`; the
+//!    first two rows of each slice have no top neighbour). Both
+//!    decode and encode honour it, so interlaced streams round-trip
+//!    byte-for-byte across every FOURCC / bit-depth tier.
 
 use crate::error::{Error, Result};
 use crate::tables;
@@ -30,9 +32,12 @@ pub const MAGY_MAGIC: [u8; 4] = *b"MAGY";
 pub const HEADER_SIZE: usize = 32;
 
 /// `flags & FLAG_INTERLACED` set ⇒ field-stride=2 prediction
-/// (`spec/04` §5.1 round-2 note). Round 1 informs the decoder of the
-/// flag but only the progressive path is implemented. The bit is
-/// also written by the encoder per `spec/01` §3.1.
+/// (`spec/04` §5.1). The decoder doubles the predictor's
+/// top-neighbour row stride (top of row `r` is row `r-2`; the first
+/// two rows of each slice have no top neighbour) and the encoder
+/// emits the matching field-stride residuals, so interlaced streams
+/// round-trip byte-for-byte. The bit is also written by the encoder
+/// per `spec/01` §3.1.
 pub const FLAG_INTERLACED: u32 = 0x0000_0002;
 
 /// `flags & FLAG_FULL_RANGE` set ⇒ full-range YUV (`spec/01` §3.1

@@ -19,10 +19,11 @@ const FOURCC_CSV: &str = include_str!("../tables/00-fourcc-table.csv");
 const PREDICTOR_CSV: &str = include_str!("../tables/01-predictor-table.csv");
 
 /// Pixel-family classification, derived from `tables/00-fourcc-table.csv`
-/// column "family". Round 1 only implements the 8-bit native set, so
-/// only `Rgb`, `Rgba`, `Yuv`, `Yuva`, `Gray` are exercised — the
-/// 10/12/14-bit families pass through the same enum but are gated at
-/// the dispatch site (see `lib.rs::supported_format_byte`).
+/// column "family". All five families (`Rgb`, `Rgba`, `Yuv`, `Yuva`,
+/// `Gray`) are decoded and encoded across every bit-depth tier the
+/// CSV enumerates (8 / 10 / 12 / 14-bit); the storage container width
+/// is selected from [`FourccRecord::is_high_bit_depth`], not the
+/// family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Family {
     /// Three planes: G, B, R (per spec/03 §4 audit-corrected wire
