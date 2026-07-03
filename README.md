@@ -1,5 +1,7 @@
 # oxideav-magicyuv
 
+[![CI](https://github.com/OxideAV/oxideav-magicyuv/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-magicyuv/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-magicyuv.svg)](https://crates.io/crates/oxideav-magicyuv) [![docs.rs](https://docs.rs/oxideav-magicyuv/badge.svg)](https://docs.rs/oxideav-magicyuv) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Pure-Rust MagicYUV lossless video codec for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
 
