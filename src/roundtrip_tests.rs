@@ -3786,3 +3786,87 @@ mod spec_fixture_decode {
         assert_eq!(r, expect_plane(2).as_slice(), "R = R'+G = 2·ramp");
     }
 }
+
+// ───────────────── forward-compatibility hardening (spec open questions) ─────────────────
+//
+// The v2.4.2 encoder produces a narrow subset of the wire format's
+// legal shapes: every slice's `slice_flags` byte is 0x00 or 0x01, the
+// preamble carries no trailing bytes, `entry[0] == entry[1]`, and the
+// header `codec_variant` byte is always 0x02. A future or third-party
+// encoder is free to vary the parts the spec marks as reserved /
+// implementation-latitude, and a spec-compliant decoder MUST tolerate
+// them. Every self-roundtrip test above only ever sees the vendor
+// subset, so a regression that tightened one of these tolerances would
+// slip past all of them. Each test here rewrites a valid frame to the
+// edge of a documented open-question and asserts the decoded pixels are
+// unchanged.
+mod forward_compat {
+    use super::*;
+    use crate::decoder::decode_frame;
+
+    /// `spec/04` §8 open-question 3: bits 1..7 of a slice's
+    /// `slice_flags` byte (payload byte +0) are reserved forward-compat
+    /// padding. The decoder MUST mask `& 0x01` to read the Huffman/raw
+    /// mode bit and ignore the rest. The 8-bit (`decode_eight_bit`) and
+    /// high-bit-depth (`decode_high_bit_depth`) slice loops each mask at
+    /// their own site, so both decode paths are exercised. We OR `0xfe`
+    /// (all reserved bits set, bit 0 preserved) into every slice's flags
+    /// byte and require bit-exact recovery, in both slice modes.
+    #[test]
+    fn decoder_ignores_reserved_slice_flag_bits() {
+        // (label, format byte): one 8-bit and one high-bit-depth
+        // multi-plane FOURCC — covers both decode paths' `& 0x01` site.
+        for &(label, fb) in &[("M8RG", 0x65u8), ("M0RG", 0x6du8)] {
+            let rec = lookup_round2(fb).unwrap();
+            let (w, h, sh) = (32u32, 32u32, 16u32); // 2 slices/plane
+            let slices_per_plane = (h as usize).div_ceil(sh as usize);
+            let total_slices = rec.planes as usize * slices_per_plane;
+            for mode in [SliceMode::Huffman, SliceMode::Raw] {
+                let planes_in: Vec<PlaneInput> = if rec.is_high_bit_depth() {
+                    make_planes_u16_seeded(rec, w, h, 0xa53f ^ fb as u64)
+                } else {
+                    make_planes_u8_seeded(rec, w, h, 0xa53f ^ fb as u64)
+                };
+                let bytes = encode_frame(
+                    rec,
+                    w,
+                    h,
+                    sh,
+                    planes_in.clone(),
+                    EncodeOptions {
+                        mode,
+                        ..EncodeOptions::fixed(PredictorKind::Median)
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label} {mode:?}: encode failed: {e}"));
+
+                // Baseline: the unmodified frame decodes to the source.
+                let base = decode_frame(&bytes)
+                    .unwrap_or_else(|e| panic!("{label} {mode:?}: baseline decode failed: {e}"));
+                assert!(
+                    samples_eq_planes(&planes_in, &base.planes),
+                    "{label} {mode:?}: baseline decode mismatch"
+                );
+
+                // OR the reserved bits into every slice's flags byte.
+                // 0xfe preserves bit 0 (mode) while setting bits 1..7.
+                let mut patched = bytes.clone();
+                for s in 0..total_slices {
+                    let entry_off = 32 + 4 * (s + 1);
+                    let entry =
+                        u32::from_le_bytes(patched[entry_off..entry_off + 4].try_into().unwrap())
+                            as usize;
+                    patched[32 + entry] |= 0xfe;
+                }
+
+                let dec = decode_frame(&patched).unwrap_or_else(|e| {
+                    panic!("{label} {mode:?}: decode with reserved slice-flag bits set failed: {e}")
+                });
+                assert!(
+                    samples_eq_planes(&planes_in, &dec.planes),
+                    "{label} {mode:?}: reserved slice-flag bits must not change decoded pixels"
+                );
+            }
+        }
+    }
+}
