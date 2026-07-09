@@ -109,6 +109,32 @@ property sweeps proving bit-exact lossless recovery:
   the `dynamic_auto()` strategies. The same boundary shapes seed the
   decode fuzz corpus.
 
+### Forward-compat decode tolerances
+
+The v2.4.2 encoder emits a narrow subset of the format's legal shapes,
+so the round-trip suite never exercises the parts the spec marks as
+reserved / implementation-latitude. A dedicated `forward_compat` module
+rewrites a valid frame to the edge of each documented open question and
+asserts the decoded pixels are unchanged — locking the decoder's
+robustness against a regression that tightened a tolerance:
+
+- **Reserved `slice_flags` bits** (`spec/04` §8 Q3) — only bit 0 selects
+  Huffman vs raw; bits 1..7 are ignored (`& 0x01`) in both the 8-bit and
+  high-bit-depth slice loops.
+- **Trailing preamble bytes** (`spec/05` §10 Q5) — padding between the
+  last Huffman descriptor and the first slice is skipped; pinned in the
+  default feature set (the `trace` build additionally emits a
+  `preamble_trailing` diagnostic).
+- **Header `codec_variant` byte `+0x0b`** (`spec/04` §8 Q4) — stored for
+  diagnostics but never consulted by the decode dispatch (the predictor
+  is the per-slice `predictor_id`); decode is invariant to its value.
+- **Slice-table `entry[0]`** (`spec/02` §10 Q4) — the decoder derives
+  the preamble end and every slice start from `entry[1..]`, so `entry[0]`
+  can hold anything.
+- **Interleaved `per_slice_plane_index`** (`spec/02` §7.3 / §10 Q8) — a
+  non-plane-major slice order decodes identically (RGB/RGBA/YUV-4:2:0 at
+  8-bit and 10-bit).
+
 ## Public API
 
 - [`decode_frame`] — decode one MAGY-prefixed frame; returns one
