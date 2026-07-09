@@ -3869,4 +3869,69 @@ mod forward_compat {
             }
         }
     }
+
+    /// `spec/05` §10 open-question 5: the per-plane Huffman-descriptor
+    /// parser consumes exactly the bytes it needs to produce N lengths
+    /// per plane and then advances to the slice payloads — it does NOT
+    /// verify that consumption reaches `entry[1]` (the preamble end).
+    /// The v2.4.2 encoder never leaves trailing bytes between the last
+    /// descriptor and the first slice, but a future/third-party encoder
+    /// could pad the preamble (for alignment, say); the decoder must
+    /// tolerate the padding and still reconstruct bit-exact. The `trace`
+    /// build additionally emits a `preamble_trailing` diagnostic
+    /// (covered by `trace_preamble_trailing_emits_integer_extra_bytes`),
+    /// but that test is `#[cfg(feature = "trace")]` and so is compiled
+    /// out of the default CI build — this test runs in the default
+    /// feature set and pins the *decoded pixels*, not the trace event.
+    #[test]
+    fn decoder_tolerates_trailing_preamble_bytes() {
+        // Single-plane (M8G0) and multi-plane (M8RG): the padding lands
+        // after the last plane's descriptor in both the 1-plane and the
+        // 3-plane preamble layout.
+        for &(label, fb) in &[("M8G0", 0x6bu8), ("M8RG", 0x65u8)] {
+            let rec = lookup_round1(fb).unwrap();
+            let (w, h, sh) = (16u32, 16u32, 28u32); // slice_height ≥ h ⇒ 1 slice/plane
+            let total_slices = rec.planes as usize;
+            let planes_in = make_planes_u8_seeded(rec, w, h, 0x1234 ^ fb as u64);
+            let bytes = encode_frame(
+                rec,
+                w,
+                h,
+                sh,
+                planes_in.clone(),
+                EncodeOptions::fixed(PredictorKind::Gradient),
+            )
+            .unwrap_or_else(|e| panic!("{label}: encode failed: {e}"));
+
+            for pad_len in [1usize, 3, 8] {
+                let table_off = 32usize;
+                // entry[1] = preamble end = first slice's file offset.
+                let entry1 =
+                    u32::from_le_bytes(bytes[table_off + 4..table_off + 8].try_into().unwrap());
+                let first_payload_off = entry1 as usize + table_off;
+                // Insert `pad_len` non-zero padding bytes immediately
+                // after the last descriptor (before the first payload).
+                let mut patched = Vec::with_capacity(bytes.len() + pad_len);
+                patched.extend_from_slice(&bytes[..first_payload_off]);
+                patched.extend(std::iter::repeat_n(0xabu8, pad_len));
+                patched.extend_from_slice(&bytes[first_payload_off..]);
+                // Every slice offset (entry[1..=total_slices]) shifts
+                // right by pad_len — the payloads physically moved.
+                for i in 1..=total_slices {
+                    let off = table_off + 4 * i;
+                    let v = u32::from_le_bytes(patched[off..off + 4].try_into().unwrap())
+                        + pad_len as u32;
+                    patched[off..off + 4].copy_from_slice(&v.to_le_bytes());
+                }
+
+                let dec = decode_frame(&patched).unwrap_or_else(|e| {
+                    panic!("{label} pad={pad_len}: decode with trailing preamble bytes failed: {e}")
+                });
+                assert!(
+                    samples_eq_planes(&planes_in, &dec.planes),
+                    "{label} pad={pad_len}: trailing preamble bytes must not change decoded pixels"
+                );
+            }
+        }
+    }
 }
