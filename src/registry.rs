@@ -1323,8 +1323,8 @@ mod tests {
         assert_eq!(probe_magicyuv(&ctx), 1.0);
 
         // Too-short packet → fall through to FourCC-only confidence.
-        let short = [b'M', b'A'];
-        let ctx = ProbeContext::new(&tag).packet(&short);
+        let short = b"MA";
+        let ctx = ProbeContext::new(&tag).packet(short);
         assert!(probe_magicyuv(&ctx) > 0.0 && probe_magicyuv(&ctx) < 1.0);
     }
 
