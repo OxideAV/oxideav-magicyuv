@@ -3934,4 +3934,93 @@ mod forward_compat {
             }
         }
     }
+
+    /// `spec/04` §8 open-question 4: the header `codec_variant` byte at
+    /// `+0x0b` is always `0x02` in v2.4.2 streams and is NOT the on-wire
+    /// predictor — the actual predictor is the per-slice `predictor_id`
+    /// byte (`spec/04` §1.2). A pre-2.4.2 or third-party stream might
+    /// carry a different value; a decoder targeting v2.4.2 output can
+    /// ignore `+0x0b` entirely. The parser stores the byte for
+    /// diagnostics but the decode dispatch never consults it, so decode
+    /// must be invariant to its value. This test rewrites `+0x0b` to a
+    /// spread of values (including the reserved `>2` range) and asserts
+    /// bit-exact recovery, while confirming the parsed
+    /// `FrameHeader::codec_variant` faithfully reports the mutated byte.
+    #[test]
+    fn decoder_ignores_codec_variant_byte() {
+        for &(label, fb) in &[("M8RG", 0x65u8), ("M0Y0", 0x7bu8)] {
+            let rec = lookup_round2(fb).unwrap();
+            let (w, h, sh) = (16u32, 16u32, 28u32);
+            let planes_in: Vec<PlaneInput> = if rec.is_high_bit_depth() {
+                make_planes_u16_seeded(rec, w, h, 0x0b0b ^ fb as u64)
+            } else {
+                make_planes_u8_seeded(rec, w, h, 0x0b0b ^ fb as u64)
+            };
+            let bytes = encode_frame(
+                rec,
+                w,
+                h,
+                sh,
+                planes_in.clone(),
+                EncodeOptions::fixed(PredictorKind::Gradient),
+            )
+            .unwrap_or_else(|e| panic!("{label}: encode failed: {e}"));
+            assert_eq!(bytes[0x0b], 0x02, "{label}: vendor codec_variant is 0x02");
+
+            for variant in [0x00u8, 0x01, 0x03, 0x04, 0x7f, 0xff] {
+                let mut patched = bytes.clone();
+                patched[0x0b] = variant;
+                let hdr = crate::header::parse(&patched[..32])
+                    .unwrap_or_else(|e| panic!("{label} variant={variant:#x}: header parse: {e}"));
+                assert_eq!(
+                    hdr.codec_variant, variant,
+                    "{label}: parser must report the mutated codec_variant byte"
+                );
+                let dec = decode_frame(&patched)
+                    .unwrap_or_else(|e| panic!("{label} variant={variant:#x}: decode failed: {e}"));
+                assert!(
+                    samples_eq_planes(&planes_in, &dec.planes),
+                    "{label} variant={variant:#x}: codec_variant must not change decoded pixels"
+                );
+            }
+        }
+    }
+
+    /// `spec/02` §10 open-question 4: `entry[0] == entry[1]` in every
+    /// v2.4.2 fixture — whether the duplication is a "preamble-end"
+    /// boundary that happens to equal "slice 0 start" or a vestigial v6
+    /// artifact is unresolved. A decoder following §5.1 derives the
+    /// preamble end and every slice start from `entry[1..]` and never
+    /// reads `entry[0]`, so it is robust to either interpretation. This
+    /// pins that robustness: corrupting `entry[0]` to arbitrary values
+    /// must not affect the decoded pixels.
+    #[test]
+    fn decoder_ignores_slice_table_entry_zero() {
+        // Multi-plane, multi-slice frame so the slice table has several
+        // entries after entry[0].
+        let rec = lookup_round2(0x65).unwrap(); // M8RG, 3 planes
+        let (w, h, sh) = (32u32, 32u32, 16u32); // 2 slices/plane ⇒ 6 slices
+        let planes_in = make_planes_u8_seeded(rec, w, h, 0xe0e0);
+        let bytes = encode_frame(
+            rec,
+            w,
+            h,
+            sh,
+            planes_in.clone(),
+            EncodeOptions::fixed(PredictorKind::Median),
+        )
+        .unwrap();
+
+        for corrupt in [0u32, 1, 0x0000_2000, 0xdead_beef] {
+            let mut patched = bytes.clone();
+            // entry[0] occupies the four bytes at 0x20..0x24.
+            patched[0x20..0x24].copy_from_slice(&corrupt.to_le_bytes());
+            let dec = decode_frame(&patched)
+                .unwrap_or_else(|e| panic!("entry[0]={corrupt:#x}: decode failed: {e}"));
+            assert!(
+                samples_eq_planes(&planes_in, &dec.planes),
+                "entry[0]={corrupt:#x}: slice-table entry[0] must not change decoded pixels"
+            );
+        }
+    }
 }
