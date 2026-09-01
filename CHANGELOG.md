@@ -6,6 +6,49 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/OxideAV/oxideav-magicyuv/compare/v0.0.6...v0.0.7) - 2026-09-01
+
+### Fixed
+
+- *(clippy)* use byte-string literal for byte_char_slices lint (test-only)
+
+### Other
+
+- hide internal pub surface from rustdoc/semver (fleet rule 2026-09-01)
+- document forward-compat decode tolerances (spec open questions)
+- *(decode)* pin invariance to codec_variant byte + slice-table entry[0] (spec/04 §8 Q4, spec/02 §10 Q4)
+- *(decode)* tolerate trailing preamble bytes in default features (spec/05 §10 Q5)
+- *(decode)* prove slice_flags reserved bits 1..7 are ignored (spec/04 §8 Q3)
+- add CI / crates.io / docs.rs / MIT-license badges
+- typed width_extra accessor + decode robustness to +0x18 mismatch
+- pin raw-slice on-wire byte sizes to spec/05 §4.1 (open Q2)
+- refresh stale round-1-era doc comments to match complete impl
+- document the §6 slice-height divisibility guard + §4.4 formula pins
+- *(registry)* cover §6 slice-height guard at the registry encoder tier
+- *(predict)* pin spec/04 §4.4 bit-depth-conditional Median formula
+- reject slice_height indivisible by sub_y on 4:2:0 (spec/02 §6)
+- attach a MAGY content probe to disambiguate FourCC claims
+- report exact PixelFormat in output_params (spec/03 §4/§7)
+- expose slice_height as a registry encoder option (spec/02 §4)
+- accept interleaved 8-bit RGB/RGBA at the registry encoder
+- typed encoder options via CodecParameters::options (spec/04 + spec/05)
+- register a framework-level Encoder (spec/01 §4.1 + spec/03 §7)
+- document the cartesian + minimal-geometry property sweeps
+- seed decode corpus with 55 minimal-geometry frames
+- *(roundtrip)* minimal-geometry dynamic_auto sweep across all 17 FOURCCs
+- *(roundtrip)* minimal-geometry property sweep across all 17 FOURCCs
+- pin HBD-path malformed-input rejection guards (10/12/14-bit)
+- document proprietary-ground-truth conformance fixtures
+- *(decode)* ground-truth interlaced field-stride decode from spec §5.1.1
+- *(huffman)* pin exact §2.0.1 canonical code-assignment table
+- *(decode)* decode proprietary-ground-truth m8rg_64x64_zero from spec hex
+- *(roundtrip)* full cartesian encode→decode property sweep across the advertised input space
+- surface HuffmanIncomplete on under-full codespace hit (spec/05 §2.1)
+- *(huffman)* pin two-level high-bit-depth decode EOF/truncation robustness (spec/05 §3.3)
+- fix EOF-refill subtract-overflow in single-level Huffman decode (spec/05 §3)
+- *(decode)* pin reserved predictor_id=0x00 rejection (spec/04 §1.2 + §7.3c)
+- refresh to current status, drop per-round changelog cruft
+
 ### Other
 
 - silence the newly-promoted `clippy::byte_char_slices` lint in a registry probe test (`[b'M', b'A']` → `b"MA"`); mechanical, test-only, no behaviour change
