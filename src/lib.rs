@@ -57,12 +57,18 @@
 
 #![forbid(unsafe_code)]
 
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod bitreader;
 pub mod decoder;
 pub mod encoder;
 pub mod error;
 pub mod header;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod huffman;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod predict;
 #[cfg(feature = "registry")]
 pub mod registry;
