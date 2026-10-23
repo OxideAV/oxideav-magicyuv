@@ -20,7 +20,7 @@
 use std::cell::RefCell;
 use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 /// Process-local override of the trace destination, consulted before
@@ -34,8 +34,9 @@ static PATH_OVERRIDE: Mutex<Option<Option<PathBuf>>> = Mutex::new(None);
 /// Force the trace destination for this process: `Some(path)` traces
 /// to `path`, `None` disables tracing regardless of the env var.
 #[cfg(test)]
-pub(crate) fn set_trace_file(path: Option<&Path>) {
-    *PATH_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()) = Some(path.map(Path::to_path_buf));
+pub(crate) fn set_trace_file(path: Option<&std::path::Path>) {
+    *PATH_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some(path.map(std::path::Path::to_path_buf));
 }
 
 /// Per-thread (per-decode-call really) trace tape. Each `decode_frame`
