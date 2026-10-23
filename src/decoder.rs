@@ -16,6 +16,7 @@ use crate::error::{Error, Result};
 use crate::header::{self, FLAG_INTERLACED, FrameHeader};
 use crate::huffman::{self, HuffmanTable};
 use crate::predict::{self, FieldStride};
+use crate::slice_bounds::{self, MAX_SLICES};
 use crate::tables::{self, Family, FourccRecord};
 
 #[cfg(feature = "trace")]
@@ -209,7 +210,18 @@ pub fn decode_into(bytes: &[u8], dst: &mut DecodedFrame) -> Result<()> {
     let slice_height = hdr.slice_height as usize;
     let slices_per_plane = height.div_ceil(slice_height);
     let num_planes = rec.planes as usize;
-    let total_slices = num_planes * slices_per_plane;
+    let total_slices = num_planes
+        .checked_mul(slices_per_plane)
+        .ok_or(Error::TooManySlices {
+            got: usize::MAX,
+            max: MAX_SLICES,
+        })?;
+    if total_slices == 0 || total_slices > MAX_SLICES {
+        return Err(Error::TooManySlices {
+            got: total_slices,
+            max: MAX_SLICES,
+        });
+    }
 
     // Reject odd dims that don't divide chroma subsampling cleanly —
     // the rounding rule is unverified at odd sizes (spec/03 §8.2).
@@ -246,7 +258,13 @@ pub fn decode_into(bytes: &[u8], dst: &mut DecodedFrame) -> Result<()> {
 
     // Slice table: (total_slices + 1) u32 LE entries at offset 0x20.
     let table_off = header::HEADER_SIZE;
-    let table_bytes = 4 * (total_slices + 1);
+    let table_bytes = total_slices
+        .checked_add(1)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or(Error::TooManySlices {
+            got: total_slices,
+            max: MAX_SLICES,
+        })?;
     if bytes.len() < table_off + table_bytes {
         return Err(Error::Truncated {
             what: "slice table",
@@ -261,6 +279,7 @@ pub fn decode_into(bytes: &[u8], dst: &mut DecodedFrame) -> Result<()> {
         a.copy_from_slice(&bytes[off..off + 4]);
         entries.push(u32::from_le_bytes(a));
     }
+    slice_bounds::reject_nonmonotonic_table(&entries, total_slices)?;
 
     #[cfg(feature = "trace")]
     if let Some(t) = &tracer {
@@ -423,6 +442,7 @@ pub fn decode_into(bytes: &[u8], dst: &mut DecodedFrame) -> Result<()> {
             bytes,
             &entries,
             table_off,
+            preamble_end,
             total_slices,
             &slice_plane_map,
             &plane_geoms,
@@ -439,6 +459,7 @@ pub fn decode_into(bytes: &[u8], dst: &mut DecodedFrame) -> Result<()> {
             bytes,
             &entries,
             table_off,
+            preamble_end,
             total_slices,
             &slice_plane_map,
             &plane_geoms,
@@ -500,6 +521,7 @@ fn decode_eight_bit(
     bytes: &[u8],
     entries: &[u32],
     table_off: usize,
+    preamble_end: usize,
     total_slices: usize,
     slice_plane_map: &[(usize, usize)],
     plane_geoms: &[PlaneGeom],
@@ -525,15 +547,14 @@ fn decode_eight_bit(
         let row_end = ((in_plane_idx + 1) * g.plane_slice_height).min(g.height);
         let slice_rows = row_end - row_start;
 
-        let slice_start = (entries[s + 1] as usize) + table_off;
-        let slice_end = if s + 1 < total_slices {
-            (entries[s + 2] as usize) + table_off
-        } else {
-            bytes.len()
-        };
-        if slice_end < slice_start || bytes.len() < slice_end {
-            return Err(Error::SliceTruncated { slice_index: s });
-        }
+        let (slice_start, slice_end) = slice_bounds::slice_byte_range(
+            entries,
+            s,
+            total_slices,
+            table_off,
+            preamble_end,
+            bytes.len(),
+        )?;
         let payload = &bytes[slice_start..slice_end];
         if payload.len() < 2 {
             return Err(Error::SlicePrefixMissing { slice_index: s });
@@ -620,6 +641,7 @@ fn decode_high_bit_depth(
     bytes: &[u8],
     entries: &[u32],
     table_off: usize,
+    preamble_end: usize,
     total_slices: usize,
     slice_plane_map: &[(usize, usize)],
     plane_geoms: &[PlaneGeom],
@@ -645,15 +667,14 @@ fn decode_high_bit_depth(
         let row_end = ((in_plane_idx + 1) * g.plane_slice_height).min(g.height);
         let slice_rows = row_end - row_start;
 
-        let slice_start = (entries[s + 1] as usize) + table_off;
-        let slice_end = if s + 1 < total_slices {
-            (entries[s + 2] as usize) + table_off
-        } else {
-            bytes.len()
-        };
-        if slice_end < slice_start || bytes.len() < slice_end {
-            return Err(Error::SliceTruncated { slice_index: s });
-        }
+        let (slice_start, slice_end) = slice_bounds::slice_byte_range(
+            entries,
+            s,
+            total_slices,
+            table_off,
+            preamble_end,
+            bytes.len(),
+        )?;
         let payload = &bytes[slice_start..slice_end];
         if payload.len() < 2 {
             return Err(Error::SlicePrefixMissing { slice_index: s });

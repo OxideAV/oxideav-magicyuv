@@ -74,6 +74,7 @@ pub mod predict;
 pub mod registry;
 #[cfg(test)]
 mod roundtrip_tests;
+pub(crate) mod slice_bounds;
 pub mod tables;
 #[cfg(feature = "trace")]
 pub(crate) mod trace;
