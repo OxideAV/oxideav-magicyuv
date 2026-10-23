@@ -178,11 +178,7 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Truncated {
-                what,
-                needed,
-                have,
-            } => write!(
+            Self::Truncated { what, needed, have } => write!(
                 f,
                 "oxideav-magicyuv: truncated {what} (need {needed} bytes, have {have})"
             ),
@@ -216,10 +212,9 @@ impl fmt::Display for Error {
                 f,
                 "oxideav-magicyuv: predictor_id {b:#04x} not in {{0x01, 0x02, 0x03}} (spec/04 §1.2)"
             ),
-            Self::SliceTruncated { slice_index } => write!(
-                f,
-                "oxideav-magicyuv: slice {slice_index} payload truncated"
-            ),
+            Self::SliceTruncated { slice_index } => {
+                write!(f, "oxideav-magicyuv: slice {slice_index} payload truncated")
+            }
             Self::HuffmanOverfull { plane } => write!(
                 f,
                 "oxideav-magicyuv: plane {plane} Huffman descriptor over-full (spec/05 §2.0.3)"

@@ -52,10 +52,10 @@
 //! Run with:
 //!     cargo bench -p oxideav-magicyuv --bench encode_strategy_matrix
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use oxideav_magicyuv::tables::{self, Family, FourccRecord, PredictorKind};
-use oxideav_magicyuv::{encode_frame, EncodeOptions, PlaneInput, PredictorStrategy, SliceMode};
+use oxideav_magicyuv::{EncodeOptions, PlaneInput, PredictorStrategy, SliceMode, encode_frame};
 
 const BENCH_WIDTH: u32 = 640;
 const BENCH_HEIGHT: u32 = 480;
@@ -138,11 +138,7 @@ fn mode_tag(m: SliceMode) -> &'static str {
 }
 
 fn interlaced_tag(i: bool) -> &'static str {
-    if i {
-        "interlaced"
-    } else {
-        "progressive"
-    }
+    if i { "interlaced" } else { "progressive" }
 }
 
 fn bench_encode_strategy_matrix(c: &mut Criterion) {

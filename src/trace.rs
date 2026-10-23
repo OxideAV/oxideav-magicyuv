@@ -20,7 +20,23 @@
 use std::cell::RefCell;
 use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+/// Process-local override of the trace destination, consulted before
+/// `OXIDEAV_MAGICYUV_TRACE_FILE`. `None` = no override (the env var
+/// decides); `Some(None)` = tracing forced off; `Some(Some(path))` =
+/// trace to `path`. It exists so the in-crate tests can steer tracing
+/// without `std::env::set_var`, which is `unsafe` since edition 2024
+/// while this crate forbids unsafe code.
+static PATH_OVERRIDE: Mutex<Option<Option<PathBuf>>> = Mutex::new(None);
+
+/// Force the trace destination for this process: `Some(path)` traces
+/// to `path`, `None` disables tracing regardless of the env var.
+#[cfg(test)]
+pub(crate) fn set_trace_file(path: Option<&Path>) {
+    *PATH_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()) = Some(path.map(Path::to_path_buf));
+}
 
 /// Per-thread (per-decode-call really) trace tape. Each `decode_frame`
 /// call constructs a `Tracer`, threads it through, and drops it at the
@@ -30,12 +46,19 @@ pub(crate) struct Tracer {
 }
 
 impl Tracer {
-    /// Open the path in `OXIDEAV_MAGICYUV_TRACE_FILE` for append. If the
-    /// env var is unset / unreadable, returns `None` and the decoder's
-    /// trace points become no-ops.
+    /// Open the path in `OXIDEAV_MAGICYUV_TRACE_FILE` (or the
+    /// [`set_trace_file`] override) for append. If neither names a
+    /// path, or the file is unreadable, returns `None` and the
+    /// decoder's trace points become no-ops.
     pub fn from_env() -> Option<Self> {
-        let path = std::env::var_os("OXIDEAV_MAGICYUV_TRACE_FILE")?;
-        let path = PathBuf::from(path);
+        let forced = PATH_OVERRIDE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let path = match forced {
+            Some(forced) => forced?,
+            None => PathBuf::from(std::env::var_os("OXIDEAV_MAGICYUV_TRACE_FILE")?),
+        };
         let file = File::options().create(true).append(true).open(path).ok()?;
         Some(Self {
             writer: RefCell::new(BufWriter::new(file)),

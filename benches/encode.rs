@@ -5,10 +5,10 @@
 //! by value), which adds a tiny constant memcpy overhead but keeps
 //! the bench self-consistent.
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use oxideav_magicyuv::tables::{Family, FourccRecord, PredictorKind};
-use oxideav_magicyuv::{encode_frame, tables, EncodeOptions, PlaneInput, SliceMode};
+use oxideav_magicyuv::{EncodeOptions, PlaneInput, SliceMode, encode_frame, tables};
 
 fn xorshift_byte(state: &mut u32) -> u8 {
     *state ^= *state << 13;

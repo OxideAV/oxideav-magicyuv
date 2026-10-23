@@ -7,8 +7,8 @@ use std::time::Instant;
 
 use oxideav_magicyuv::tables::{Family, FourccRecord, PredictorKind};
 use oxideav_magicyuv::{
-    decode_frame, decode_into, encode_frame, tables, DecodedFrame, EncodeOptions, PlaneInput,
-    SliceMode,
+    DecodedFrame, EncodeOptions, PlaneInput, SliceMode, decode_frame, decode_into, encode_frame,
+    tables,
 };
 
 fn xorshift_byte(state: &mut u32) -> u8 {

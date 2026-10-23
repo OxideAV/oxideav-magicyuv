@@ -4,9 +4,9 @@
 //! Auditor-only). We synthesise frames with the public encoder,
 //! decode them back, and assert byte-exactness.
 
-use crate::decoder::{decode_frame, Samples};
-use crate::encoder::{encode_frame, EncodeOptions, PlaneInput, PredictorStrategy, SliceMode};
-use crate::tables::{lookup, lookup_round1, lookup_round2, Family, FourccRecord, PredictorKind};
+use crate::decoder::{Samples, decode_frame};
+use crate::encoder::{EncodeOptions, PlaneInput, PredictorStrategy, SliceMode, encode_frame};
+use crate::tables::{Family, FourccRecord, PredictorKind, lookup, lookup_round1, lookup_round2};
 
 /// Helper: build per-plane pixel buffers (8-bit) for a given FOURCC.
 fn make_planes_u8(rec: FourccRecord, width: u32, height: u32, pattern: u8) -> Vec<PlaneInput> {
@@ -1244,9 +1244,9 @@ fn trace_emits_audit02_event_vocabulary() {
     ));
     // Truncate first.
     let _ = std::fs::remove_file(&path);
-    std::env::set_var("OXIDEAV_MAGICYUV_TRACE_FILE", &path);
+    crate::trace::set_trace_file(Some(path.as_ref()));
     let _ = decode_frame(&bytes).expect("decode");
-    std::env::remove_var("OXIDEAV_MAGICYUV_TRACE_FILE");
+    crate::trace::set_trace_file(None);
 
     let mut s = String::new();
     std::fs::File::open(&path)
@@ -1324,9 +1324,9 @@ fn trace_huff_used_field_is_per_symbol_map() {
             .as_nanos()
     ));
     let _ = std::fs::remove_file(&path);
-    std::env::set_var("OXIDEAV_MAGICYUV_TRACE_FILE", &path);
+    crate::trace::set_trace_file(Some(path.as_ref()));
     let _ = decode_frame(&bytes).expect("decode");
-    std::env::remove_var("OXIDEAV_MAGICYUV_TRACE_FILE");
+    crate::trace::set_trace_file(None);
     let mut s = String::new();
     std::fs::File::open(&path)
         .unwrap()
@@ -1367,7 +1367,7 @@ fn trace_huff_used_field_is_per_symbol_map() {
     //
     // Pick the first symbol whose code-length is positive, parse its
     // value out of the JSON map, and compare.
-    use crate::huffman::{parse_lengths, HuffmanTable};
+    use crate::huffman::{HuffmanTable, parse_lengths};
     // Re-derive the descriptor bytes by re-running the encode pipeline
     // off the same input. Easier: parse them out of the trace event's
     // `descriptor_bytes` hex field.
@@ -1386,7 +1386,7 @@ fn trace_huff_used_field_is_per_symbol_map() {
     let (s_check, l_check) = lens
         .iter()
         .enumerate()
-        .find(|(_, &l)| l > 0)
+        .find(|&(_, &l)| l > 0)
         .map(|(s, &l)| (s, l))
         .expect("at least one positive-length symbol");
     let c_check = codes[s_check];
@@ -1473,9 +1473,9 @@ fn trace_preamble_trailing_emits_integer_extra_bytes() {
             .as_nanos()
     ));
     let _ = std::fs::remove_file(&path);
-    std::env::set_var("OXIDEAV_MAGICYUV_TRACE_FILE", &path);
+    crate::trace::set_trace_file(Some(path.as_ref()));
     let _ = decode_frame(&patched).expect("decode patched frame");
-    std::env::remove_var("OXIDEAV_MAGICYUV_TRACE_FILE");
+    crate::trace::set_trace_file(None);
 
     let mut s = String::new();
     std::fs::File::open(&path)
@@ -1528,7 +1528,7 @@ fn trace_omits_when_env_var_unset() {
         EncodeOptions::default(),
     )
     .unwrap();
-    std::env::remove_var("OXIDEAV_MAGICYUV_TRACE_FILE");
+    crate::trace::set_trace_file(None);
     let _ = decode_frame(&bytes).expect("decode");
 }
 
@@ -2288,7 +2288,7 @@ fn skewed_histogram_round_trips_median_10bit() {
 /// the most allocation-heavy code path).
 #[test]
 fn decode_into_matches_decode_frame_rgb_8bit() {
-    use crate::decoder::{decode_into, DecodedFrame};
+    use crate::decoder::{DecodedFrame, decode_into};
     let rec = lookup(0x65).expect("M8RG"); // RGB 8-bit, 3 planes
     let w = 64u32;
     let h = 32u32;
@@ -2325,7 +2325,7 @@ fn decode_into_matches_decode_frame_rgb_8bit() {
 /// buffers correctly and produces identical samples.
 #[test]
 fn decode_into_matches_decode_frame_rgb_10bit() {
-    use crate::decoder::{decode_into, DecodedFrame};
+    use crate::decoder::{DecodedFrame, decode_into};
     let rec = lookup(0x6d).expect("M0RG"); // RGB 10-bit, 3 planes
     let w = 32u32;
     let h = 16u32;
@@ -2357,7 +2357,7 @@ fn decode_into_matches_decode_frame_rgb_10bit() {
 /// decode and asserting they survive a second decode unchanged.
 #[test]
 fn decode_into_reuses_plane_storage_when_geometry_matches() {
-    use crate::decoder::{decode_into, DecodedFrame, Samples};
+    use crate::decoder::{DecodedFrame, Samples, decode_into};
     let rec = lookup(0x6b).expect("M8G0"); // Gray 8-bit, 1 plane
     let w = 64u32;
     let h = 64u32;
@@ -2392,7 +2392,7 @@ fn decode_into_reuses_plane_storage_when_geometry_matches() {
 /// the output samples are exact).
 #[test]
 fn decode_into_handles_geometry_change() {
-    use crate::decoder::{decode_into, DecodedFrame};
+    use crate::decoder::{DecodedFrame, decode_into};
     let rec = lookup(0x65).expect("M8RG");
     let mut dst = DecodedFrame::empty();
     // First frame: 64×32.
@@ -2448,7 +2448,7 @@ fn decode_into_handles_geometry_change() {
 /// too.
 #[test]
 fn decode_into_handles_bit_depth_change() {
-    use crate::decoder::{decode_into, DecodedFrame};
+    use crate::decoder::{DecodedFrame, decode_into};
     let mut dst = DecodedFrame::empty();
     // 8-bit Gray first.
     let rec_8 = lookup(0x6b).expect("M8G0");
@@ -2499,7 +2499,7 @@ fn decode_into_handles_bit_depth_change() {
 /// conversion to the consumer above the codec).
 #[test]
 fn encoder_color_matrix_knob_writes_flags_bits_20_23_and_round_trips() {
-    use crate::header::{parse as parse_header, FLAG_COLOR_MATRIX_MASK, FLAG_COLOR_MATRIX_SHIFT};
+    use crate::header::{FLAG_COLOR_MATRIX_MASK, FLAG_COLOR_MATRIX_SHIFT, parse as parse_header};
     let rec = lookup(0x65).expect("M8RG");
     let w = 32u32;
     let h = 16u32;
@@ -2561,7 +2561,7 @@ fn encoder_color_matrix_knob_writes_flags_bits_20_23_and_round_trips() {
 /// another (e.g. a `flags = ...` assignment in place of a `|=`).
 #[test]
 fn encoder_color_matrix_composes_with_interlaced_flag() {
-    use crate::header::{parse as parse_header, FLAG_INTERLACED};
+    use crate::header::{FLAG_INTERLACED, parse as parse_header};
     let rec = lookup(0x65).expect("M8RG");
     let w = 32u32;
     let h = 16u32;
@@ -2635,7 +2635,7 @@ fn encode_options_defaults_carry_matrix_skip_sentinel() {
     );
     // Sanity check: emit a frame with default options and confirm
     // the on-wire flags dword has zero in bits 20..23.
-    use crate::header::{parse as parse_header, FLAG_COLOR_MATRIX_MASK};
+    use crate::header::{FLAG_COLOR_MATRIX_MASK, parse as parse_header};
     let rec = lookup(0x65).expect("M8RG");
     let w = 16u32;
     let h = 16u32;
@@ -2671,7 +2671,7 @@ fn encode_options_defaults_carry_matrix_skip_sentinel() {
 /// by the override; see the dedicated family-sweep tests below.)
 #[test]
 fn encoder_full_range_knob_writes_flags_bit_2_and_round_trips() {
-    use crate::header::{parse as parse_header, FLAG_FULL_RANGE};
+    use crate::header::{FLAG_FULL_RANGE, parse as parse_header};
     let rec = lookup(0x69).expect("M8Y0");
     let w = 32u32;
     let h = 16u32;
@@ -2716,7 +2716,7 @@ fn encoder_full_range_knob_writes_flags_bit_2_and_round_trips() {
 /// pixel bytes still round-trip (the override is header-only).
 #[test]
 fn full_range_override_clears_bit_2_for_rgb_family() {
-    use crate::header::{parse as parse_header, FLAG_FULL_RANGE};
+    use crate::header::{FLAG_FULL_RANGE, parse as parse_header};
     for &fb in &[0x65u8, 0x66, 0x6d, 0x6e, 0x6f, 0x70, 0x71, 0x72] {
         let rec = lookup(fb).expect("native RGB-family format byte");
         let w = 16u32;
@@ -2774,7 +2774,7 @@ fn full_range_override_clears_bit_2_for_rgb_family() {
 /// flags bit 2 and reads back through `is_full_range()`.
 #[test]
 fn full_range_survives_for_yuv_and_gray_family() {
-    use crate::header::{parse as parse_header, FLAG_FULL_RANGE};
+    use crate::header::{FLAG_FULL_RANGE, parse as parse_header};
     for &fb in &[0x67u8, 0x68, 0x69, 0x6a, 0x6b, 0x6c, 0x73, 0x76, 0x7b] {
         let rec = lookup(fb).expect("native YUV/Gray-family format byte");
         let w = 16u32;
@@ -2820,7 +2820,7 @@ fn full_range_survives_for_yuv_and_gray_family() {
 /// three authored knobs are observable on the wire simultaneously.
 #[test]
 fn encoder_full_range_composes_with_interlaced_and_color_matrix() {
-    use crate::header::{parse as parse_header, FLAG_FULL_RANGE, FLAG_INTERLACED};
+    use crate::header::{FLAG_FULL_RANGE, FLAG_INTERLACED, parse as parse_header};
     let rec = lookup(0x69).expect("M8Y0");
     let w = 32u32;
     let h = 16u32;
@@ -2886,7 +2886,7 @@ fn encode_options_defaults_clear_full_range() {
         !EncodeOptions::dynamic_auto().full_range,
         "dynamic_auto() helper must default full_range to false",
     );
-    use crate::header::{parse as parse_header, FLAG_FULL_RANGE};
+    use crate::header::{FLAG_FULL_RANGE, parse as parse_header};
     let rec = lookup(0x65).expect("M8RG");
     let w = 16u32;
     let h = 16u32;
@@ -3521,7 +3521,7 @@ mod high_bit_depth_malformed_input {
 /// (the all-`0xff` Huffman bitstream and why an all-zero residual
 /// plane encodes that way).
 mod spec_fixture_decode {
-    use crate::decoder::{decode_frame, Samples};
+    use crate::decoder::{Samples, decode_frame};
 
     /// Assemble the exact bytes of `m8rg_64x64_zero.bin` from the hex
     /// transcribed in `spec/02 §5.2` and `spec/05 §7`.
@@ -3590,8 +3590,8 @@ mod spec_fixture_decode {
         for plane in 0..3 {
             push_slice(&mut f, 224, 0); // slice 0: rows 0..27
             push_slice(&mut f, 224, 0); // slice 1: rows 28..55
-                                        // slice 2: rows 56..63 (8 rows). The plane-2 last slice
-                                        // carries 16 trailing pad bytes to make the frame even.
+            // slice 2: rows 56..63 (8 rows). The plane-2 last slice
+            // carries 16 trailing pad bytes to make the frame even.
             let pad = if plane == 2 { 16 } else { 0 };
             push_slice(&mut f, 64, pad);
         }

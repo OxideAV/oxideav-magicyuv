@@ -9,17 +9,17 @@
 #![cfg(feature = "registry")]
 
 use oxideav_core::{
-    parse_options, CodecCapabilities, CodecId, CodecInfo, CodecOptionsStruct, CodecParameters,
-    CodecRegistry, CodecTag, Decoder, Encoder, Error as CoreError, Frame, MediaType, OptionField,
-    OptionKind, OptionValue, Packet, PixelFormat, Result as CoreResult, RuntimeContext, TimeBase,
-    VideoFrame, VideoPlane,
+    CodecCapabilities, CodecId, CodecInfo, CodecOptionsStruct, CodecParameters, CodecRegistry,
+    CodecTag, Decoder, Encoder, Error as CoreError, Frame, MediaType, OptionField, OptionKind,
+    OptionValue, Packet, PixelFormat, Result as CoreResult, RuntimeContext, TimeBase, VideoFrame,
+    VideoPlane, parse_options,
 };
 
-use crate::decoder::{decode_frame, DecodedFrame, Samples};
+use crate::decoder::{DecodedFrame, Samples, decode_frame};
 use crate::encoder::{
-    encode_frame, output_params, EncodeOptions, PlaneInput, PredictorStrategy, SliceMode,
+    EncodeOptions, PlaneInput, PredictorStrategy, SliceMode, encode_frame, output_params,
 };
-use crate::tables::{lookup, Family, FourccRecord, PredictorKind};
+use crate::tables::{Family, FourccRecord, PredictorKind, lookup};
 
 /// Canonical codec id. `oxideav-meta::register_all` calls
 /// `crate::__oxideav_entry`, which delegates here.
@@ -444,10 +444,10 @@ fn fourcc_record_for_params(params: &CodecParameters) -> CoreResult<FourccRecord
 /// Linear scan of the native FourCC table for a 4-byte code.
 fn fourcc_table_lookup_by_fourcc(raw: &[u8; 4]) -> Option<FourccRecord> {
     for fb in 0x00u8..=0xFF {
-        if let Some(rec) = lookup(fb) {
-            if &rec.fourcc == raw {
-                return Some(rec);
-            }
+        if let Some(rec) = lookup(fb)
+            && &rec.fourcc == raw
+        {
+            return Some(rec);
         }
     }
     None
@@ -519,7 +519,7 @@ impl MagicYuvEncoder {
                 )));
             }
             let mut samples = Vec::with_capacity(want);
-            for chunk in plane.data.chunks_exact(2) {
+            for chunk in plane.data.as_chunks::<2>().0 {
                 samples.push(u16::from_le_bytes([chunk[0], chunk[1]]));
             }
             Ok(PlaneInput::U16(samples))
@@ -648,8 +648,8 @@ mod tests {
     use super::*;
     use oxideav_core::{CodecId, CodecParameters, Packet, TimeBase};
 
-    use crate::encoder::{encode_frame, EncodeOptions, PlaneInput};
-    use crate::tables::{lookup_round1, PredictorKind};
+    use crate::encoder::{EncodeOptions, PlaneInput, encode_frame};
+    use crate::tables::{PredictorKind, lookup_round1};
 
     #[test]
     fn register_via_runtime_context_installs_codec() {
@@ -794,7 +794,7 @@ mod tests {
 
     // ─────────────────── registry Encoder impl ───────────────────
 
-    use crate::tables::{lookup, lookup_round2, Family};
+    use crate::tables::{Family, lookup, lookup_round2};
     use oxideav_core::{ProbeContext, VideoFrame, VideoPlane};
 
     /// Build a `CodecParameters` carrying the native FourCC + geometry
@@ -1333,7 +1333,7 @@ mod tests {
         // End-to-end through the registry: a registered FourCC with a
         // real MAGY packet resolves to magicyuv; the same FourCC with a
         // foreign packet does not (probe returns 0.0 → skipped).
-        use crate::encoder::{output_params, PlaneInput};
+        use crate::encoder::{PlaneInput, output_params};
         use crate::tables::PredictorKind;
 
         let rec = lookup(0x6b).unwrap(); // M8G0

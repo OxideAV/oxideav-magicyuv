@@ -78,15 +78,15 @@ pub mod tables;
 #[cfg(feature = "trace")]
 pub(crate) mod trace;
 
-pub use crate::decoder::{decode_frame, decode_into, DecodedFrame, DecodedPlane, Samples};
+pub use crate::decoder::{DecodedFrame, DecodedPlane, Samples, decode_frame, decode_into};
 #[cfg(feature = "registry")]
 pub use crate::encoder::output_params;
-pub use crate::encoder::{encode_frame, EncodeOptions, PlaneInput, PredictorStrategy, SliceMode};
+pub use crate::encoder::{EncodeOptions, PlaneInput, PredictorStrategy, SliceMode, encode_frame};
 pub use crate::error::{Error, Result};
 
 // Framework integration — only when the `registry` feature is on.
 #[cfg(feature = "registry")]
-pub use crate::registry::{register, register_codecs, CODEC_ID_STR};
+pub use crate::registry::{CODEC_ID_STR, register, register_codecs};
 
 #[cfg(feature = "registry")]
 oxideav_core::register!("oxideav-magicyuv", register);

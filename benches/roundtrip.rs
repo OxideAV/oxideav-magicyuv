@@ -2,10 +2,10 @@
 //! "end-to-end pipeline" health check — adds the encode + decode wall
 //! times together so a regression in either side is visible.
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use oxideav_magicyuv::tables::{Family, FourccRecord, PredictorKind};
-use oxideav_magicyuv::{decode_frame, encode_frame, tables, EncodeOptions, PlaneInput, SliceMode};
+use oxideav_magicyuv::{EncodeOptions, PlaneInput, SliceMode, decode_frame, encode_frame, tables};
 
 fn xorshift_byte(state: &mut u32) -> u8 {
     *state ^= *state << 13;

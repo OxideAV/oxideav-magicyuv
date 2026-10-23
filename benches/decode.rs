@@ -26,10 +26,10 @@
 //! Run with:
 //!     cargo bench -p oxideav-magicyuv --bench decode
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use oxideav_magicyuv::tables::{Family, FourccRecord, PredictorKind};
-use oxideav_magicyuv::{decode_frame, encode_frame, tables, EncodeOptions, PlaneInput, SliceMode};
+use oxideav_magicyuv::{EncodeOptions, PlaneInput, SliceMode, decode_frame, encode_frame, tables};
 
 /// Cheap deterministic xorshift32 — synthesises "natural-ish"
 /// per-pixel values for the bench inputs so residuals are not all

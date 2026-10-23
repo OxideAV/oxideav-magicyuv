@@ -11,9 +11,9 @@
 //! Round 2 covers the full 8-bit + 10/12/14-bit native FOURCC set
 //! plus interlaced field-stride=2 prediction (`flags & 0x02`).
 
-use crate::bitreader::{unpack_raw_bits_to_u16, BitReader};
+use crate::bitreader::{BitReader, unpack_raw_bits_to_u16};
 use crate::error::{Error, Result};
-use crate::header::{self, FrameHeader, FLAG_INTERLACED};
+use crate::header::{self, FLAG_INTERLACED, FrameHeader};
 use crate::huffman::{self, HuffmanTable};
 use crate::predict::{self, FieldStride};
 use crate::tables::{self, Family, FourccRecord};
@@ -397,12 +397,12 @@ pub fn decode_into(bytes: &[u8], dst: &mut DecodedFrame) -> Result<()> {
     // an integer count, matching the Python ref's
     // `len(preamble) - cursor` emission at `frame.py:514`.
     #[cfg(feature = "trace")]
-    if let Some(t) = &tracer {
-        if desc_pos < preamble.len() {
-            t.emit(Event::PreambleTrailing {
-                extra_bytes: preamble.len() - desc_pos,
-            });
-        }
+    if let Some(t) = &tracer
+        && desc_pos < preamble.len()
+    {
+        t.emit(Event::PreambleTrailing {
+            extra_bytes: preamble.len() - desc_pos,
+        });
     }
     let _ = desc_pos;
 

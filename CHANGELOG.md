@@ -6,6 +6,10 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- edition 2024, MSRV 1.95
+
 ### Other
 
 - silence the newly-promoted `clippy::byte_char_slices` lint in a registry probe test (`[b'M', b'A']` → `b"MA"`); mechanical, test-only, no behaviour change

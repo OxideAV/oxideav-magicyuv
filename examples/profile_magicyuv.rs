@@ -79,7 +79,7 @@ use std::time::Instant;
 
 use oxideav_magicyuv::tables::{Family, FourccRecord, PredictorKind};
 use oxideav_magicyuv::{
-    decode_into, encode_frame, tables, DecodedFrame, EncodeOptions, PlaneInput, SliceMode,
+    DecodedFrame, EncodeOptions, PlaneInput, SliceMode, decode_into, encode_frame, tables,
 };
 
 // ───────────────────── synthesised input planes ─────────────────────

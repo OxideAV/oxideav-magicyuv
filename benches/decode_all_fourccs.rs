@@ -32,10 +32,10 @@
 //! Run with:
 //!     cargo bench -p oxideav-magicyuv --bench decode_all_fourccs
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
-use oxideav_magicyuv::tables::{fourcc_table, Family, FourccRecord, PredictorKind};
-use oxideav_magicyuv::{decode_frame, encode_frame, EncodeOptions, PlaneInput, SliceMode};
+use oxideav_magicyuv::tables::{Family, FourccRecord, PredictorKind, fourcc_table};
+use oxideav_magicyuv::{EncodeOptions, PlaneInput, SliceMode, decode_frame, encode_frame};
 
 const BENCH_WIDTH: u32 = 640;
 const BENCH_HEIGHT: u32 = 480;

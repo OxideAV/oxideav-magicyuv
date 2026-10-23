@@ -236,14 +236,14 @@ pub fn encode_frame(
     // `width / sub_x` (which drops the last chroma column/row and
     // produces a stream the decoder then rejects). For even
     // dimensions `ceil == floor` and this guard is inert.
-    if rec.sub_x as u32 > 1 && (width % rec.sub_x as u32) != 0 {
+    if rec.sub_x as u32 > 1 && !width.is_multiple_of(rec.sub_x as u32) {
         return Err(Error::OddDimensionForSubsampling {
             what: "width",
             got: width,
             factor: rec.sub_x as u32,
         });
     }
-    if rec.sub_y as u32 > 1 && (height % rec.sub_y as u32) != 0 {
+    if rec.sub_y as u32 > 1 && !height.is_multiple_of(rec.sub_y as u32) {
         return Err(Error::OddDimensionForSubsampling {
             what: "height",
             got: height,
@@ -256,7 +256,7 @@ pub fn encode_frame(
     // inert for `sub_y == 1`. `slice_height == 0` is normalised to a
     // single full-frame slice by the callers below before reaching the
     // partition arithmetic, so it's exempt here.
-    if rec.sub_y as u32 > 1 && slice_height != 0 && (slice_height % rec.sub_y as u32) != 0 {
+    if rec.sub_y as u32 > 1 && slice_height != 0 && !slice_height.is_multiple_of(rec.sub_y as u32) {
         return Err(Error::SliceHeightNotDivisibleBySubsampling {
             slice_height,
             factor: rec.sub_y as u32,
@@ -580,7 +580,7 @@ fn package_merge_lengths(hist: &[u32], cap: u8) -> Vec<u8> {
     let mut active: Vec<(usize, u64)> = hist
         .iter()
         .enumerate()
-        .filter(|(_, &c)| c > 0)
+        .filter(|&(_, &c)| c > 0)
         .map(|(s, &c)| (s, c as u64))
         .collect();
     active.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
@@ -1123,7 +1123,7 @@ fn encode_frame_u8(
                     plane: i,
                     expected: 0,
                     got: 1,
-                })
+                });
             }
         }
     }
@@ -1587,7 +1587,7 @@ fn encode_frame_u16(
                     plane: i,
                     expected: 1,
                     got: 0,
-                })
+                });
             }
         }
     }
@@ -1989,21 +1989,21 @@ fn write_header(
     out.push(rec.format_byte);
     out.push(rec.aux_byte);
     out.push(0x02); // codec_variant — v2.4.2 always 0x02 (spec/04 §2).
-                    // Encoder OR-accumulator from spec/01 §3.1 (the v2.4.2 encoder's
-                    // `magicyuv.dll!0x69b97647`–`0x69b9767a` sequence): the
-                    // `ColorMatrix == 1` registry value is the matrix-skip
-                    // sentinel — the encoder branches over the OR step, leaving
-                    // flags bits 20..23 clear; any other low-nibble value
-                    // (0..=15 modulo `& 0xf`) shifts into bits 20..23 with mask
-                    // `0x00f00000`. Interlaced (bit 1) accumulates from the
-                    // separate `Interlaced` registry value at context `+0x70`.
-                    // Full-range YUV (bit 2, registry `+0x78`) — when the
-                    // `FullRangeYUV` registry value is non-zero, the OR step
-                    // contributes `0x4` to the flags dword (mask
-                    // `0x00000004`); the decoder pickup at
-                    // `magicyuv.dll!0x69bae311` (file `@0x2d311`) shifts the
-                    // dword right by 2 and isolates the low bit, routing the
-                    // boolean to the application/conversion layer.
+    // Encoder OR-accumulator from spec/01 §3.1 (the v2.4.2 encoder's
+    // `magicyuv.dll!0x69b97647`–`0x69b9767a` sequence): the
+    // `ColorMatrix == 1` registry value is the matrix-skip
+    // sentinel — the encoder branches over the OR step, leaving
+    // flags bits 20..23 clear; any other low-nibble value
+    // (0..=15 modulo `& 0xf`) shifts into bits 20..23 with mask
+    // `0x00f00000`. Interlaced (bit 1) accumulates from the
+    // separate `Interlaced` registry value at context `+0x70`.
+    // Full-range YUV (bit 2, registry `+0x78`) — when the
+    // `FullRangeYUV` registry value is non-zero, the OR step
+    // contributes `0x4` to the flags dword (mask
+    // `0x00000004`); the decoder pickup at
+    // `magicyuv.dll!0x69bae311` (file `@0x2d311`) shifts the
+    // dword right by 2 and isolates the low bit, routing the
+    // boolean to the application/conversion layer.
     let mut flags: u32 = 0;
     if interlaced {
         flags |= FLAG_INTERLACED;
@@ -2071,7 +2071,7 @@ mod huffman_limit_tests {
         let codes: Vec<(u32, u8)> = lengths
             .iter()
             .enumerate()
-            .filter(|(_, &l)| l > 0)
+            .filter(|&(_, &l)| l > 0)
             .map(|(s, &l)| (ph.codes[s], l))
             .collect();
         // Pairwise: code A is a prefix of code B (A no longer than B)
