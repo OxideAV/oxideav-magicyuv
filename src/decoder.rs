@@ -411,6 +411,19 @@ pub fn decode_into(bytes: &[u8], dst: &mut DecodedFrame) -> Result<()> {
         .map(|p| plane_geom(rec, p, width, height, slice_height))
         .collect();
 
+    // Resolve and size-check every slice *before* the plane buffers are
+    // sized from the header geometry. See `validate_slices`.
+    let slice_ranges = validate_slices(
+        bytes,
+        &entries,
+        table_off,
+        total_slices,
+        &slice_plane_map,
+        &plane_geoms,
+        &huff_tables,
+        rec,
+    )?;
+
     let interlaced = (hdr.flags & FLAG_INTERLACED) != 0;
     let field_stride = if interlaced {
         FieldStride::INTERLACED
@@ -421,9 +434,7 @@ pub fn decode_into(bytes: &[u8], dst: &mut DecodedFrame) -> Result<()> {
     if rec.is_high_bit_depth() {
         decode_high_bit_depth(
             bytes,
-            &entries,
-            table_off,
-            total_slices,
+            &slice_ranges,
             &slice_plane_map,
             &plane_geoms,
             &huff_tables,
@@ -437,9 +448,7 @@ pub fn decode_into(bytes: &[u8], dst: &mut DecodedFrame) -> Result<()> {
     } else {
         decode_eight_bit(
             bytes,
-            &entries,
-            table_off,
-            total_slices,
+            &slice_ranges,
             &slice_plane_map,
             &plane_geoms,
             &huff_tables,
@@ -451,6 +460,110 @@ pub fn decode_into(bytes: &[u8], dst: &mut DecodedFrame) -> Result<()> {
             dst,
         )
     }
+}
+
+/// Minimum number of payload bytes (after the 2-byte slice prefix)
+/// that can carry `pixels` residuals at `bits_per_residual` bits each:
+/// `ceil(pixels * bits / 8)`. Computed in `u64` so the product cannot
+/// wrap on 32-bit targets; `None` if the result does not fit `usize`.
+fn min_payload_bytes(pixels: usize, bits_per_residual: u32) -> Option<usize> {
+    let bits = (pixels as u64).checked_mul(bits_per_residual as u64)?;
+    usize::try_from(bits.div_ceil(8)).ok()
+}
+
+/// Resolve every slice's byte range per the `spec/02` §5.1 decoder
+/// rule and reject any slice that cannot possibly hold its residuals,
+/// *before* the decoder sizes its plane buffers from the header.
+///
+/// Per slice `s` (`0..total_slices`):
+///
+/// - start = `entry[s+1] + 0x20`; end = `entry[s+2] + 0x20`, or the
+///   packet length for the last slice (`spec/02` §5.1). Both are
+///   computed with checked arithmetic; `end < start` (a non-monotonic
+///   or overlapping table) or `end > packet length` is
+///   [`Error::SliceTruncated`]. Because every slice must satisfy
+///   `start <= end` and slice 0 starts at the preamble end
+///   (`entry[1]`, `spec/02` §5.1), the chain also guarantees that no
+///   slice starts inside the header, slice table or preamble.
+/// - the payload carries the 2-byte `slice_flags` / `predictor_id`
+///   prefix (`spec/05` §3.1), else [`Error::SlicePrefixMissing`].
+/// - the bytes after the prefix are at least the minimum the slice's
+///   `rows × plane_width` residuals need: `bits` bits each in raw mode
+///   (`spec/05` §4.1 — one byte per sample at 8-bit), and at least the
+///   plane's *shortest* code length each in Huffman mode (`spec/05`
+///   §3.4: a Huffman slice is `2 + ceil(Σ code bits / 8)` bytes, and
+///   every assigned code is ≥ 1 bit). A Huffman slice of a plane whose
+///   descriptor assigns no code at all is [`Error::HuffmanIncomplete`].
+///
+/// The last check is what bounds the decoder's memory: the bit reader
+/// zero-pads past the end of a slice (`spec/05` §3.3 — the residual
+/// count comes from geometry, not from the bitstream), so without it a
+/// few hundred bytes declaring a `32768 × 32768` raster would make the
+/// decoder allocate and fill gigabytes of planes. With it, the decoded
+/// raster is at most 8 samples per input byte.
+#[allow(clippy::too_many_arguments)]
+fn validate_slices(
+    bytes: &[u8],
+    entries: &[u32],
+    table_off: usize,
+    total_slices: usize,
+    slice_plane_map: &[(usize, usize)],
+    plane_geoms: &[PlaneGeom],
+    huff_tables: &[HuffmanTable],
+    rec: FourccRecord,
+) -> Result<Vec<(usize, usize)>> {
+    let offset = |e: u32, s: usize| {
+        usize::try_from(e)
+            .ok()
+            .and_then(|e| e.checked_add(table_off))
+            .ok_or(Error::SliceTruncated { slice_index: s })
+    };
+    // Shortest assigned code per plane (0 = no code assigned).
+    let min_code_len: Vec<u32> = huff_tables
+        .iter()
+        .map(|t| {
+            t.lengths()
+                .iter()
+                .copied()
+                .filter(|&l| l > 0)
+                .min()
+                .unwrap_or(0) as u32
+        })
+        .collect();
+    let mut ranges = Vec::with_capacity(total_slices);
+    for (s, &(plane, in_plane_idx)) in slice_plane_map.iter().enumerate() {
+        let start = offset(entries[s + 1], s)?;
+        let end = if s + 1 < total_slices {
+            offset(entries[s + 2], s)?
+        } else {
+            bytes.len()
+        };
+        if end < start || bytes.len() < end {
+            return Err(Error::SliceTruncated { slice_index: s });
+        }
+        if end - start < 2 {
+            return Err(Error::SlicePrefixMissing { slice_index: s });
+        }
+        let g = plane_geoms[plane];
+        let row_start = in_plane_idx * g.plane_slice_height;
+        let row_end = ((in_plane_idx + 1) * g.plane_slice_height).min(g.height);
+        let pixels = row_end.saturating_sub(row_start) * g.width;
+        let bits_per_residual = if (bytes[start] & 0x01) != 0 {
+            rec.bit_depth as u32
+        } else {
+            match min_code_len[plane] {
+                0 => return Err(Error::HuffmanIncomplete { plane }),
+                l => l,
+            }
+        };
+        let needed = min_payload_bytes(pixels, bits_per_residual)
+            .ok_or(Error::SliceTruncated { slice_index: s })?;
+        if end - start - 2 < needed {
+            return Err(Error::SliceTruncated { slice_index: s });
+        }
+        ranges.push((start, end));
+    }
+    Ok(ranges)
 }
 
 /// Pull the existing per-plane `Vec<u8>` storage out of `dst` so it
@@ -498,9 +611,7 @@ fn take_plane_bufs_u16(dst: &mut DecodedFrame, plane_geoms: &[PlaneGeom]) -> Vec
 #[allow(clippy::too_many_arguments)]
 fn decode_eight_bit(
     bytes: &[u8],
-    entries: &[u32],
-    table_off: usize,
-    total_slices: usize,
+    slice_ranges: &[(usize, usize)],
     slice_plane_map: &[(usize, usize)],
     plane_geoms: &[PlaneGeom],
     huff_tables: &[HuffmanTable],
@@ -515,7 +626,7 @@ fn decode_eight_bit(
     // size-mismatched (or previously-U16) slots allocate.
     let mut plane_bufs: Vec<Vec<u8>> = take_plane_bufs_u8(dst, plane_geoms);
 
-    for s in 0..total_slices {
+    for (s, &(slice_start, slice_end)) in slice_ranges.iter().enumerate() {
         // `(plane, in_plane_idx)` comes from the on-wire
         // `per_slice_plane_index` mapping (spec/02 §7.3), not the
         // assumed plane-major `s / slices_per_plane`.
@@ -525,19 +636,9 @@ fn decode_eight_bit(
         let row_end = ((in_plane_idx + 1) * g.plane_slice_height).min(g.height);
         let slice_rows = row_end - row_start;
 
-        let slice_start = (entries[s + 1] as usize) + table_off;
-        let slice_end = if s + 1 < total_slices {
-            (entries[s + 2] as usize) + table_off
-        } else {
-            bytes.len()
-        };
-        if slice_end < slice_start || bytes.len() < slice_end {
-            return Err(Error::SliceTruncated { slice_index: s });
-        }
+        // Bounds, prefix and minimum size were checked by
+        // `validate_slices`.
         let payload = &bytes[slice_start..slice_end];
-        if payload.len() < 2 {
-            return Err(Error::SlicePrefixMissing { slice_index: s });
-        }
         let slice_flags = payload[0];
         let predictor_id = payload[1];
         let pred_kind = tables::lookup_predictor(predictor_id)?;
@@ -549,7 +650,7 @@ fn decode_eight_bit(
         if (slice_flags & 0x01) != 0 {
             mode_str = "raw";
             let needed = pixels_in_slice;
-            if payload.len() < 2 + needed {
+            if payload.len() - 2 < needed {
                 return Err(Error::SliceTruncated { slice_index: s });
             }
             buf.copy_from_slice(&payload[2..2 + needed]);
@@ -618,9 +719,7 @@ fn decode_eight_bit(
 #[allow(clippy::too_many_arguments)]
 fn decode_high_bit_depth(
     bytes: &[u8],
-    entries: &[u32],
-    table_off: usize,
-    total_slices: usize,
+    slice_ranges: &[(usize, usize)],
     slice_plane_map: &[(usize, usize)],
     plane_geoms: &[PlaneGeom],
     huff_tables: &[HuffmanTable],
@@ -636,7 +735,7 @@ fn decode_high_bit_depth(
 
     let mut plane_bufs: Vec<Vec<u16>> = take_plane_bufs_u16(dst, plane_geoms);
 
-    for s in 0..total_slices {
+    for (s, &(slice_start, slice_end)) in slice_ranges.iter().enumerate() {
         // On-wire slice→plane mapping (spec/02 §7.3); see
         // `decode_eight_bit` for the rationale.
         let (plane, in_plane_idx) = slice_plane_map[s];
@@ -645,19 +744,9 @@ fn decode_high_bit_depth(
         let row_end = ((in_plane_idx + 1) * g.plane_slice_height).min(g.height);
         let slice_rows = row_end - row_start;
 
-        let slice_start = (entries[s + 1] as usize) + table_off;
-        let slice_end = if s + 1 < total_slices {
-            (entries[s + 2] as usize) + table_off
-        } else {
-            bytes.len()
-        };
-        if slice_end < slice_start || bytes.len() < slice_end {
-            return Err(Error::SliceTruncated { slice_index: s });
-        }
+        // Bounds, prefix and minimum size were checked by
+        // `validate_slices`.
         let payload = &bytes[slice_start..slice_end];
-        if payload.len() < 2 {
-            return Err(Error::SlicePrefixMissing { slice_index: s });
-        }
         let slice_flags = payload[0];
         let predictor_id = payload[1];
         let pred_kind = tables::lookup_predictor(predictor_id)?;
@@ -671,9 +760,9 @@ fn decode_high_bit_depth(
             // High-bit-depth raw mode: residuals are bit-packed at
             // `bits` bits per sample, MSB-first, total
             // `pixels_in_slice * bits` bits (`spec/05` §4.1).
-            let needed_bits = pixels_in_slice * bits as usize;
-            let needed_bytes = needed_bits.div_ceil(8);
-            if payload.len() < 2 + needed_bytes {
+            let needed_bytes = min_payload_bytes(pixels_in_slice, bits as u32)
+                .ok_or(Error::SliceTruncated { slice_index: s })?;
+            if payload.len() - 2 < needed_bytes {
                 return Err(Error::SliceTruncated { slice_index: s });
             }
             // Batched unpacker — same observable bit stream as a

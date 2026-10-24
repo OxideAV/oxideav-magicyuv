@@ -10,6 +10,11 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - edition 2024, MSRV 1.95
 
+### Fixed
+
+- **bound decoder memory by the packet size: reject slices too short for their residual count before allocating planes** (`spec/05` §3.3 / §3.4 / §4.1). The bit reader zero-pads past a slice's end because the residual count comes from geometry, so a few hundred bytes declaring a `32768 × 32768` raster (e.g. a 4096×20 M8RG frame from 736 bytes, or up to 8 GiB of 14-bit planes) used to be accepted and allocated/filled in full. A new pre-pass resolves every slice range per `spec/02` §5.1 with checked arithmetic (no `entry + 0x20` wrap on 32-bit targets) and requires `2 + ceil(pixels × min_bits / 8)` payload bytes — `bits` per raw residual, the plane's shortest code length per Huffman residual (every assigned code is ≥ 1 bit) — before the plane buffers are sized, capping the decoded raster at 8 samples per input byte. Conformant streams are unaffected (they carry every code bit). The `decode_magicyuv` fuzz harness drops its 16 MiB raster cap accordingly (11 min / 11 M execs at `-rss_limit_mb=2048`, no findings)
+- new `tests/slice_table_hostile.rs`: every truncation of six baseline frames (8-bit RGB / RGBA / YUV 4:2:0 / Gray, 10-bit RGB / YUV 4:2:2, Huffman and raw), slice offsets past the packet end and near `u32::MAX`, non-monotonic / swapped / overlapping / zero-length / into-the-preamble offsets, `entry[0]` invariance, every single-byte corruption of the table and preamble, zero / huge `slice_height`, and oversized or overflowing width / height — each through both `decode_frame` and a reused `decode_into`
+
 ### Other
 
 - silence the newly-promoted `clippy::byte_char_slices` lint in a registry probe test (`[b'M', b'A']` → `b"MA"`); mechanical, test-only, no behaviour change
