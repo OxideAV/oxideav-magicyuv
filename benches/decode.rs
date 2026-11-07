@@ -105,10 +105,7 @@ fn encode_test_frame(
 ) -> Vec<u8> {
     let rec = tables::lookup(format_byte).expect("FOURCC in CSV");
     let planes = make_planes(rec, width, height);
-    let opts = EncodeOptions {
-        mode: SliceMode::Huffman,
-        ..EncodeOptions::fixed(predictor)
-    };
+    let opts = EncodeOptions::fixed(predictor).with_mode(SliceMode::Huffman);
     // Slice height = 28 mirrors the reference encoder's default.
     encode_frame(rec, width, height, 28, planes, opts).expect("encode")
 }

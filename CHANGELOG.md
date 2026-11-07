@@ -6,6 +6,14 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `with_<field>` setters on `EncodeOptions`, `MagicYuvEncoderOptions` and `DecodedFrame`; `new(..)` (every field, in declaration order) on `DecodedPlane`, `FrameHeader`, `tables::FourccRecord` and `tables::PredictorRecord`.
+
+### Changed
+
+- `#[non_exhaustive]` on the enums `Error`, `SliceMode`, `PredictorStrategy` and `tables::Family`, and on the records `DecodedFrame`, `DecodedPlane`, `EncodeOptions`, `FrameHeader`, `MagicYuvEncoderOptions`, `tables::FourccRecord`, `tables::PredictorRecord`. `Samples` / `PlaneInput` (8- vs 16-bit storage) and `tables::PredictorKind` (the format's three predictors) stay exhaustive.
+
 ## [0.0.7](https://github.com/OxideAV/oxideav-magicyuv/compare/v0.0.6...v0.0.7) - 2026-10-24
 
 ### Fixed

@@ -48,10 +48,7 @@ fn make_planes(rec: FourccRecord, width: u32, height: u32) -> Vec<PlaneInput> {
 fn run_roundtrip(format_byte: u8, width: u32, height: u32, predictor: PredictorKind) {
     let rec = tables::lookup(format_byte).expect("FOURCC in CSV");
     let planes = make_planes(rec, width, height);
-    let opts = EncodeOptions {
-        mode: SliceMode::Huffman,
-        ..EncodeOptions::fixed(predictor)
-    };
+    let opts = EncodeOptions::fixed(predictor).with_mode(SliceMode::Huffman);
     let frame = encode_frame(rec, width, height, 28, planes, opts).expect("encode");
     let _ = decode_frame(&frame).expect("decode");
 }

@@ -75,10 +75,7 @@ fn time_decode(name: &str, format_byte: u8, w: u32, h: u32, predictor: Predictor
     std::io::stdout().flush().ok();
     let rec = tables::lookup(format_byte).unwrap();
     let planes = make_planes(rec, w, h);
-    let opts = EncodeOptions {
-        mode: SliceMode::Huffman,
-        ..EncodeOptions::fixed(predictor)
-    };
+    let opts = EncodeOptions::fixed(predictor).with_mode(SliceMode::Huffman);
     let t_enc = Instant::now();
     let frame = encode_frame(rec, w, h, 28, planes, opts).unwrap();
     let enc_ms = t_enc.elapsed().as_secs_f64() * 1000.0;
@@ -118,10 +115,7 @@ fn time_encode(name: &str, format_byte: u8, w: u32, h: u32, predictor: Predictor
     print!("  encode {:38} ", name);
     std::io::stdout().flush().ok();
     let rec = tables::lookup(format_byte).unwrap();
-    let opts = EncodeOptions {
-        mode: SliceMode::Huffman,
-        ..EncodeOptions::fixed(predictor)
-    };
+    let opts = EncodeOptions::fixed(predictor).with_mode(SliceMode::Huffman);
     let _ = encode_frame(rec, w, h, 28, make_planes(rec, w, h), opts).unwrap();
 
     let t = Instant::now();
@@ -152,10 +146,7 @@ fn time_encode_raw(
     print!("  encode {:38} ", name);
     std::io::stdout().flush().ok();
     let rec = tables::lookup(format_byte).unwrap();
-    let opts = EncodeOptions {
-        mode: SliceMode::Raw,
-        ..EncodeOptions::fixed(predictor)
-    };
+    let opts = EncodeOptions::fixed(predictor).with_mode(SliceMode::Raw);
     let _ = encode_frame(rec, w, h, 28, make_planes(rec, w, h), opts).unwrap();
 
     let t = Instant::now();

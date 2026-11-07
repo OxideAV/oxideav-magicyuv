@@ -320,6 +320,7 @@ fn make_encoder(params: &CodecParameters) -> CoreResult<Box<dyn Encoder>> {
 /// progressive (`interlaced = false`). Every combination produces a
 /// stream the decoder round-trips bit-exact.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MagicYuvEncoderOptions {
     /// `"left"` / `"gradient"` / `"median"` (fixed predictor) or
     /// `"dynamic"` (per-slice minimum-residual selection, `spec/04` §3).
@@ -335,6 +336,36 @@ pub struct MagicYuvEncoderOptions {
     /// slices; the decoder reconstructs identically regardless of the
     /// partition, so this only affects the wire slice layout.
     pub slice_height: u32,
+}
+
+impl MagicYuvEncoderOptions {
+    /// Set `predictor`.
+    #[must_use]
+    pub fn with_predictor(mut self, predictor: String) -> Self {
+        self.predictor = predictor;
+        self
+    }
+
+    /// Set `slice_mode`.
+    #[must_use]
+    pub fn with_slice_mode(mut self, slice_mode: String) -> Self {
+        self.slice_mode = slice_mode;
+        self
+    }
+
+    /// Set `interlaced`.
+    #[must_use]
+    pub fn with_interlaced(mut self, interlaced: bool) -> Self {
+        self.interlaced = interlaced;
+        self
+    }
+
+    /// Set `slice_height`.
+    #[must_use]
+    pub fn with_slice_height(mut self, slice_height: u32) -> Self {
+        self.slice_height = slice_height;
+        self
+    }
 }
 
 impl Default for MagicYuvEncoderOptions {

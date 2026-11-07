@@ -67,6 +67,7 @@ pub const MAX_DIMENSION: u32 = 32_768;
 /// Parsed v7 frame header / `strf` extradata. Both are byte-identical
 /// per `spec/06` §4.1.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct FrameHeader {
     /// Header byte `+0x09`.
     pub format_byte: u8,
@@ -89,6 +90,32 @@ pub struct FrameHeader {
     /// `slice_height` field (`spec/02` §3 — 28 in v2.4.2; the spec
     /// requires decoders to read this rather than assume 28).
     pub slice_height: u32,
+}
+
+impl FrameHeader {
+    /// Build `FrameHeader` from every field, in declaration order.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        format_byte: u8,
+        aux_byte: u8,
+        codec_variant: u8,
+        flags: u32,
+        width: u32,
+        height: u32,
+        width_extra: u32,
+        slice_height: u32,
+    ) -> Self {
+        Self {
+            format_byte,
+            aux_byte,
+            codec_variant,
+            flags,
+            width,
+            height,
+            width_extra,
+            slice_height,
+        }
+    }
 }
 
 impl FrameHeader {

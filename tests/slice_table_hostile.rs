@@ -75,10 +75,7 @@ fn make_frame(rec: FourccRecord, w: u32, h: u32, slice_height: u32, mode: SliceM
             ));
         }
     }
-    let opts = EncodeOptions {
-        mode,
-        ..EncodeOptions::default()
-    };
+    let opts = EncodeOptions::default().with_mode(mode);
     let bytes = oxideav_magicyuv::encode_frame(rec, w, h, slice_height, planes, opts)
         .expect("encode baseline frame");
     decode_frame(&bytes).expect("baseline frame must decode");

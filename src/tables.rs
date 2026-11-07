@@ -25,6 +25,7 @@ const PREDICTOR_CSV: &str = include_str!("../tables/01-predictor-table.csv");
 /// is selected from [`FourccRecord::is_high_bit_depth`], not the
 /// family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Family {
     /// Three planes: G, B, R (per spec/03 §4 audit-corrected wire
     /// order is `(B', G, R')` after `(B-G, R-G)` decorrelation).
@@ -43,6 +44,7 @@ pub enum Family {
 /// uses `format_byte`, `bit_depth`, `planes`, `aux_byte`, `family`,
 /// and `(sub_x, sub_y)` — derived from the CSV's `subsampling` column.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct FourccRecord {
     pub format_byte: u8,
     pub fourcc: [u8; 4],
@@ -53,6 +55,34 @@ pub struct FourccRecord {
     pub family: Family,
     pub sub_x: u8,
     pub sub_y: u8,
+}
+
+impl FourccRecord {
+    /// Build `FourccRecord` from every field, in declaration order.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        format_byte: u8,
+        fourcc: [u8; 4],
+        bit_depth: u8,
+        planes: u8,
+        alpha: bool,
+        aux_byte: u8,
+        family: Family,
+        sub_x: u8,
+        sub_y: u8,
+    ) -> Self {
+        Self {
+            format_byte,
+            fourcc,
+            bit_depth,
+            planes,
+            alpha,
+            aux_byte,
+            family,
+            sub_x,
+            sub_y,
+        }
+    }
 }
 
 impl FourccRecord {
@@ -247,9 +277,17 @@ fn subsampling_xy(s: &str, family: Family) -> (u8, u8) {
 /// formulas from `spec/04` §4.2..§4.4); the table is parsed to
 /// guarantee the IDs we accept exactly match the documented dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PredictorRecord {
     pub predictor_id: u8,
     pub kind: PredictorKind,
+}
+
+impl PredictorRecord {
+    /// Build `PredictorRecord` from every field, in declaration order.
+    pub fn new(predictor_id: u8, kind: PredictorKind) -> Self {
+        Self { predictor_id, kind }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -252,10 +252,7 @@ fn profile_encode(iters_override: Option<u32>) {
     for scen in scenarios() {
         let iters = iters_override.unwrap_or(scen.encode_iters_default);
         let rec = tables::lookup(scen.format_byte).expect("format_byte in fourcc table");
-        let opts = EncodeOptions {
-            mode: SliceMode::Huffman,
-            ..EncodeOptions::fixed(scen.predictor)
-        };
+        let opts = EncodeOptions::fixed(scen.predictor).with_mode(SliceMode::Huffman);
         let raw = raw_bytes_per_iter(rec, scen.width, scen.height) as u64;
 
         // Warm-up — first encode pays any lazy table-parse cost.
@@ -305,10 +302,7 @@ fn profile_decode(iters_override: Option<u32>) {
         // when the caller didn't pick one explicitly.
         let iters = iters_override.unwrap_or(scen.encode_iters_default * 50);
         let rec = tables::lookup(scen.format_byte).expect("format_byte in fourcc table");
-        let opts = EncodeOptions {
-            mode: SliceMode::Huffman,
-            ..EncodeOptions::fixed(scen.predictor)
-        };
+        let opts = EncodeOptions::fixed(scen.predictor).with_mode(SliceMode::Huffman);
         let raw = raw_bytes_per_iter(rec, scen.width, scen.height) as u64;
 
         // Encode once OUTSIDE the timed region — the decode driver
@@ -338,10 +332,7 @@ fn profile_roundtrip(iters_override: Option<u32>) {
     for scen in scenarios() {
         let iters = iters_override.unwrap_or(scen.encode_iters_default);
         let rec = tables::lookup(scen.format_byte).expect("format_byte in fourcc table");
-        let opts = EncodeOptions {
-            mode: SliceMode::Huffman,
-            ..EncodeOptions::fixed(scen.predictor)
-        };
+        let opts = EncodeOptions::fixed(scen.predictor).with_mode(SliceMode::Huffman);
         let raw = raw_bytes_per_iter(rec, scen.width, scen.height) as u64;
 
         // Warm-up — one full encode + decode pair.
@@ -439,11 +430,9 @@ fn profile_interlaced(iters_override: Option<u32>) {
     let rec = tables::lookup(0x69).expect("M8Y0 in fourcc table");
     let width: u32 = 640;
     let height: u32 = 480;
-    let opts = EncodeOptions {
-        mode: SliceMode::Huffman,
-        interlaced: true,
-        ..EncodeOptions::fixed(PredictorKind::Gradient)
-    };
+    let opts = EncodeOptions::fixed(PredictorKind::Gradient)
+        .with_mode(SliceMode::Huffman)
+        .with_interlaced(true);
     let raw = raw_bytes_per_iter(rec, width, height) as u64;
 
     // Encode once outside the timed region.
@@ -492,10 +481,7 @@ fn profile_raw(iters_override: Option<u32>) {
     for (fb, label, w, h, iters_default) in rows {
         let iters = iters_override.unwrap_or(*iters_default);
         let rec = tables::lookup(*fb).expect("format_byte in fourcc table");
-        let opts = EncodeOptions {
-            mode: SliceMode::Raw,
-            ..EncodeOptions::fixed(PredictorKind::Left)
-        };
+        let opts = EncodeOptions::fixed(PredictorKind::Left).with_mode(SliceMode::Raw);
         let raw = raw_bytes_per_iter(rec, *w, *h) as u64;
         // Encode once outside the timed region.
         let planes = make_planes(rec, *w, *h);

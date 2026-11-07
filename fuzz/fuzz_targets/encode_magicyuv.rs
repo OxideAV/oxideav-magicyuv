@@ -170,7 +170,7 @@ fuzz_target!(|data: &[u8]| {
     // path, so the value is arbitrary.
     let predictor = match strategy {
         PredictorStrategy::Fixed(p) => p,
-        PredictorStrategy::Dynamic => PredictorKind::Gradient,
+        _ => PredictorKind::Gradient,
     };
 
     // ── Header byte 7: per-slice mode ─────────────────────────────
@@ -197,14 +197,13 @@ fuzz_target!(|data: &[u8]| {
     let full_range = (data[8] & 0b10) != 0;
     let color_matrix = data[8] >> 4;
 
-    let options = EncodeOptions {
-        strategy,
-        mode,
-        interlaced,
-        color_matrix,
-        full_range,
-        predictor,
-    };
+    let options = EncodeOptions::default()
+        .with_strategy(strategy)
+        .with_mode(mode)
+        .with_interlaced(interlaced)
+        .with_color_matrix(color_matrix)
+        .with_full_range(full_range)
+        .with_predictor(predictor);
 
     // ── Build per-plane buffers ───────────────────────────────────
     // Per-plane geometry: chroma planes of `Family::Yuv` / `Family::Yuva`

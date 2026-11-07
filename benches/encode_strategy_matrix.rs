@@ -126,6 +126,7 @@ fn strategy_tag(s: PredictorStrategy) -> &'static str {
         PredictorStrategy::Fixed(PredictorKind::Gradient) => "fixed-gradient",
         PredictorStrategy::Fixed(PredictorKind::Median) => "fixed-median",
         PredictorStrategy::Dynamic => "dynamic",
+        _ => "other",
     }
 }
 
@@ -134,6 +135,7 @@ fn mode_tag(m: SliceMode) -> &'static str {
         SliceMode::Huffman => "huffman",
         SliceMode::Raw => "raw",
         SliceMode::Auto => "auto",
+        _ => "other",
     }
 }
 
@@ -166,18 +168,17 @@ fn bench_encode_strategy_matrix(c: &mut Criterion) {
         // Fixed, default to Gradient under Dynamic.
         let predictor = match strategy {
             PredictorStrategy::Fixed(p) => p,
-            PredictorStrategy::Dynamic => PredictorKind::Gradient,
+            _ => PredictorKind::Gradient,
         };
         for &mode in &modes {
             for &interlaced in &interlaced_axis {
-                let opts = EncodeOptions {
-                    strategy,
-                    mode,
-                    interlaced,
-                    color_matrix: 1,
-                    full_range: false,
-                    predictor,
-                };
+                let opts = EncodeOptions::default()
+                    .with_strategy(strategy)
+                    .with_mode(mode)
+                    .with_interlaced(interlaced)
+                    .with_color_matrix(1)
+                    .with_full_range(false)
+                    .with_predictor(predictor);
                 let label = format!(
                     "{}/{}/{}",
                     strategy_tag(strategy),

@@ -6,6 +6,7 @@ use core::fmt;
 
 /// Crate-local error type for the MagicYUV v7 decoder.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// Buffer was shorter than the v7 header's mandatory 32 bytes
     /// (`spec/01` §1) or shorter than the slice table / preamble it

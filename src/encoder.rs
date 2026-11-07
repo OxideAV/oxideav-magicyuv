@@ -56,6 +56,7 @@ use crate::tables::{Family, FourccRecord, PredictorKind};
 
 /// Per-slice Huffman / raw mode the encoder offers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SliceMode {
     /// Huffman-coded residuals (`slice_flags = 0x00`) for every slice.
     Huffman,
@@ -77,6 +78,7 @@ pub enum SliceMode {
 
 /// Per-slice predictor strategy the encoder offers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PredictorStrategy {
     /// Use the named predictor on every slice
     /// (spec/04 §1.2 — fixed `predictor_id`).
@@ -96,6 +98,7 @@ pub enum PredictorStrategy {
 
 /// High-level encode options.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct EncodeOptions {
     /// Per-slice predictor strategy.
     ///
@@ -165,6 +168,50 @@ pub struct EncodeOptions {
     /// is `Fixed(_)`, this field is ignored. Callers should set
     /// `strategy = PredictorStrategy::Fixed(predictor)` instead.
     pub predictor: PredictorKind,
+}
+
+impl EncodeOptions {
+    /// Set `strategy`.
+    #[must_use]
+    pub fn with_strategy(mut self, strategy: PredictorStrategy) -> Self {
+        self.strategy = strategy;
+        self
+    }
+
+    /// Set `mode`.
+    #[must_use]
+    pub fn with_mode(mut self, mode: SliceMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Set `interlaced`.
+    #[must_use]
+    pub fn with_interlaced(mut self, interlaced: bool) -> Self {
+        self.interlaced = interlaced;
+        self
+    }
+
+    /// Set `color_matrix`.
+    #[must_use]
+    pub fn with_color_matrix(mut self, color_matrix: u8) -> Self {
+        self.color_matrix = color_matrix;
+        self
+    }
+
+    /// Set `full_range`.
+    #[must_use]
+    pub fn with_full_range(mut self, full_range: bool) -> Self {
+        self.full_range = full_range;
+        self
+    }
+
+    /// Set `predictor`.
+    #[must_use]
+    pub fn with_predictor(mut self, predictor: PredictorKind) -> Self {
+        self.predictor = predictor;
+        self
+    }
 }
 
 impl Default for EncodeOptions {

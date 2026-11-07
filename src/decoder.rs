@@ -42,6 +42,7 @@ struct PlaneGeom {
 /// `Vec` allocations (one per plane + the RGB-decorrelation working
 /// copy). Use [`DecodedFrame::default`] (or
 /// [`DecodedFrame::empty`]) to seed an empty target for the first call.
+#[non_exhaustive]
 pub struct DecodedFrame {
     /// Frame width (luma plane width).
     pub width: u32,
@@ -53,6 +54,43 @@ pub struct DecodedFrame {
     pub header: FrameHeader,
     /// FOURCC record (family, subsampling, bit depth, …).
     pub record: FourccRecord,
+}
+
+impl DecodedFrame {
+    /// Set `width`.
+    #[must_use]
+    pub fn with_width(mut self, width: u32) -> Self {
+        self.width = width;
+        self
+    }
+
+    /// Set `height`.
+    #[must_use]
+    pub fn with_height(mut self, height: u32) -> Self {
+        self.height = height;
+        self
+    }
+
+    /// Set `planes`.
+    #[must_use]
+    pub fn with_planes(mut self, planes: Vec<DecodedPlane>) -> Self {
+        self.planes = planes;
+        self
+    }
+
+    /// Set `header`.
+    #[must_use]
+    pub fn with_header(mut self, header: FrameHeader) -> Self {
+        self.header = header;
+        self
+    }
+
+    /// Set `record`.
+    #[must_use]
+    pub fn with_record(mut self, record: FourccRecord) -> Self {
+        self.record = record;
+        self
+    }
 }
 
 impl DecodedFrame {
@@ -78,6 +116,7 @@ impl Default for DecodedFrame {
 }
 
 /// One reconstructed plane.
+#[non_exhaustive]
 pub struct DecodedPlane {
     pub width: usize,
     pub height: usize,
@@ -86,6 +125,18 @@ pub struct DecodedPlane {
     /// Storage. 8-bit FOURCCs use [`Samples::U8`]; 10/12/14-bit use
     /// [`Samples::U16`] (with values masked to `(1 << bit_depth) - 1`).
     pub samples: Samples,
+}
+
+impl DecodedPlane {
+    /// Build `DecodedPlane` from every field, in declaration order.
+    pub fn new(width: usize, height: usize, bit_depth: u8, samples: Samples) -> Self {
+        Self {
+            width,
+            height,
+            bit_depth,
+            samples,
+        }
+    }
 }
 
 /// Per-plane sample container. 8-bit FOURCCs decode to [`Samples::U8`];

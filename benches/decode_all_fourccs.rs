@@ -133,10 +133,7 @@ fn bench_all_fourccs(c: &mut Criterion) {
         // measures decode only — encode timings are covered by the
         // `encode` bench harness.
         let planes = make_planes(*rec, BENCH_WIDTH, BENCH_HEIGHT);
-        let opts = EncodeOptions {
-            mode: SliceMode::Huffman,
-            ..EncodeOptions::fixed(PredictorKind::Gradient)
-        };
+        let opts = EncodeOptions::fixed(PredictorKind::Gradient).with_mode(SliceMode::Huffman);
         let frame = encode_frame(*rec, BENCH_WIDTH, BENCH_HEIGHT, SLICE_HEIGHT, planes, opts)
             .expect("encode for bench input");
 
