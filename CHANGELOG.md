@@ -6,6 +6,12 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-magicyuv/compare/v0.0.7...v0.0.8) - 2026-11-07
+
+### Other
+
+- API hygiene: #[non_exhaustive] on growable enums + option / header records, with_* setters and constructors
+
 ### Added
 
 - `with_<field>` setters on `EncodeOptions`, `MagicYuvEncoderOptions` and `DecodedFrame`; `new(..)` (every field, in declaration order) on `DecodedPlane`, `FrameHeader`, `tables::FourccRecord` and `tables::PredictorRecord`.
