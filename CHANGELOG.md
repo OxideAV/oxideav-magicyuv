@@ -6,6 +6,10 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Encoder output was refused by a black-box decoder (every frame, every option).** The per-plane Huffman book marked unused residual symbols with length 0; the black-box decoder rejects any such descriptor ("invalid Huffman codes"), and every book in `spec/05` §1.2 / §1.3 codes the whole alphabet. The encoder now builds an optimal length-limited complete code over all `1 << bit_depth` symbols (package-merge, `O(max_length · N)`), unused symbols sinking to the longest lengths (at most 1/16 of the codespace).
+
 ### Added
 
 - `with_<field>` setters on `EncodeOptions`, `MagicYuvEncoderOptions` and `DecodedFrame`; `new(..)` (every field, in declaration order) on `DecodedPlane`, `FrameHeader`, `tables::FourccRecord` and `tables::PredictorRecord`.

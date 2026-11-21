@@ -466,7 +466,7 @@ const fn pack_huff_entry(code: u32, length: u8) -> u32 {
 
 impl PlaneHuff {
     fn build_from_histogram(hist: &[u32], max_len: u8) -> Self {
-        let lengths = canonical_huffman_lengths(hist, max_len);
+        let lengths = complete_code_lengths(hist, max_len);
         let n = lengths.len();
         let max_observed = *lengths.iter().max().unwrap_or(&0);
         let mut codes = vec![0u32; n];
@@ -508,230 +508,91 @@ impl PlaneHuff {
     }
 }
 
-fn canonical_huffman_lengths(hist: &[u32], max_len: u8) -> Vec<u8> {
-    #[derive(Clone, Copy)]
-    struct Node {
-        freq: u64,
-        tag: u32,
-        left: i32,
-        right: i32,
-        symbol: i32,
-    }
-    let n = hist.len();
-    let mut nodes: Vec<Node> = Vec::new();
-    let mut heap: Vec<u32> = Vec::new();
-    for (s, &c) in hist.iter().enumerate() {
-        if c == 0 {
-            continue;
-        }
-        nodes.push(Node {
-            freq: c as u64,
-            tag: s as u32,
-            left: -1,
-            right: -1,
-            symbol: s as i32,
-        });
-        heap.push((nodes.len() - 1) as u32);
-    }
-    if nodes.is_empty() {
-        return vec![0u8; n];
-    }
-    if nodes.len() == 1 {
-        let mut out = vec![0u8; n];
-        let only = nodes[0].symbol as usize;
-        out[only] = 1;
-        return out;
-    }
-    let lt = |a: &Node, b: &Node| a.freq < b.freq || (a.freq == b.freq && a.tag < b.tag);
-    let mut next_tag: u32 = 0x1000_0000;
-    while heap.len() > 1 {
-        heap.sort_by(|&i, &j| {
-            let na = &nodes[i as usize];
-            let nb = &nodes[j as usize];
-            if lt(na, nb) {
-                std::cmp::Ordering::Less
-            } else if lt(nb, na) {
-                std::cmp::Ordering::Greater
-            } else {
-                std::cmp::Ordering::Equal
-            }
-        });
-        let a = heap.remove(0);
-        let b = heap.remove(0);
-        let an = nodes[a as usize];
-        let bn = nodes[b as usize];
-        nodes.push(Node {
-            freq: an.freq + bn.freq,
-            tag: next_tag,
-            left: a as i32,
-            right: b as i32,
-            symbol: -1,
-        });
-        next_tag += 1;
-        heap.push((nodes.len() - 1) as u32);
-    }
-    let root = heap[0] as usize;
-    let mut lengths = vec![0u8; n];
-    fn walk(nodes: &[Node], idx: usize, depth: u8, lengths: &mut [u8]) {
-        let node = &nodes[idx];
-        if node.symbol >= 0 {
-            lengths[node.symbol as usize] = depth.max(1);
-            return;
-        }
-        if node.left >= 0 {
-            walk(nodes, node.left as usize, depth + 1, lengths);
-        }
-        if node.right >= 0 {
-            walk(nodes, node.right as usize, depth + 1, lengths);
-        }
-    }
-    walk(&nodes, root, 0, &mut lengths);
-
-    // If the unbounded-optimal tree fits the `max_length` cap (the
-    // common case — every v2.4.2 fixture in spec/05 §1.3 observes
-    // `max ≤ 12` at 8-bit), the plain canonical lengths above are
-    // already valid and we keep them byte-for-byte. Only when a
-    // skewed histogram (e.g. a near-geometric residual distribution)
-    // drives the optimal tree past the cap do we recompute under the
-    // length constraint with package-merge, which produces an optimal
-    // *length-limited* prefix code whose Kraft sum is still exactly 1
-    // (spec/05 §1.1: `L[s] ∈ [0, max_length]`, §1.3: Kraft = 1.0).
-    if lengths.iter().copied().max().unwrap_or(0) > max_len {
-        lengths = package_merge_lengths(hist, max_len);
-    }
-    lengths
-}
-
-/// Optimal length-limited Huffman code lengths via the Package-Merge
-/// algorithm (Larmore & Hirschberg, 1990).
+/// Optimal length-limited prefix-code lengths over the **whole**
+/// alphabet: every symbol — including the ones the plane never uses —
+/// receives a length in `1..=cap`, and the lengths satisfy the Kraft
+/// equality `Σ 2^-L = 1` exactly.
 ///
-/// Returns a `Vec<u8>` of length `hist.len()` with `lengths[s] ∈
-/// [0, cap]` for every symbol `s`; symbols with zero frequency get
-/// length 0. The non-zero lengths satisfy the Kraft equality
-/// `Σ 2^-L = 1` exactly, so the result is always a *complete*
-/// canonical prefix code — the strict validity requirement of
-/// spec/05 §1.3 (every fixture's descriptor has Kraft sum 1.0) and
-/// §2.0.3 (the decoder's Phase-4 constructor rejects any length set
-/// whose running code accumulator reaches `1 << len`).
+/// This is the shape every descriptor in `spec/05` §1.2 / §1.3 has
+/// (the all-zero plane's book is `1, 94 × 9, 8, 160 × 9`: 256 coded
+/// symbols although one is used). A book that marks unused symbols
+/// with length 0 is the `spec/05` §10 open question 1 territory, and a
+/// black-box decoder refuses it outright, so the encoder never emits
+/// one. Unused symbols carry weight 0 and therefore sink to the
+/// longest lengths; with `cap = bit_depth + 4` they occupy at most
+/// 1/16 of the codespace.
 ///
-/// `cap` is assumed `≥ ceil(log2(active))` so a complete code of
-/// `active` leaves actually fits in the codespace; the encoder's
-/// per-bit-depth caps (12 / 14 / 16 / 18, spec/05 §1) always satisfy
-/// this because the active alphabet never exceeds `1 << bit_depth`.
-fn package_merge_lengths(hist: &[u32], cap: u8) -> Vec<u8> {
+/// The lengths are computed with the package-merge construction
+/// (coin-collector formulation): level `cap` holds the leaves sorted
+/// by weight, every shallower level holds the leaves merged with the
+/// pairwise packages of the level below, and the cheapest `2n - 2`
+/// items of the top level are selected. A leaf's code length is the
+/// number of levels on which it is selected. Only one flag per item
+/// (leaf or package) is kept per level, so the cost is
+/// `O(cap · n)` time and memory for any alphabet size.
+fn complete_code_lengths(hist: &[u32], cap: u8) -> Vec<u8> {
     let n = hist.len();
-
-    // Collect active symbols (freq > 0), sorted by frequency ascending
-    // then symbol index — a deterministic order so the resulting
-    // lengths are reproducible across runs.
-    let mut active: Vec<(usize, u64)> = hist
-        .iter()
-        .enumerate()
-        .filter(|&(_, &c)| c > 0)
-        .map(|(s, &c)| (s, c as u64))
-        .collect();
-    active.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
-
-    let m = active.len();
-    let mut lengths = vec![0u8; n];
-    if m == 0 {
-        return lengths;
+    if n < 2 {
+        return vec![1u8; n];
     }
-    if m == 1 {
-        lengths[active[0].0] = 1;
-        return lengths;
-    }
+    debug_assert!((cap as u32) < 32 && (1usize << cap) >= n);
 
-    // A "coin" is one original leaf, identified by its index into
-    // `active` (0..m). The package-merge tableau builds, for each
-    // length level `1..=cap`, the multiset of coins of denomination
-    // `2^-level`: the `m` leaf coins plus the packages carried up from
-    // the previous (deeper) level. We need `2m - 2` coins selected
-    // from the final level; the number of times leaf `i` appears
-    // across all selected coins equals its code length.
-    //
-    // Represent each item as a `(weight, members)` where `members` is
-    // the set of leaf indices it covers. To keep memory bounded we
-    // track per-level only the running per-leaf selection counts via
-    // the standard "boundary package-merge" — but the simple form is
-    // clear and `m ≤ 1 << bit_depth`, `cap ≤ 18`, so the O(cap·m)
-    // package list is small enough.
+    // Leaves in ascending weight order, ties by symbol index.
+    let mut order: Vec<u32> = (0..n as u32).collect();
+    order.sort_unstable_by_key(|&s| (hist[s as usize], s));
+    let leaf_w: Vec<u64> = order.iter().map(|&s| hist[s as usize] as u64).collect();
 
-    #[derive(Clone)]
-    struct Item {
-        weight: u64,
-        // Number of leaf-coins of each active symbol contained.
-        // Stored sparsely as a bitmap of covered leaves is too large;
-        // we instead carry the covered-leaf list. For the diagonal
-        // package-merge the lists stay short (≤ m), bounded overall.
-        leaves: Vec<u32>,
-    }
-
-    // Level `cap` (the deepest) starts as just the `m` leaf coins.
-    let leaf_items: Vec<Item> = active
-        .iter()
-        .enumerate()
-        .map(|(i, &(_, w))| Item {
-            weight: w,
-            leaves: vec![i as u32],
-        })
-        .collect();
-
-    // Merge from the deepest level up to level 1.
-    let mut prev: Vec<Item> = leaf_items.clone();
-    for _level in 1..(cap as usize) {
-        // Package: combine adjacent pairs of `prev` (already sorted)
-        // into new items, then merge with the leaf coins for this
-        // (shallower) level. Drop a trailing unpaired item.
-        let mut packaged: Vec<Item> = Vec::with_capacity(prev.len() / 2);
-        let mut k = 0;
-        while k + 1 < prev.len() {
-            let mut leaves = prev[k].leaves.clone();
-            leaves.extend_from_slice(&prev[k + 1].leaves);
-            packaged.push(Item {
-                weight: prev[k].weight + prev[k + 1].weight,
-                leaves,
-            });
-            k += 2;
-        }
-        // Merge the packaged list with a fresh copy of the leaf coins,
-        // keeping ascending weight order (stable: leaves before
-        // packages on ties keeps the order deterministic).
-        let mut merged: Vec<Item> = Vec::with_capacity(packaged.len() + leaf_items.len());
+    // `is_package[k]` describes the merged list at depth `cap - k`.
+    let mut is_package: Vec<Vec<bool>> = Vec::with_capacity(cap as usize);
+    is_package.push(vec![false; n]);
+    let mut prev: Vec<u64> = leaf_w.clone();
+    for _ in 1..cap {
+        let packages = prev.len() / 2;
+        let mut merged: Vec<u64> = Vec::with_capacity(n + packages);
+        let mut flags: Vec<bool> = Vec::with_capacity(n + packages);
         let (mut a, mut b) = (0usize, 0usize);
-        while a < leaf_items.len() && b < packaged.len() {
-            if leaf_items[a].weight <= packaged[b].weight {
-                merged.push(leaf_items[a].clone());
+        while a < n || b < packages {
+            let take_leaf = if b == packages {
+                true
+            } else {
+                a < n && leaf_w[a] <= prev[2 * b] + prev[2 * b + 1]
+            };
+            if take_leaf {
+                merged.push(leaf_w[a]);
+                flags.push(false);
                 a += 1;
             } else {
-                merged.push(packaged[b].clone());
+                merged.push(prev[2 * b] + prev[2 * b + 1]);
+                flags.push(true);
                 b += 1;
             }
         }
-        merged.extend_from_slice(&leaf_items[a..]);
-        merged.extend_from_slice(&packaged[b..]);
         prev = merged;
+        is_package.push(flags);
     }
 
-    // Select the cheapest `2m - 2` coins from the top level; the
-    // per-leaf occurrence count is the code length.
-    let need = 2 * m - 2;
-    let mut counts = vec![0u32; m];
-    for item in prev.iter().take(need) {
-        for &leaf in &item.leaves {
-            counts[leaf as usize] += 1;
+    // Walk back from the top level: of the `take` cheapest items, the
+    // leaves each add one to their own length and every package
+    // demands its two constituents on the level below.
+    let mut bump = vec![0i32; n + 1];
+    let mut take = 2 * n - 2;
+    for flags in is_package.iter().rev() {
+        let take_here = take.min(flags.len());
+        let packages = flags[..take_here].iter().filter(|&&p| p).count();
+        let leaves = take_here - packages;
+        bump[0] += 1;
+        bump[leaves] -= 1;
+        take = 2 * packages;
+        if take == 0 {
+            break;
         }
     }
-    for (i, &(sym, _)) in active.iter().enumerate() {
-        // Every active leaf is selected at least once (counts[i] ≥ 1)
-        // because `need ≥ m` for `m ≥ 2`; clamp defensively to ≥ 1.
-        lengths[sym] = counts[i].max(1) as u8;
+    let mut lengths = vec![0u8; n];
+    let mut depth = 0i32;
+    for (&sym, &d) in order.iter().zip(bump.iter()) {
+        depth += d;
+        lengths[sym as usize] = depth as u8;
     }
-
-    debug_assert!(
-        lengths.iter().all(|&l| l <= cap),
-        "package-merge exceeded the length cap"
-    );
     lengths
 }
 
@@ -2142,38 +2003,53 @@ mod huffman_limit_tests {
         true
     }
 
-    /// Drives `canonical_huffman_lengths` end-to-end (the real entry
-    /// point, including the cap-detection branch) and asserts the
-    /// result is a valid, length-capped, complete prefix code that the
+    /// Asserts the lengths are a length-capped complete prefix code
+    /// over the whole alphabet (no symbol left without a code) that the
     /// production code-assignment path turns into a prefix-free code.
-    fn assert_valid_capped(hist: &[u32], cap: u8) {
-        let lengths = canonical_huffman_lengths(hist, cap);
+    fn assert_valid_capped(hist: &[u32], cap: u8) -> Vec<u8> {
+        let lengths = complete_code_lengths(hist, cap);
         assert_eq!(lengths.len(), hist.len());
         let max = lengths.iter().copied().max().unwrap_or(0);
         assert!(max <= cap, "max length {max} exceeds cap {cap}");
-        // Exactly the zero-frequency symbols are unused.
-        for (s, &h) in hist.iter().enumerate() {
-            if h == 0 {
-                assert_eq!(lengths[s], 0, "symbol {s} unused but got a length");
-            } else {
-                assert!(lengths[s] >= 1, "symbol {s} active but length 0");
-            }
-        }
+        assert!(
+            lengths.iter().all(|&l| l >= 1),
+            "a symbol was left without a code"
+        );
         assert!(kraft_is_one(&lengths), "Kraft sum != 1 for cap {cap}");
         assert!(
             codes_are_prefix_free(hist, &lengths),
             "code assignment not prefix-free for cap {cap}"
         );
+        lengths
+    }
+
+    /// Total coded bits of `hist` under `lengths`.
+    fn cost(hist: &[u32], lengths: &[u8]) -> u64 {
+        hist.iter()
+            .zip(lengths)
+            .map(|(&h, &l)| h as u64 * l as u64)
+            .sum()
+    }
+
+    /// Cost of the unconstrained optimal prefix code over the whole
+    /// alphabet (sum of the merged weights of a two-smallest merge).
+    fn unlimited_cost(hist: &[u32]) -> u64 {
+        let mut w: Vec<u64> = hist.iter().map(|&h| h as u64).collect();
+        let mut total = 0u64;
+        while w.len() > 1 {
+            w.sort_unstable_by(|a, b| b.cmp(a));
+            let a = w.pop().unwrap();
+            let b = w.pop().unwrap();
+            total += a + b;
+            w.push(a + b);
+        }
+        total
     }
 
     #[test]
     fn fibonacci_histogram_is_capped_and_complete() {
-        // A Fibonacci frequency profile builds a caterpillar tree whose
-        // unbounded-optimal depth is ~N-1 (47 for N=64) — far past the
-        // 8-bit cap of 12. The pre-fix `enforce_length_cap` heuristic
-        // both spun for millions of iterations and left a Kraft sum of
-        // ~8e-5 (an invalid, non-decodable code). package-merge must
-        // produce a valid length-12-capped complete code.
+        // A Fibonacci frequency profile has an unconstrained-optimal
+        // depth of ~N-1 (47 for N=64) — far past the 8-bit cap of 12.
         let mut hist = vec![0u32; 64];
         let (mut a, mut b) = (1u32, 1u32);
         for h in hist.iter_mut() {
@@ -2187,9 +2063,6 @@ mod huffman_limit_tests {
 
     #[test]
     fn geometric_skew_8bit_capped() {
-        // A near-geometric residual distribution over the full 256-symbol
-        // 8-bit alphabet — the realistic shape a smooth-gradient plane
-        // produces after Median prediction.
         let mut hist = vec![0u32; 256];
         for (i, h) in hist.iter_mut().enumerate() {
             let shift = 30u64.saturating_sub(i as u64 / 4);
@@ -2209,41 +2082,90 @@ mod huffman_limit_tests {
     }
 
     #[test]
-    fn dominant_symbol_plus_tail_capped() {
-        // One overwhelmingly-frequent symbol plus a flat tail (the
-        // all-zero-residual / single-active-symbol-dominant shape of
-        // spec/05 §1.2). Optimal length here stays under the cap, so
-        // this also checks the limiter agrees with the natural code.
+    fn non_binding_cap_matches_the_unconstrained_optimum() {
+        // When the unconstrained optimum already fits the cap, the
+        // length-limited construction must cost exactly the same.
         let mut hist = vec![1u32; 256];
         hist[0] = 1_000_000;
-        assert_valid_capped(&hist, 12);
+        let lengths = assert_valid_capped(&hist, 12);
+        assert_eq!(cost(&hist, &lengths), unlimited_cost(&hist));
+
+        let mut state = 0x1234_5678u32;
+        let mut noisy = vec![0u32; 256];
+        for h in noisy.iter_mut() {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            *h = 900 + state % 200;
+        }
+        let lengths = assert_valid_capped(&noisy, 12);
+        assert_eq!(cost(&noisy, &lengths), unlimited_cost(&noisy));
     }
 
     #[test]
-    fn uniform_alphabet_unchanged_by_cap() {
-        // A uniform histogram yields a balanced tree of depth
-        // log2(N) ≤ cap, so the cap is non-binding and the plain
-        // canonical path is taken (no package-merge invocation).
-        for (n, cap) in [(16usize, 12u8), (256, 12), (1024, 14), (4096, 16)] {
+    fn uniform_alphabet_is_fixed_length() {
+        for (n, cap) in [
+            (16usize, 12u8),
+            (256, 12),
+            (1024, 14),
+            (4096, 16),
+            (16384, 18),
+        ] {
             let hist = vec![1u32; n];
-            let lengths = canonical_huffman_lengths(&hist, cap);
+            let lengths = assert_valid_capped_fast(&hist, cap);
             let expect = (usize::BITS - 1 - (n.leading_zeros())) as u8; // log2(n)
             assert!(lengths.iter().all(|&l| l == expect));
-            assert!(kraft_is_one(&lengths));
         }
     }
 
-    #[test]
-    fn two_symbol_code_is_one_bit_each() {
-        let lengths = canonical_huffman_lengths(&[5, 3, 0, 0], 12);
-        assert_eq!(lengths, vec![1, 1, 0, 0]);
+    /// As [`assert_valid_capped`] minus the quadratic prefix-free scan,
+    /// for the 12/14-bit alphabets.
+    fn assert_valid_capped_fast(hist: &[u32], cap: u8) -> Vec<u8> {
+        let lengths = complete_code_lengths(hist, cap);
+        assert!(lengths.iter().all(|&l| l >= 1 && l <= cap));
         assert!(kraft_is_one(&lengths));
+        lengths
     }
 
     #[test]
-    fn single_active_symbol_gets_length_one() {
-        let lengths = canonical_huffman_lengths(&[0, 7, 0, 0], 12);
-        assert_eq!(lengths, vec![0, 1, 0, 0]);
+    fn two_used_symbols_still_code_the_whole_alphabet() {
+        let hist = [5u32, 3, 0, 0];
+        let lengths = assert_valid_capped(&hist, 12);
+        assert_eq!(lengths[0], 1);
+        assert_eq!(lengths[1], 2);
+        assert_eq!((lengths[2], lengths[3]), (3, 3));
+    }
+
+    #[test]
+    fn single_used_symbol_matches_the_spec_all_zero_book_shape() {
+        // spec/05 §1.2: the all-zero 8-bit plane's book is one
+        // length-1 code, one length-8 code and 254 length-9 codes.
+        let mut hist = vec![0u32; 256];
+        hist[0] = 4096;
+        let lengths = assert_valid_capped(&hist, 12);
+        assert_eq!(lengths[0], 1);
+        assert_eq!(lengths.iter().filter(|&&l| l == 8).count(), 1);
+        assert_eq!(lengths.iter().filter(|&&l| l == 9).count(), 254);
+    }
+
+    #[test]
+    fn sparse_high_depth_alphabets_stay_complete() {
+        // A handful of used symbols in the 10/12/14-bit alphabets: the
+        // unused symbols must fit under the cap without starving the
+        // used ones (they take at most 1/16 of the codespace).
+        for (bits, cap) in [(10u32, 14u8), (12, 16), (14, 18)] {
+            let n = 1usize << bits;
+            let mut hist = vec![0u32; n];
+            hist[0] = 50_000;
+            hist[1] = 20_000;
+            hist[n - 1] = 20_000;
+            hist[n / 2] = 7;
+            let lengths = assert_valid_capped_fast(&hist, cap);
+            assert_eq!(lengths[0], 1);
+            assert!(lengths[1] <= 3 && lengths[n - 1] <= 3);
+            let unused_max = lengths[2];
+            assert_eq!(unused_max, cap);
+        }
     }
 
     // --- Descriptor run-length cap (spec/05 §1.5 / §10 Q3) ---------------
@@ -2267,12 +2189,12 @@ mod huffman_limit_tests {
 
     #[test]
     fn descriptor_sparse_highdepth_splits_into_capped_runs() {
-        // spec/05 §10 Q3 worked shape: a 10-bit (N=1024) plane with one
-        // active symbol then 1023 unused (length-0) symbols. The unused
-        // tail must split into successive 255-rep runs, never a single
+        // spec/05 §10 Q3 worked shape: a 10-bit (N=1024) descriptor
+        // whose tail is one length value repeated 1023 times. The tail
+        // must split into successive 255-rep runs, never a single
         // out-of-range run.
-        let mut lengths = vec![0u8; 1024];
-        lengths[0] = 1; // sole active symbol
+        let mut lengths = vec![11u8; 1024];
+        lengths[0] = 1;
         let desc = super::encode_descriptor(&lengths);
         // First byte is the length-1 literal; the rest encode 1023
         // zero-lengths as 4×(80 fe) [=1020] + a tail run of 3 (80 02).
@@ -2777,12 +2699,10 @@ mod pack_huffman_residuals_tests {
     }
 
     #[test]
-    fn unused_symbols_are_skipped() {
-        // Build a histogram that leaves most symbols unused. Hand the
-        // packer a stream containing only the active symbols and assert
-        // the unused-symbol `length == 0` early-continue branch is never
-        // hit (no bit emitted for any unused symbol) — the active-stream
-        // bytes equal what the per-pixel reference emits.
+    fn sparse_histogram_stream_matches_reference() {
+        // A histogram that leaves most symbols unused (they still get
+        // codes, just long ones): the batched packer's bytes equal what
+        // the per-pixel reference emits.
         let mut hist = vec![0u32; 256];
         hist[10] = 3;
         hist[20] = 2;
