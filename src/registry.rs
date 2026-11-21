@@ -294,10 +294,14 @@ fn make_encoder(params: &CodecParameters) -> CoreResult<Box<dyn Encoder>> {
     let opts: MagicYuvEncoderOptions = parse_options(&params.options)?;
     // `0` → single full-frame slice; otherwise clamp to the frame
     // height (a slice taller than the frame degenerates to one slice).
+    // The full-frame value is rounded up to the vertical chroma factor
+    // so an odd-height 4:2:0 frame still gets a slice height the
+    // `spec/02` §6 chroma partition can tile.
+    let full_frame = height.next_multiple_of(rec.sub_y.max(1) as u32);
     let slice_height = if opts.slice_height == 0 {
-        height
+        full_frame
     } else {
-        opts.slice_height.min(height)
+        opts.slice_height.min(full_frame)
     };
     Ok(Box::new(MagicYuvEncoder {
         rec,

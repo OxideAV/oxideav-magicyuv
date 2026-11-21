@@ -1951,7 +1951,7 @@ fn minimal_geometry_dynamic_auto_all_fourccs() {
                 } else {
                     make_planes_u8_seeded(rec, w, h, 0x5123_c4f5_9e37_79b9)
                 };
-                let bytes = encode_frame(
+                let bytes = crate::encoder::encode_frame_any_geometry(
                     rec,
                     w,
                     h,
@@ -2850,7 +2850,7 @@ fn roundtrip_seeded(
     } else {
         make_planes_u8_seeded(rec, width, height, seed)
     };
-    let bytes = encode_frame(
+    let bytes = crate::encoder::encode_frame_any_geometry(
         rec,
         width,
         height,
@@ -3949,4 +3949,69 @@ mod forward_compat {
             );
         }
     }
+}
+
+#[test]
+fn encoder_refuses_interlaced_slices_shorter_than_two_rows_per_plane() {
+    use crate::Error;
+    let opts = EncodeOptions::default().with_interlaced(true);
+    // (FOURCC byte, width, height, slice_height, refused)
+    for (fb, w, h, sh, refused) in [
+        (0x65u8, 4u32, 1u32, 28u32, true), // one row in all
+        (0x65, 4, 2, 28, false),
+        (0x65, 4, 16, 1, true), // one-row slices
+        (0x65, 4, 16, 3, true), // last slice has one row
+        (0x65, 4, 16, 2, false),
+        (0x65, 4, 17, 5, false), // last slice has two rows
+        (0x69, 4, 6, 4, true),   // 4:2:0: last slice has two luma rows
+        (0x69, 4, 8, 4, false),
+        (0x69, 4, 8, 2, true),   // 4:2:0: one chroma row per slice
+        (0x69, 18, 33, 6, true), // 4:2:0: last slice has three luma rows
+        (0x69, 18, 33, 28, false),
+    ] {
+        let rec = lookup(fb).unwrap();
+        let planes = make_planes_u8(rec, w, h, 3);
+        let got = encode_frame(rec, w, h, sh, planes.clone(), opts);
+        assert_eq!(
+            matches!(got, Err(Error::InterlacedSliceTooShort { .. })),
+            refused,
+            "{fb:#04x} {w}x{h} sh={sh}: {:?}",
+            got.as_ref().map(Vec::len)
+        );
+        // Progressive frames of the same geometry are unaffected.
+        encode_frame(rec, w, h, sh, planes, EncodeOptions::default()).unwrap();
+    }
+}
+
+#[test]
+fn encoder_refuses_zero_and_oversized_dimensions() {
+    use crate::Error;
+    let rec = lookup(0x6b).unwrap();
+    let opts = EncodeOptions::default();
+    let plane = || vec![PlaneInput::U8(vec![0u8; 16])];
+    assert!(matches!(
+        encode_frame(rec, 0, 4, 4, plane(), opts),
+        Err(Error::ZeroDimension { what: "width" })
+    ));
+    assert!(matches!(
+        encode_frame(rec, 4, 0, 4, plane(), opts),
+        Err(Error::ZeroDimension { what: "height" })
+    ));
+    assert!(matches!(
+        encode_frame(rec, 4, 4, 0, plane(), opts),
+        Err(Error::ZeroDimension {
+            what: "slice_height"
+        })
+    ));
+    assert!(matches!(
+        encode_frame(rec, 4, 4, 40_000, plane(), opts),
+        Err(Error::DimensionTooLarge {
+            what: "slice_height",
+            ..
+        })
+    ));
+    assert!(matches!(
+        encode_frame(rec, 40_000, 4, 4, plane(), opts),
+        Err(Error::DimensionTooLarge { what: "width", .. })
+    ));
 }

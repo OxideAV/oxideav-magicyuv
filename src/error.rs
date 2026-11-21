@@ -162,7 +162,8 @@ pub enum Error {
     /// mapping must address each plane exactly `slices_per_plane`
     /// times; the decoder honours an arbitrary (e.g. interleaved)
     /// ordering but rejects a mapping that over- or under-fills a
-    /// plane's slice quota.
+    /// plane's slice quota. The one other accepted shape is the
+    /// row-major rank bytes described on the decoder.
     BadPlaneIndex {
         /// Slice index inside the frame whose mapping byte was bad.
         slice_index: usize,
@@ -170,6 +171,23 @@ pub enum Error {
         got: usize,
         /// Number of planes the format byte implies.
         num_planes: usize,
+    },
+    /// The encoder was asked for an interlaced frame whose slice
+    /// partition leaves some slice with fewer than two rows per plane.
+    ///
+    /// Interlaced prediction treats the first **two** rows of a slice
+    /// as the two field-first rows (`spec/04` §5.1.1). A shorter slice
+    /// is decodable by this crate, but a black-box decoder refuses the
+    /// frame ("impossible height" / "impossible slice height") whenever
+    /// a slice's luma rows divided by `sub_y` (rounding down) is below
+    /// two, so the encoder does not write one. Pick a `slice_height` of
+    /// at least `2 × sub_y` whose last slice keeps `2 × sub_y` luma
+    /// rows, or encode the frame as progressive.
+    InterlacedSliceTooShort {
+        /// The requested `slice_height`.
+        slice_height: u32,
+        /// Frame height.
+        height: u32,
     },
 }
 
@@ -247,6 +265,13 @@ impl fmt::Display for Error {
             } => write!(
                 f,
                 "oxideav-magicyuv: encoder plane {plane} length {got} != expected {expected}"
+            ),
+            Self::InterlacedSliceTooShort {
+                slice_height,
+                height,
+            } => write!(
+                f,
+                "oxideav-magicyuv: interlaced frame of height {height} with slice_height {slice_height} has a slice shorter than two rows per plane (spec/04 §5.1.1 needs two field-first rows per slice)"
             ),
             Self::BadPlaneIndex {
                 slice_index,

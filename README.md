@@ -44,38 +44,95 @@ FourCC with no exact core variant). A content probe validates a FourCC
 claim against the `MAGY` magic (`spec/01` §1): decisive `1.0`/`0.0` when
 a packet/header is peekable, `0.9` on the FourCC alone otherwise.
 
-Both sides reject odd dimensions that don't divide a subsampled
-FOURCC's chroma factor with the same `OddDimensionForSubsampling`
-error, so they accept exactly the same dimension set. They likewise
-reject a `slice_height` that doesn't divide the vertical chroma factor
-(`sub_y`) cleanly on a 4:2:0 family with `SliceHeightNotDivisibleBySubsampling`
-(`spec/02` §6): the chroma row-partition reuses the luma slice count and
-floors `slice_height / sub_y`, so an indivisible value would leave the
-bottom chroma rows outside every slice — a silent chroma-row drop, now
-refused symmetrically by encoder, decoder, and the registry encoder
-(inert for `sub_y == 1`). The flags-dword knobs `interlaced` (bit 1),
-`full_range` (bit 2), and the 4-bit `color_matrix` nibble (bits 20..23)
-are surfaced as [`EncodeOptions`] fields and recovered via typed
-`FrameHeader` accessors.
+Odd widths and heights are accepted for every FOURCC; on 4:2:2 /
+4:2:0 the chroma planes are `ceil(width / sub_x) × ceil(height /
+sub_y)` samples (`spec/03` §8.2). On a 4:2:0 family a `slice_height`
+that is not a multiple of the vertical chroma factor is refused by
+encoder, decoder and the registry encoder alike
+(`SliceHeightNotDivisibleBySubsampling`, `spec/02` §6: the chroma
+partition would not tile). The encoder also refuses an interlaced frame
+whose slice partition leaves a slice shorter than two rows per plane
+(`InterlacedSliceTooShort`, see *Interoperability*). The flags-dword
+knobs `interlaced` (bit 1), `full_range` (bit 2), and the 4-bit
+`color_matrix` nibble (bits 20..23) are surfaced as [`EncodeOptions`]
+fields and recovered via typed `FrameHeader` accessors.
 
 ## Pipeline
 
 | Stage                  | Notes                                         |
 | ---------------------- | --------------------------------------------- |
 | 32-byte v7 header      | parse + emit                                  |
-| Slice table + preamble | honours on-wire `per_slice_plane_index`       |
-| Chroma slice partition | per-plane slice count from luma row count; `slice_height` indivisible by `sub_y` on 4:2:0 rejected (would drop bottom chroma rows, `spec/02` §6) |
+| Slice table + preamble | honours on-wire `per_slice_plane_index`; also the row-major-rank layout (see *Interoperability*) |
+| Chroma planes          | `ceil(dim / sub)` samples; per-plane slice count from luma row count; `slice_height` indivisible by `sub_y` on 4:2:0 rejected (`spec/02` §6) |
 | Per-slice predictors   | Left / Gradient / Median (modular 8-bit, JPEG-LS at 10/12/14-bit); §4.4 formula divergence + §4 column-0 top-fallback pinned against spec worked examples |
 | Interlaced field-stride| top neighbour = row r-2; first 2 rows raw     |
 | Per-plane Huffman      | RLE descriptor                                |
-| Canonical-code build   | longest-length-first cumulative; over-full books rejected at build, under-full (Kraft < 1) books accepted (encoder emits them for single-symbol planes) |
+| Canonical-code build   | longest-length-first cumulative; over-full books rejected at build, under-full (Kraft < 1) books accepted on decode. The encoder always writes a complete book over the whole alphabet (optimal length-limited, package-merge) |
 | Under-full hardening   | a malformed slice peeking unused codespace → `HuffmanIncomplete` (spec/05 §2.1), not a silent mis-decode |
 | Raw-mode fallback      | per-slice                                     |
 
+## Interoperability
+
+`tests/blackbox_matrix.rs` runs a live matrix against a black-box
+MagicYUV encoder and decoder (the `ffmpeg` executable, output only; the
+test skips at runtime when it is absent). Current result with
+`cargo test --release`: **30 402 frames, 30 402 pass.**
+
+- **Foreign → this decoder — 12 474 / 12 474 bit-exact.** Every pixel
+  format the black-box encoder accepts (planar RGB, RGBA, YUV 4:4:4 /
+  4:2:2 / 4:2:0, YUVA 4:4:4:4, gray — all 8-bit; it writes no deeper
+  format) × 3 predictors × slice counts 1…33 × 13 sizes from 1×1 through
+  odd sizes to 641×361 × 6 kinds of content (noise, flat, zero,
+  two-valued, noisy ramp, clean ramp). The black-box decoder is run on
+  the same frames and agrees.
+- **This encoder → foreign decoder — 17 928 / 17 928 accepted
+  bit-exact with no decoder diagnostics.** All 17 native FOURCCs
+  (8/10/12/14-bit) × Left / Gradient / Median / Dynamic × Huffman / raw /
+  auto × slice heights 1…1024 × progressive / interlaced × 8 sizes
+  (1×1 … 321×243). This covers the 10/12/14-bit bit-packed raw slices
+  of `spec/05` §4.1, which the vendor fixtures behind the spec never
+  exercised.
+- **Size.** On the foreign → ours frames, `EncodeOptions::dynamic_auto()`
+  at the black-box encoder's slice height needs 91.7 % (4:2:0) to
+  95.8 % of the bytes of the *best of the black-box encoder's three
+  predictors*, per pixel format (run-length descriptors, per-slice
+  predictor choice and raw fallback); the test asserts it never needs
+  more.
+
+What the first run of this matrix found (all fixed, each pinned in
+`tests/foreign_layout.rs`):
+
+- **Every frame this encoder wrote was refused** by the black-box
+  decoder: the Huffman books marked unused symbols with length 0. The
+  books in `spec/05` §1.2 / §1.3 always code the whole alphabet, and so
+  does the encoder now.
+- **Every multi-slice foreign frame was refused** here. Such frames
+  use a layout `spec/02` does not describe: the slice payloads are
+  stored slice-row by slice-row, the slice table is still indexed
+  plane-major (so it is not monotonic), and the preamble index byte at
+  position `p·S + s` holds `s·P + p` (`P` planes, `S` slices per plane)
+  rather than the plane index of `spec/02` §7.3. The decoder accepts
+  exactly this shape next to the documented one — the two cannot be
+  confused, a rank byte exceeds the plane count as soon as a plane has
+  two slices — and refuses any other permutation; what a general
+  permutation would mean is an open question for the spec.
+- **Odd sizes on 4:2:2 / 4:2:0 were refused** in both directions.
+- **Interlaced frames with a slice shorter than two rows per plane**
+  (measured as the slice's luma rows divided by `sub_y`, rounded down)
+  are refused by the black-box decoder, so the encoder returns
+  `InterlacedSliceTooShort` instead of writing one. The decoder here
+  still reads such frames.
+
+Not verified against any outside stream: frames written by the vendor
+codec itself beyond the worked examples transcribed from the spec
+(below); foreign 10/12/14-bit frames (the black-box encoder writes
+none); foreign interlaced frames (the black-box encoder never sets the
+flag).
+
 ## Conformance
 
-Beyond the encode→decode self-roundtrip suite, the decoder is pinned
-against **proprietary-encoder ground-truth bytes** reconstructed
+Beyond the live matrix and the encode→decode self-roundtrip suite, the
+decoder is pinned against **proprietary-encoder ground-truth bytes** reconstructed
 byte-for-byte from the clean-room spec's worked-example hex (no
 reference binary in-tree):
 
@@ -170,8 +227,8 @@ harnesses under [`fuzz/`](fuzz/), wired into the daily fuzz workflow:
   contract is decode always returns a `Result` and never
   panics / overflows / indexes OOB.
 - **`encode_magicyuv`** — drives `encode_frame` across the full
-  parameter cube; asserts no panic plus byte-exact round-trip
-  through `decode_frame`.
+  parameter cube (odd sizes included); asserts no panic plus
+  byte-exact round-trip through `decode_frame`.
 - **`huffman_descriptor`** — pushes arbitrary bytes into the
   length-descriptor parse + canonical-Huffman build + two-level
   table arithmetic.
@@ -184,6 +241,8 @@ cd fuzz && cargo +nightly fuzz run huffman_descriptor -- -max_total_time=60
 
 ## Profiling
 
+[`examples/magy_cli.rs`](examples/magy_cli.rs) decodes / encodes single
+frame files (planes back to back), handy next to a black-box tool.
 [`examples/profile_magicyuv.rs`](examples/profile_magicyuv.rs) is a
 flat sampling-profiler driver (modes: `encode`, `decode`,
 `roundtrip`, `dynamic`, `interlaced`, `all`). Criterion benches under

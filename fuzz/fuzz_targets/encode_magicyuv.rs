@@ -118,15 +118,12 @@ fuzz_target!(|data: &[u8]| {
     };
 
     // ── Header bytes 1-4: width / height ──────────────────────────
-    // Snap to even ≥ 2 so the subsampled chroma planes (sub_x/sub_y
-    // up to 2) never round down to 0 rows or 0 columns. The encoder
-    // accepts odd dimensions in principle — the in-crate roundtrip
-    // tests only cover even — and the fuzzer can still find issues
-    // with odd dims via the slice_height / interlaced axes below.
+    // Any size in 1..=32, odd ones included: subsampled chroma planes
+    // round up (`spec/03` §8.2), so they never have 0 rows or columns.
     let width_seed = u16::from_le_bytes([data[1], data[2]]) as u32;
     let height_seed = u16::from_le_bytes([data[3], data[4]]) as u32;
-    let width = ((width_seed % MAX_DIM) + 2) & !1; // even in 2..=32
-    let height = ((height_seed % MAX_DIM) + 2) & !1; // even in 2..=32
+    let width = (width_seed % MAX_DIM) + 1;
+    let height = (height_seed % MAX_DIM) + 1;
 
     // ── Header byte 5: slice_height ───────────────────────────────
     // Bias toward small slice heights so a single frame exercises
@@ -221,8 +218,8 @@ fuzz_target!(|data: &[u8]| {
             Family::Yuva if p == 1 || p == 2 => (rec.sub_x as usize, rec.sub_y as usize),
             _ => (1usize, 1usize),
         };
-        let pw = (width as usize) / sub_x;
-        let ph = (height as usize) / sub_y;
+        let pw = (width as usize).div_ceil(sub_x);
+        let ph = (height as usize).div_ceil(sub_y);
         let count = pw * ph;
         if rec.is_high_bit_depth() {
             // 2 bytes per sample (little-endian) then masked to
@@ -260,9 +257,10 @@ fuzz_target!(|data: &[u8]| {
     // ── 1. Encoder must always return ─────────────────────────────
     let bytes = match encode_frame(rec, width, height, slice_height, planes, options) {
         Ok(b) => b,
-        Err(_) => return, // legitimate rejection (e.g. mis-sized plane on a
-                          // FOURCC the harness happened to size for a sibling
-                          // family); not a panic, contract upheld.
+        Err(_) => return, // legitimate rejection (an interlaced slice
+                          // partition with a slice shorter than two
+                          // rows per plane); not a panic, contract
+                          // upheld.
     };
 
     // ── 2. Encoder output must decode ────────────────────────────

@@ -274,13 +274,72 @@ pub fn encode_frame(
     planes: Vec<PlaneInput>,
     options: EncodeOptions,
 ) -> Result<Vec<u8>> {
+    encode_frame_checked(rec, width, height, slice_height, planes, options, true)
+}
+
+/// [`encode_frame`] without the interlaced slice-length guard, so the
+/// in-crate tests can still build the short interlaced slices the
+/// decoder accepts (`spec/04` §5.1.1) but the encoder no longer writes.
+#[cfg(test)]
+pub(crate) fn encode_frame_any_geometry(
+    rec: FourccRecord,
+    width: u32,
+    height: u32,
+    slice_height: u32,
+    planes: Vec<PlaneInput>,
+    options: EncodeOptions,
+) -> Result<Vec<u8>> {
+    encode_frame_checked(rec, width, height, slice_height, planes, options, false)
+}
+
+fn encode_frame_checked(
+    rec: FourccRecord,
+    width: u32,
+    height: u32,
+    slice_height: u32,
+    planes: Vec<PlaneInput>,
+    options: EncodeOptions,
+    guard_interlaced_slices: bool,
+) -> Result<Vec<u8>> {
+    for (what, v) in [
+        ("width", width),
+        ("height", height),
+        ("slice_height", slice_height),
+    ] {
+        if v == 0 {
+            return Err(Error::ZeroDimension { what });
+        }
+    }
+    for (what, got) in [
+        ("width", width),
+        ("height", height),
+        ("slice_height", slice_height),
+    ] {
+        if got > crate::header::MAX_DIMENSION {
+            return Err(Error::DimensionTooLarge { what, got });
+        }
+    }
+    // Interlaced: every slice of every plane needs its two field-first
+    // rows (`spec/04` §5.1.1). A black-box decoder measures this on the
+    // luma rows of a slice divided (rounding down) by the vertical
+    // chroma factor, so a 4:2:0 slice needs four luma rows even where
+    // the rounded-up chroma plane would have two rows left.
+    if options.interlaced && guard_interlaced_slices {
+        let sub_y = rec.sub_y.max(1) as u32;
+        let slices = height.div_ceil(slice_height);
+        let last_rows = height - (slices - 1) * slice_height;
+        if (slices > 1 && slice_height / sub_y < 2) || last_rows / sub_y < 2 {
+            return Err(Error::InterlacedSliceTooShort {
+                slice_height,
+                height,
+            });
+        }
+    }
     // Reject a `slice_height` the §6 chroma partition can't tile (an
     // indivisible-by-`sub_y` value floors `slice_height / sub_y` and
     // drops the bottom chroma rows). Symmetric with the decoder guard;
-    // inert for `sub_y == 1`. `slice_height == 0` is normalised to a
-    // single full-frame slice by the callers below before reaching the
-    // partition arithmetic, so it's exempt here.
-    if rec.sub_y as u32 > 1 && slice_height != 0 && !slice_height.is_multiple_of(rec.sub_y as u32) {
+    // inert for `sub_y == 1`.
+    if rec.sub_y as u32 > 1 && !slice_height.is_multiple_of(rec.sub_y as u32) {
         return Err(Error::SliceHeightNotDivisibleBySubsampling {
             slice_height,
             factor: rec.sub_y as u32,
