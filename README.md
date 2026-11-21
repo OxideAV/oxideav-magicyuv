@@ -76,15 +76,17 @@ fields and recovered via typed `FrameHeader` accessors.
 `tests/blackbox_matrix.rs` runs a live matrix against a black-box
 MagicYUV encoder and decoder (the `ffmpeg` executable, output only; the
 test skips at runtime when it is absent). Current result with
-`cargo test --release`: **30 402 frames, 30 402 pass.**
+`cargo test --release`: **32 040 frames, 32 040 pass.**
 
-- **Foreign → this decoder — 12 474 / 12 474 bit-exact.** Every pixel
+- **Foreign → this decoder — 14 112 / 14 112 bit-exact.** Every pixel
   format the black-box encoder accepts (planar RGB, RGBA, YUV 4:4:4 /
   4:2:2 / 4:2:0, YUVA 4:4:4:4, gray — all 8-bit; it writes no deeper
-  format) × 3 predictors × slice counts 1…33 × 13 sizes from 1×1 through
+  format) × 3 predictors × slice counts 1…64 × 13 sizes from 1×1 through
   odd sizes to 641×361 × 6 kinds of content (noise, flat, zero,
   two-valued, noisy ramp, clean ramp). The black-box decoder is run on
-  the same frames and agrees.
+  the same frames and agrees. (Asked for more than 255 slices in a
+  frame, the black-box encoder writes frames its own decoder refuses;
+  those are outside the sweep.)
 - **This encoder → foreign decoder — 17 928 / 17 928 accepted
   bit-exact with no decoder diagnostics.** All 17 native FOURCCs
   (8/10/12/14-bit) × Left / Gradient / Median / Dynamic × Huffman / raw /
@@ -93,11 +95,14 @@ test skips at runtime when it is absent). Current result with
   of `spec/05` §4.1, which the vendor fixtures behind the spec never
   exercised.
 - **Size.** On the foreign → ours frames, `EncodeOptions::dynamic_auto()`
-  at the black-box encoder's slice height needs 91.7 % (4:2:0) to
-  95.8 % of the bytes of the *best of the black-box encoder's three
+  at the black-box encoder's slice height needs 92.4 % (4:2:0) to
+  96.2 % of the bytes of the *best of the black-box encoder's three
   predictors*, per pixel format (run-length descriptors, per-slice
   predictor choice and raw fallback); the test asserts it never needs
-  more.
+  more. On a 1080p image the two encoders are within 0.1 % of each
+  other predictor for predictor (both code the same residuals with an
+  optimal book), `dynamic_auto()` landing at or just under the best of
+  the three.
 
 What the first run of this matrix found (all fixed, each pinned in
 `tests/foreign_layout.rs`):

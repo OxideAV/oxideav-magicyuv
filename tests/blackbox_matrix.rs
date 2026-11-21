@@ -2,7 +2,7 @@
 //! and decoder (the `ffmpeg` executable, used for its output only).
 //!
 //! - **Foreign → ours**: the black-box encoder writes every pixel
-//!   format it accepts × every predictor × a sweep of slice counts ×
+//!   format it accepts × every predictor × slice counts 1…64 ×
 //!   tiny / odd / large sizes × several kinds of content; each frame
 //!   must decode here to exactly the source samples, and the black-box
 //!   decoder must agree.
@@ -291,7 +291,10 @@ const SIZES: [(usize, usize); 13] = [
     (641, 361),
 ];
 
-const SLICE_COUNTS: [u32; 8] = [1, 2, 3, 4, 5, 8, 16, 33];
+/// Slice counts asked of the black-box encoder. It writes at most 61
+/// slices per plane for these sizes; past 255 slices in a frame its own
+/// decoder refuses its output, so the sweep stops short of that.
+const SLICE_COUNTS: [u32; 9] = [1, 2, 3, 4, 5, 8, 16, 33, 64];
 
 /// Statistics of one foreign → ours sweep.
 #[derive(Default)]
@@ -313,8 +316,10 @@ fn foreign_to_ours(pix_fmt: &str, fourcc: &str) -> Tally {
             continue;
         }
         let big = w * h > 100_000;
-        let slice_counts: &[u32] = if big || REDUCED {
+        let slice_counts: &[u32] = if REDUCED {
             &[1, 5, 33]
+        } else if big {
+            &[1, 5, 33, 64]
         } else {
             &SLICE_COUNTS
         };
@@ -423,7 +428,7 @@ macro_rules! foreign_test {
                 return;
             }
             let tally = foreign_to_ours($pix, $fourcc);
-            let expected = if REDUCED { 432 } else { 1782 };
+            let expected = if REDUCED { 432 } else { 2016 };
             assert_eq!(tally.frames, expected);
             assert!(
                 tally.our_bytes <= tally.foreign_bytes,
