@@ -15,7 +15,7 @@ use oxideav_core::{
     VideoPlane, parse_options,
 };
 
-use crate::decoder::{DecodedFrame, Samples, decode_frame};
+use crate::decoder::{DecodedFrame, Samples};
 use crate::encoder::{
     EncodeOptions, PlaneInput, PredictorStrategy, SliceMode, encode_frame, output_params,
 };
@@ -119,6 +119,7 @@ fn make_decoder(params: &CodecParameters) -> CoreResult<Box<dyn Decoder>> {
         codec_id: params.codec_id.clone(),
         pending: None,
         eof: false,
+        threads: 1,
     }))
 }
 
@@ -126,6 +127,9 @@ struct MagicYuvDecoder {
     codec_id: CodecId,
     pending: Option<Packet>,
     eof: bool,
+    /// Thread budget granted through `set_execution_context` (serial by
+    /// default).
+    threads: usize,
 }
 
 impl Decoder for MagicYuvDecoder {
@@ -151,7 +155,8 @@ impl Decoder for MagicYuvDecoder {
                 Err(CoreError::NeedMore)
             };
         };
-        let frame = decode_frame(&pkt.data)
+        let options = crate::DecodeOptions::new().with_threads(self.threads);
+        let frame = crate::decode_frame_with(&pkt.data, options)
             .map_err(|e| CoreError::invalid(format!("oxideav-magicyuv: {e}")))?;
         Ok(Frame::Video(map_to_video_frame(frame, pkt.pts)))
     }
@@ -159,6 +164,12 @@ impl Decoder for MagicYuvDecoder {
     fn flush(&mut self) -> CoreResult<()> {
         self.eof = true;
         Ok(())
+    }
+
+    fn set_execution_context(&mut self, ctx: &oxideav_core::ExecutionContext) {
+        // Slices are independent (`spec/04` §5.2): decode them under the
+        // caller's budget. The default context is serial.
+        self.threads = ctx.threads;
     }
 }
 
@@ -672,6 +683,14 @@ impl Encoder for MagicYuvEncoder {
 
     fn flush(&mut self) -> CoreResult<()> {
         Ok(())
+    }
+
+    fn set_execution_context(&mut self, ctx: &oxideav_core::ExecutionContext) {
+        // Slices are independent (`spec/04` §5.2): code them under the
+        // caller's budget; the packet bytes do not depend on it. A
+        // single full-frame slice (the default `slice_height`) leaves
+        // only one unit of work per plane.
+        self.options = self.options.with_threads(ctx.threads);
     }
 }
 

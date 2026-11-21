@@ -168,6 +168,12 @@ pub struct EncodeOptions {
     /// is `Fixed(_)`, this field is ignored. Callers should set
     /// `strategy = PredictorStrategy::Fixed(predictor)` instead.
     pub predictor: PredictorKind,
+    /// Upper bound on the worker threads one frame may use. Slices are
+    /// independent (`spec/04` §5.2), so their prediction and entropy
+    /// coding run on up to this many scoped threads, the calling
+    /// thread included. `0` and `1` both mean serial (the default).
+    /// The encoded bytes are identical at every value.
+    pub threads: usize,
 }
 
 impl EncodeOptions {
@@ -212,6 +218,13 @@ impl EncodeOptions {
         self.predictor = predictor;
         self
     }
+
+    /// Set `threads`.
+    #[must_use]
+    pub fn with_threads(mut self, threads: usize) -> Self {
+        self.threads = threads;
+        self
+    }
 }
 
 impl Default for EncodeOptions {
@@ -223,6 +236,7 @@ impl Default for EncodeOptions {
             color_matrix: 1,
             full_range: false,
             predictor: PredictorKind::Gradient,
+            threads: 1,
         }
     }
 }
@@ -239,6 +253,7 @@ impl EncodeOptions {
             color_matrix: 1,
             full_range: false,
             predictor: PredictorKind::Gradient,
+            threads: 1,
         }
     }
 
@@ -251,6 +266,7 @@ impl EncodeOptions {
             color_matrix: 1,
             full_range: false,
             predictor: p,
+            threads: 1,
         }
     }
 }
@@ -1050,13 +1066,6 @@ fn encode_frame_u8(
     let w = width as usize;
     let h = height as usize;
     let sh = slice_height as usize;
-    let slices_per_plane = h.div_ceil(sh);
-    let total_slices = num_planes * slices_per_plane;
-    let field_stride = if options.interlaced {
-        FieldStride::INTERLACED
-    } else {
-        FieldStride::PROGRESSIVE
-    };
 
     let mut planes: Vec<Vec<u8>> = Vec::with_capacity(num_planes);
     for (i, p) in planes_in.into_iter().enumerate() {
@@ -1087,144 +1096,321 @@ fn encode_frame_u8(
         }
     }
 
-    let mut wire_planes: Vec<Vec<u8>> = match rec.family {
-        Family::Rgb | Family::Rgba => apply_rgb_decorrelation_u8(planes),
+    let threads = worker_grant(&options, &planes);
+    let wire_planes: Vec<Vec<u8>> = match rec.family {
+        Family::Rgb | Family::Rgba => apply_rgb_decorrelation_u8(planes, threads),
         _ => planes,
     };
+    Ok(encode_wire_planes(
+        rec,
+        width,
+        height,
+        slice_height,
+        wire_planes,
+        &plane_dims,
+        options,
+        threads,
+    ))
+}
 
-    // Per-slice predictor decision and residual production. Under
-    // `PredictorStrategy::Fixed(p)` every slice uses `p`; under
-    // `PredictorStrategy::Dynamic` the encoder evaluates all three
-    // predictors per slice and writes whichever produced the smallest
-    // residual sum (per spec/04 §3.1 algorithm).
-    //
-    // `plane_resid[p]` holds the concatenated residuals for every slice
-    // of plane `p` (in slice order), produced with that slice's chosen
-    // predictor. `slice_predictors[s]` records the predictor that wrote
-    // the residuals for global slice `s = plane * slices_per_plane +
-    // in_plane_idx`.
-    let mut plane_resid: Vec<Vec<u8>> = Vec::with_capacity(num_planes);
-    let mut slice_predictors: Vec<PredictorKind> = vec![PredictorKind::Left; total_slices];
-    let strategy = options.strategy;
-    // Reusable per-plane trial scratch buffers for Dynamic strategy.
-    // Capped at one slice's worth of bytes (max plane_slice_height *
-    // pw across planes); reused across every slice and every kind so
-    // the per-slice allocation count drops from 3 (Dynamic) / 1
-    // (Fixed) Vec<u8> mallocs to 0 after the first slice of the
-    // largest plane. The previous shape paid an
-    // `slice_rows * pw`-byte malloc on every `src.to_vec()` call (3
-    // per slice for Dynamic, 1 per slice for Fixed); see
-    // `build_slice_residuals_u8_into` below.
-    let mut trial_a: Vec<u8> = Vec::new();
-    let mut trial_b: Vec<u8> = Vec::new();
-    for p in 0..num_planes {
-        let (pw, ph, plane_slice_height) = plane_dims[p];
-        let mut residuals: Vec<u8> = Vec::with_capacity(pw * ph);
-        let plane_data = std::mem::take(&mut wire_planes[p]);
-        for s in 0..slices_per_plane {
-            let row_start = s * plane_slice_height;
-            let row_end = ((s + 1) * plane_slice_height).min(ph);
-            let slice_rows = row_end - row_start;
-            let src = &plane_data[row_start * pw..row_end * pw];
-            let chosen = build_slice_residuals_u8_into(
-                strategy,
-                src,
-                slice_rows,
-                pw,
-                field_stride,
-                &mut residuals,
-                &mut trial_a,
-                &mut trial_b,
-            );
-            slice_predictors[p * slices_per_plane + s] = chosen;
-        }
-        plane_resid.push(residuals);
+/// The thread grant actually used for a frame: frames below
+/// [`MIN_SAMPLES_FOR_THREADS`] are coded serially whatever the grant.
+fn worker_grant<T>(options: &EncodeOptions, planes: &[Vec<T>]) -> usize {
+    let samples: usize = planes.iter().map(Vec::len).sum();
+    if samples < MIN_SAMPLES_FOR_THREADS {
+        1
+    } else {
+        options.threads.max(1)
     }
+}
 
-    let max_len = max_huff_len_for(rec.bit_depth);
-    let plane_huffs: Vec<PlaneHuff> = plane_resid
-        .iter()
-        .map(|res| {
-            let mut hist = vec![0u32; 1 << rec.bit_depth];
-            for &b in res {
-                hist[b as usize] += 1;
+/// Frames with fewer samples than this are encoded serially: starting
+/// threads would cost more than the encode.
+const MIN_SAMPLES_FOR_THREADS: usize = 1 << 16;
+
+/// The operations of the slice pipeline that depend on the sample
+/// container (one byte at 8-bit, a 16-bit word above).
+trait WireSample: Copy + Send + Sync + 'static {
+    /// Residual symbol index.
+    fn symbol(self) -> usize;
+    /// Replace a slice's samples by its residuals, in place.
+    fn predict(
+        kind: PredictorKind,
+        block: &mut [Self],
+        rows: usize,
+        width: usize,
+        mask: u16,
+        field_stride: FieldStride,
+    );
+    /// Sum of residual magnitudes (the Dynamic selector's score).
+    fn score(block: &[Self], bits: u8) -> u64;
+    /// Append the Huffman-coded residuals.
+    fn pack_huffman(dst: &mut Vec<u8>, block: &[Self], packed: &[u32]);
+    /// Append the raw-mode residuals (`spec/05` §4.1).
+    fn pack_raw(dst: &mut Vec<u8>, block: &[Self], bits: u8);
+}
+
+impl WireSample for u8 {
+    #[inline(always)]
+    fn symbol(self) -> usize {
+        self as usize
+    }
+    fn predict(
+        kind: PredictorKind,
+        block: &mut [u8],
+        rows: usize,
+        width: usize,
+        _mask: u16,
+        field_stride: FieldStride,
+    ) {
+        encode_predictor_u8(kind, block, rows, width, field_stride);
+    }
+    fn score(block: &[u8], _bits: u8) -> u64 {
+        abs_signed_sum_u8(block)
+    }
+    fn pack_huffman(dst: &mut Vec<u8>, block: &[u8], packed: &[u32]) {
+        pack_huffman_residuals_u8(dst, block, packed);
+    }
+    fn pack_raw(dst: &mut Vec<u8>, block: &[u8], _bits: u8) {
+        dst.extend_from_slice(block);
+    }
+}
+
+impl WireSample for u16 {
+    #[inline(always)]
+    fn symbol(self) -> usize {
+        self as usize
+    }
+    fn predict(
+        kind: PredictorKind,
+        block: &mut [u16],
+        rows: usize,
+        width: usize,
+        mask: u16,
+        field_stride: FieldStride,
+    ) {
+        encode_predictor_u16(kind, block, rows, width, mask, field_stride);
+    }
+    fn score(block: &[u16], bits: u8) -> u64 {
+        abs_signed_sum_u16(block, 1u32 << (bits - 1))
+    }
+    fn pack_huffman(dst: &mut Vec<u8>, block: &[u16], packed: &[u32]) {
+        pack_huffman_residuals_u16(dst, block, packed);
+    }
+    fn pack_raw(dst: &mut Vec<u8>, block: &[u16], bits: u8) {
+        pack_raw_bits_from_u16(dst, block, bits);
+    }
+}
+
+/// Turn one slice's samples into its residuals in place and return the
+/// predictor used.
+///
+/// `Fixed(p)` applies `p`. `Dynamic` evaluates Left and Gradient in the
+/// two scratch buffers and Median in place, and keeps the one with the
+/// smallest residual-magnitude sum (`spec/04` §3.1), ties going to the
+/// lower predictor id (Left, then Gradient, then Median).
+#[allow(clippy::too_many_arguments)]
+fn slice_residuals_in_place<T: WireSample>(
+    strategy: PredictorStrategy,
+    block: &mut [T],
+    rows: usize,
+    width: usize,
+    mask: u16,
+    bits: u8,
+    field_stride: FieldStride,
+    scratch: &mut (Vec<T>, Vec<T>),
+) -> PredictorKind {
+    match strategy {
+        PredictorStrategy::Fixed(p) => {
+            T::predict(p, block, rows, width, mask, field_stride);
+            p
+        }
+        PredictorStrategy::Dynamic => {
+            let (left, gradient) = scratch;
+            left.clear();
+            left.extend_from_slice(block);
+            T::predict(PredictorKind::Left, left, rows, width, mask, field_stride);
+            let left_score = T::score(left, bits);
+
+            gradient.clear();
+            gradient.extend_from_slice(block);
+            T::predict(
+                PredictorKind::Gradient,
+                gradient,
+                rows,
+                width,
+                mask,
+                field_stride,
+            );
+            let gradient_score = T::score(gradient, bits);
+
+            T::predict(
+                PredictorKind::Median,
+                block,
+                rows,
+                width,
+                mask,
+                field_stride,
+            );
+            let median_score = T::score(block, bits);
+
+            if left_score <= gradient_score && left_score <= median_score {
+                block.copy_from_slice(left);
+                PredictorKind::Left
+            } else if gradient_score <= median_score {
+                block.copy_from_slice(gradient);
+                PredictorKind::Gradient
+            } else {
+                PredictorKind::Median
             }
-            if res.is_empty() {
-                hist[0] = 1;
+        }
+    }
+}
+
+/// Carve every plane into its slices' row blocks, plane-major (the
+/// slice-table order of `spec/02` §7.3).
+fn slice_blocks<'a, T>(
+    planes: &'a mut [Vec<T>],
+    plane_dims: &[(usize, usize, usize)],
+    slices_per_plane: usize,
+) -> Vec<(usize, usize, usize, &'a mut [T])> {
+    let mut blocks = Vec::with_capacity(planes.len() * slices_per_plane);
+    for ((plane, data), &(pw, ph, plane_slice_height)) in
+        planes.iter_mut().enumerate().zip(plane_dims)
+    {
+        let mut rest = data.as_mut_slice();
+        for s in 0..slices_per_plane {
+            let row_start = (s * plane_slice_height).min(ph);
+            let row_end = ((s + 1) * plane_slice_height).min(ph);
+            let rows = row_end - row_start;
+            let (block, tail) = std::mem::take(&mut rest).split_at_mut(rows * pw);
+            rest = tail;
+            blocks.push((plane, rows, pw, block));
+        }
+    }
+    blocks
+}
+
+/// Predict, build the per-plane books and entropy-code every slice of
+/// the wire planes (already decorrelated for the RGB families), then
+/// assemble the frame.
+#[allow(clippy::too_many_arguments)]
+fn encode_wire_planes<T: WireSample>(
+    rec: FourccRecord,
+    width: u32,
+    height: u32,
+    slice_height: u32,
+    mut wire_planes: Vec<Vec<T>>,
+    plane_dims: &[(usize, usize, usize)],
+    options: EncodeOptions,
+    threads: usize,
+) -> Vec<u8> {
+    let num_planes = rec.planes as usize;
+    let bits = rec.bit_depth;
+    let mask = rec.sample_mask() as u16;
+    let n_symbols = 1usize << bits;
+    let slices_per_plane = (height as usize).div_ceil(slice_height as usize);
+    let total_slices = num_planes * slices_per_plane;
+    let field_stride = if options.interlaced {
+        FieldStride::INTERLACED
+    } else {
+        FieldStride::PROGRESSIVE
+    };
+    let strategy = options.strategy;
+
+    // 1. Per slice: residuals in place (each slice starts fresh,
+    //    `spec/04` §5.2), the predictor that produced them, and the
+    //    slice's residual histogram.
+    let blocks = slice_blocks(&mut wire_planes, plane_dims, slices_per_plane);
+    let predicted: Vec<(PredictorKind, Vec<u32>)> = crate::parallel::for_each_job(
+        blocks,
+        threads,
+        || (Vec::<T>::new(), Vec::<T>::new()),
+        |scratch, (_plane, rows, pw, block)| {
+            let kind = slice_residuals_in_place(
+                strategy,
+                block,
+                rows,
+                pw,
+                mask,
+                bits,
+                field_stride,
+                scratch,
+            );
+            let mut hist = vec![0u32; n_symbols];
+            for &v in block.iter() {
+                hist[v.symbol()] += 1;
             }
-            PlaneHuff::build_from_histogram(&hist, max_len)
-        })
-        .collect();
+            (kind, hist)
+        },
+    );
 
-    let mut slice_payloads: Vec<Vec<u8>> = Vec::with_capacity(total_slices);
-    for (s, &pred_kind) in slice_predictors.iter().enumerate() {
-        let plane = s / slices_per_plane;
-        let in_plane_idx = s % slices_per_plane;
-        let (pw, ph, plane_slice_height) = plane_dims[plane];
-        let row_start = in_plane_idx * plane_slice_height;
-        let row_end = ((in_plane_idx + 1) * plane_slice_height).min(ph);
-        let _ = row_end;
-
-        let res_block = &plane_resid[plane][row_start * pw..row_end * pw];
-        let pred_id: u8 = predictor_id_byte(pred_kind);
-
-        // Choose per-slice Huffman vs raw flags.
-        let mut huff_buf: Option<Vec<u8>> = None;
-        let raw_size = res_block.len(); // 1 byte per sample at 8-bit
-        let flags: u8 = match options.mode {
-            SliceMode::Huffman => 0x00,
-            SliceMode::Raw => 0x01,
-            SliceMode::Auto => {
-                let huff = &plane_huffs[plane];
-                // Pre-size to the raw-size upper bound: under Auto, any
-                // Huffman encoding exceeding `raw_size` would lose to
-                // raw, so the actual emitted byte count is ≤ `raw_size`
-                // when Huffman wins. Add 1 for the partial-byte tail
-                // the packer's final `dst.push((acc >> 56) as u8)`
-                // flushes (`bits_used ∈ [1,7]` ⇒ one more byte).
-                // Eliminates ~17 geometric reallocations per slice at
-                // 1280×28 = 35840 input bytes.
-                let mut bytes = Vec::with_capacity(raw_size + 1);
-                pack_huffman_residuals_u8(&mut bytes, res_block, &huff.packed);
-                if bytes.len() <= raw_size {
-                    huff_buf = Some(bytes);
-                    0x00
-                } else {
-                    0x01
+    // 2. One book per plane from the plane's whole residual histogram
+    //    (`spec/05` §6.1).
+    let max_len = max_huff_len_for(bits);
+    let plane_hists: Vec<Vec<u32>> = predicted
+        .chunks(slices_per_plane)
+        .map(|slices| {
+            let mut hist = vec![0u32; n_symbols];
+            for (_, h) in slices {
+                for (acc, &c) in hist.iter_mut().zip(h) {
+                    *acc += c;
                 }
             }
-        };
+            hist
+        })
+        .collect();
+    let plane_huffs: Vec<PlaneHuff> = crate::parallel::for_each_job(
+        plane_hists,
+        threads,
+        || (),
+        |_, hist| PlaneHuff::build_from_histogram(&hist, max_len),
+    );
 
-        // Pre-size the per-slice payload: flags + pred_id + body. The
-        // body is `raw_size` for raw, `huff_buf.len()` (≤ raw_size + 1)
-        // for cached-Auto, and bounded by the 8-bit max-Huffman-length
-        // `(pixels * 12 + 7) / 8` for fresh-Huffman. Use `raw_size + 2`
-        // as a tight upper bound for the common path; oversized cases
-        // will just realloc once at the end.
-        let mut payload = Vec::with_capacity(raw_size + 2);
-        payload.push(flags);
-        payload.push(pred_id);
+    // 3. Per slice: the 2-byte prefix and the Huffman or raw body
+    //    (`spec/05` §3.1, §4).
+    let mode = options.mode;
+    let blocks = slice_blocks(&mut wire_planes, plane_dims, slices_per_plane);
+    let jobs: Vec<(PredictorKind, usize, &[T])> = blocks
+        .into_iter()
+        .zip(&predicted)
+        .map(|((plane, _, _, block), &(kind, _))| (kind, plane, &*block))
+        .collect();
+    let slice_payloads: Vec<Vec<u8>> = crate::parallel::for_each_job(
+        jobs,
+        threads,
+        || (),
+        |_, (kind, plane, block)| {
+            let packed = &plane_huffs[plane].packed;
+            // Raw body size: `ceil(samples * bits / 8)` (`spec/05` §4).
+            let raw_size = (block.len() * bits as usize).div_ceil(8);
+            // Under Auto a Huffman body longer than the raw one loses,
+            // so the buffer never needs more than `raw_size + 1` bytes
+            // when Huffman wins; a forced Huffman body is bounded by
+            // the longest code.
+            let mut payload = Vec::with_capacity(2 + raw_size + raw_size / 2 + 1);
+            payload.push(0x00);
+            payload.push(predictor_id_byte(kind));
+            match mode {
+                SliceMode::Huffman => T::pack_huffman(&mut payload, block, packed),
+                SliceMode::Raw => {
+                    payload[0] = 0x01;
+                    T::pack_raw(&mut payload, block, bits);
+                }
+                SliceMode::Auto => {
+                    T::pack_huffman(&mut payload, block, packed);
+                    if payload.len() - 2 > raw_size {
+                        payload.truncate(2);
+                        payload[0] = 0x01;
+                        T::pack_raw(&mut payload, block, bits);
+                    }
+                }
+            }
+            payload
+        },
+    );
 
-        if flags & 0x01 != 0 {
-            payload.extend_from_slice(res_block);
-        } else if let Some(buf) = huff_buf {
-            payload.extend(buf);
-        } else {
-            let huff = &plane_huffs[plane];
-            // Pure-Huffman mode (SliceMode::Huffman): output bounded by
-            // `(pixels * max_huff_len + 7) / 8` ≤ 1.5 * raw_size at the
-            // 8-bit alphabet's `max_huff_len = 12`. Reserve
-            // `raw_size + raw_size / 2 + 1` on the existing `payload`
-            // Vec so the batched packer's `dst.push((acc >> 56) as u8)`
-            // hot loop stays branchless on the capacity check;
-            // pathological skewed slices will still grow gracefully.
-            payload.reserve(raw_size + raw_size / 2 + 1);
-            pack_huffman_residuals_u8(&mut payload, res_block, &huff.packed);
-        }
-        slice_payloads.push(payload);
-    }
-
-    Ok(assemble_frame(
+    assemble_frame(
         rec,
         width,
         height,
@@ -1236,7 +1422,7 @@ fn encode_frame_u8(
         slices_per_plane,
         &plane_huffs,
         &slice_payloads,
-    ))
+    )
 }
 
 fn predictor_id_byte(k: PredictorKind) -> u8 {
@@ -1247,35 +1433,8 @@ fn predictor_id_byte(k: PredictorKind) -> u8 {
     }
 }
 
-/// Compute the residual block for one slice of a `u8` plane, picking
-/// the predictor per `strategy`. Returns `(chosen_predictor, residuals)`.
-///
-/// For `Fixed(p)` we just apply `p`. For `Dynamic` we evaluate Left,
-/// Gradient, and Median, sum the absolute (signed) residual byte
-/// values, and pick the minimiser (ties broken by predictor-id
-/// ascending — i.e. Left, then Gradient, then Median — matching
-/// spec/04 §3.1's "lowest residual sum" criterion).
-/// In-place residual-build with reusable scratch buffers.
-///
-/// Fixed: writes the slice's `src` copy directly into the tail of
-/// `dst` (the per-plane residual accumulator, pre-sized to
-/// `plane_w × plane_h` so the extend is allocation-free) and runs the
-/// predictor in-place on that tail. No scratch use.
-///
-/// Dynamic: runs the three candidate predictors through `trial_a` /
-/// `trial_b` (reused across every slice of every plane — alloc-free
-/// after the first slice of the largest plane), tracks the lowest L1
-/// score so far, and on completion copies the winning scratch into
-/// `dst`'s tail with a single `extend_from_slice`. Net per-slice
-/// allocation count is 0 (vs. 3 `src.to_vec()` mallocs in the prior
-/// shape); per-slice copy count is 4 (3 `src→scratch` + 1
-/// `scratch→dst`) — same as before (3 `src.to_vec()` + 1
-/// `extend_from_slice`), but with the heap-pressure component
-/// removed.
-///
-/// Tie-break is the same as the prior shape: predictor-id ascending
-/// (Left, Gradient, Median) — `<` for "strictly better" preserves the
-/// first-runner-up on ties.
+/// Test shim with the append-to-`Vec` shape the scratch tests drive.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn build_slice_residuals_u8_into(
     strategy: PredictorStrategy,
@@ -1287,78 +1446,21 @@ fn build_slice_residuals_u8_into(
     trial_a: &mut Vec<u8>,
     trial_b: &mut Vec<u8>,
 ) -> PredictorKind {
-    match strategy {
-        PredictorStrategy::Fixed(p) => {
-            let tail_start = dst.len();
-            dst.extend_from_slice(src);
-            encode_predictor_u8(p, &mut dst[tail_start..], rows, width, field_stride);
-            p
-        }
-        PredictorStrategy::Dynamic => {
-            // Kind 1 (Left) → trial_a. Becomes "best so far".
-            trial_a.clear();
-            trial_a.extend_from_slice(src);
-            encode_predictor_u8(
-                PredictorKind::Left,
-                &mut trial_a[..],
-                rows,
-                width,
-                field_stride,
-            );
-            let mut best_kind = PredictorKind::Left;
-            let mut best_in_a = true;
-            let mut best_score = abs_signed_sum_u8(trial_a);
-
-            // Kind 2 (Gradient) → trial_b.
-            trial_b.clear();
-            trial_b.extend_from_slice(src);
-            encode_predictor_u8(
-                PredictorKind::Gradient,
-                &mut trial_b[..],
-                rows,
-                width,
-                field_stride,
-            );
-            let score_b = abs_signed_sum_u8(trial_b);
-            if score_b < best_score {
-                best_score = score_b;
-                best_kind = PredictorKind::Gradient;
-                best_in_a = false;
-            }
-
-            // Kind 3 (Median) → the current loser's scratch so the
-            // winner survives untouched.
-            {
-                let loser = if best_in_a {
-                    &mut *trial_b
-                } else {
-                    &mut *trial_a
-                };
-                loser.clear();
-                loser.extend_from_slice(src);
-                encode_predictor_u8(
-                    PredictorKind::Median,
-                    &mut loser[..],
-                    rows,
-                    width,
-                    field_stride,
-                );
-                let score_m = abs_signed_sum_u8(loser);
-                if score_m < best_score {
-                    best_kind = PredictorKind::Median;
-                    best_in_a = !best_in_a;
-                }
-            }
-
-            // Append the winning scratch into the residual accumulator.
-            if best_in_a {
-                dst.extend_from_slice(trial_a);
-            } else {
-                dst.extend_from_slice(trial_b);
-            }
-            best_kind
-        }
-    }
+    let start = dst.len();
+    dst.extend_from_slice(src);
+    let mut scratch = (std::mem::take(trial_a), std::mem::take(trial_b));
+    let kind = slice_residuals_in_place(
+        strategy,
+        &mut dst[start..],
+        rows,
+        width,
+        0xff,
+        8,
+        field_stride,
+        &mut scratch,
+    );
+    (*trial_a, *trial_b) = scratch;
+    kind
 }
 
 /// Sum of |signed| residuals interpreting each byte as `i8`. Equivalent
@@ -1375,18 +1477,19 @@ fn abs_signed_sum_u8(block: &[u8]) -> u64 {
     s
 }
 
-fn apply_rgb_decorrelation_u8(planes: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+fn apply_rgb_decorrelation_u8(planes: Vec<Vec<u8>>, threads: usize) -> Vec<Vec<u8>> {
     let mut iter = planes.into_iter();
     let g = iter.next().unwrap();
     let mut b = iter.next().unwrap();
     let mut r = iter.next().unwrap();
     let a_opt = iter.next();
-    for (bv, &gv) in b.iter_mut().zip(g.iter()) {
-        *bv = bv.wrapping_sub(gv);
-    }
-    for (rv, &gv) in r.iter_mut().zip(g.iter()) {
-        *rv = rv.wrapping_sub(gv);
-    }
+    let sub_green = |x: &mut [u8], g: &[u8]| {
+        for (v, &gv) in x.iter_mut().zip(g) {
+            *v = v.wrapping_sub(gv);
+        }
+    };
+    crate::parallel::zip_chunks(&mut b, &g, threads, sub_green);
+    crate::parallel::zip_chunks(&mut r, &g, threads, sub_green);
     let mut out = vec![b, g, r];
     if let Some(a) = a_opt {
         out.push(a);
@@ -1507,15 +1610,7 @@ fn encode_frame_u16(
     let w = width as usize;
     let h = height as usize;
     let sh = slice_height as usize;
-    let slices_per_plane = h.div_ceil(sh);
-    let total_slices = num_planes * slices_per_plane;
-    let bits = rec.bit_depth;
     let mask = rec.sample_mask() as u16;
-    let field_stride = if options.interlaced {
-        FieldStride::INTERLACED
-    } else {
-        FieldStride::PROGRESSIVE
-    };
 
     let mut planes: Vec<Vec<u16>> = Vec::with_capacity(num_planes);
     for (i, p) in planes_in.into_iter().enumerate() {
@@ -1550,149 +1645,25 @@ fn encode_frame_u16(
         }
     }
 
-    let mut wire_planes: Vec<Vec<u16>> = match rec.family {
-        Family::Rgb | Family::Rgba => apply_rgb_decorrelation_u16(planes, mask),
+    let threads = worker_grant(&options, &planes);
+    let wire_planes: Vec<Vec<u16>> = match rec.family {
+        Family::Rgb | Family::Rgba => apply_rgb_decorrelation_u16(planes, mask, threads),
         _ => planes,
     };
-
-    let mut plane_resid: Vec<Vec<u16>> = Vec::with_capacity(num_planes);
-    let mut slice_predictors: Vec<PredictorKind> = vec![PredictorKind::Left; total_slices];
-    let strategy = options.strategy;
-    // See `encode_frame_u8` for the per-plane scratch-reuse rationale.
-    let mut trial_a: Vec<u16> = Vec::new();
-    let mut trial_b: Vec<u16> = Vec::new();
-    for p in 0..num_planes {
-        let (pw, ph, plane_slice_height) = plane_dims[p];
-        let mut residuals: Vec<u16> = Vec::with_capacity(pw * ph);
-        let plane_data = std::mem::take(&mut wire_planes[p]);
-        for s in 0..slices_per_plane {
-            let row_start = s * plane_slice_height;
-            let row_end = ((s + 1) * plane_slice_height).min(ph);
-            let slice_rows = row_end - row_start;
-            let src = &plane_data[row_start * pw..row_end * pw];
-            let chosen = build_slice_residuals_u16_into(
-                strategy,
-                src,
-                slice_rows,
-                pw,
-                mask,
-                bits,
-                field_stride,
-                &mut residuals,
-                &mut trial_a,
-                &mut trial_b,
-            );
-            slice_predictors[p * slices_per_plane + s] = chosen;
-        }
-        plane_resid.push(residuals);
-    }
-
-    let max_len = max_huff_len_for(bits);
-    let plane_huffs: Vec<PlaneHuff> = plane_resid
-        .iter()
-        .map(|res| {
-            let mut hist = vec![0u32; 1usize << bits];
-            for &b in res {
-                hist[b as usize] += 1;
-            }
-            if res.is_empty() {
-                hist[0] = 1;
-            }
-            PlaneHuff::build_from_histogram(&hist, max_len)
-        })
-        .collect();
-
-    let mut slice_payloads: Vec<Vec<u8>> = Vec::with_capacity(total_slices);
-    for (s, &pred_kind) in slice_predictors.iter().enumerate() {
-        let plane = s / slices_per_plane;
-        let in_plane_idx = s % slices_per_plane;
-        let (pw, ph, plane_slice_height) = plane_dims[plane];
-        let _ = ph;
-        let row_start = in_plane_idx * plane_slice_height;
-        let row_end = ((in_plane_idx + 1) * plane_slice_height).min(plane_dims[plane].1);
-
-        let res_block = &plane_resid[plane][row_start * pw..row_end * pw];
-        let pred_id: u8 = predictor_id_byte(pred_kind);
-
-        // Per-slice mode selection. Raw size at bit-depth `bits` is
-        // `(pixels * bits + 7) / 8` bytes (spec/05 §4.1).
-        let raw_bits = res_block.len() * bits as usize;
-        let raw_size = raw_bits.div_ceil(8);
-        let mut huff_buf: Option<Vec<u8>> = None;
-        let flags: u8 = match options.mode {
-            SliceMode::Huffman => 0x00,
-            SliceMode::Raw => 0x01,
-            SliceMode::Auto => {
-                let huff = &plane_huffs[plane];
-                // See the u8 Auto branch for the cap reasoning. At
-                // 10/12/14-bit `raw_size = (pixels * bits + 7) / 8`.
-                let mut bytes = Vec::with_capacity(raw_size + 1);
-                pack_huffman_residuals_u16(&mut bytes, res_block, &huff.packed);
-                if bytes.len() <= raw_size {
-                    huff_buf = Some(bytes);
-                    0x00
-                } else {
-                    0x01
-                }
-            }
-        };
-
-        // Pre-size the per-slice payload. For the 10/12/14-bit path,
-        // pure-Huffman mode is capped by `(pixels * max_huff_len + 7)
-        // / 8` with `max_huff_len ∈ {14,16,18}` (spec/05 §1) — the
-        // worst-case ratio over `raw_size = (pixels * bits + 7) / 8` is
-        // `max_huff_len / bits ≤ 18/10 = 1.8`. We use the same `2 *
-        // raw_size + 2` cap as a comfortable margin.
-        let mut payload = Vec::with_capacity(2 * raw_size + 2);
-        payload.push(flags);
-        payload.push(pred_id);
-
-        if flags & 0x01 != 0 {
-            // Bit-pack at `bits` bits MSB-first. Output is exactly
-            // `raw_size` bytes (final partial byte already accounted
-            // for by `div_ceil`). The batched packer hoists the
-            // 64-bit accumulator + drain state into stack locals
-            // across the slice, eliminating the per-symbol
-            // `&mut BitWriter` reload + early-return that the
-            // generic `BitWriter::write` carries.
-            pack_raw_bits_from_u16(&mut payload, res_block, bits);
-        } else if let Some(buf) = huff_buf {
-            payload.extend(buf);
-        } else {
-            let huff = &plane_huffs[plane];
-            // See the u8 fresh-Huffman comment for the cap rationale;
-            // 1.8 × raw_size at 10-bit is the worst case. Reserve on
-            // the existing `payload` so the batched packer's drain
-            // hot loop is branchless on the capacity check.
-            payload.reserve(2 * raw_size + 1);
-            pack_huffman_residuals_u16(&mut payload, res_block, &huff.packed);
-        }
-        slice_payloads.push(payload);
-    }
-
-    Ok(assemble_frame(
+    Ok(encode_wire_planes(
         rec,
         width,
         height,
         slice_height,
-        options.interlaced,
-        options.color_matrix,
-        options.full_range,
-        total_slices,
-        slices_per_plane,
-        &plane_huffs,
-        &slice_payloads,
+        wire_planes,
+        &plane_dims,
+        options,
+        threads,
     ))
 }
 
-/// `u16` analogue of [`build_slice_residuals_u8`]: pick a predictor
-/// (per `strategy`) and emit its residuals. For Dynamic, the score is
-/// `u16` analogue of [`build_slice_residuals_u8_into`]: same scratch
-/// reuse + in-place-into-`dst`-tail shape. Fixed walks the predictor
-/// in `dst`'s tail; Dynamic shuffles the three trial residuals
-/// through `trial_a` / `trial_b` (reused across every slice + every
-/// kind) and `extend_from_slice`-copies the winning scratch into
-/// `dst` once.
+/// `u16` analogue of the `u8` test shim.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn build_slice_residuals_u16_into(
     strategy: PredictorStrategy,
@@ -1706,81 +1677,21 @@ fn build_slice_residuals_u16_into(
     trial_a: &mut Vec<u16>,
     trial_b: &mut Vec<u16>,
 ) -> PredictorKind {
-    match strategy {
-        PredictorStrategy::Fixed(p) => {
-            let tail_start = dst.len();
-            dst.extend_from_slice(src);
-            encode_predictor_u16(p, &mut dst[tail_start..], rows, width, mask, field_stride);
-            p
-        }
-        PredictorStrategy::Dynamic => {
-            let half = 1u32 << (bits - 1);
-
-            // Kind 1 (Left) → trial_a.
-            trial_a.clear();
-            trial_a.extend_from_slice(src);
-            encode_predictor_u16(
-                PredictorKind::Left,
-                &mut trial_a[..],
-                rows,
-                width,
-                mask,
-                field_stride,
-            );
-            let mut best_kind = PredictorKind::Left;
-            let mut best_in_a = true;
-            let mut best_score = abs_signed_sum_u16(trial_a, half);
-
-            // Kind 2 (Gradient) → trial_b.
-            trial_b.clear();
-            trial_b.extend_from_slice(src);
-            encode_predictor_u16(
-                PredictorKind::Gradient,
-                &mut trial_b[..],
-                rows,
-                width,
-                mask,
-                field_stride,
-            );
-            let score_b = abs_signed_sum_u16(trial_b, half);
-            if score_b < best_score {
-                best_score = score_b;
-                best_kind = PredictorKind::Gradient;
-                best_in_a = false;
-            }
-
-            // Kind 3 (Median) → loser's scratch.
-            {
-                let loser = if best_in_a {
-                    &mut *trial_b
-                } else {
-                    &mut *trial_a
-                };
-                loser.clear();
-                loser.extend_from_slice(src);
-                encode_predictor_u16(
-                    PredictorKind::Median,
-                    &mut loser[..],
-                    rows,
-                    width,
-                    mask,
-                    field_stride,
-                );
-                let score_m = abs_signed_sum_u16(loser, half);
-                if score_m < best_score {
-                    best_kind = PredictorKind::Median;
-                    best_in_a = !best_in_a;
-                }
-            }
-
-            if best_in_a {
-                dst.extend_from_slice(trial_a);
-            } else {
-                dst.extend_from_slice(trial_b);
-            }
-            best_kind
-        }
-    }
+    let start = dst.len();
+    dst.extend_from_slice(src);
+    let mut scratch = (std::mem::take(trial_a), std::mem::take(trial_b));
+    let kind = slice_residuals_in_place(
+        strategy,
+        &mut dst[start..],
+        rows,
+        width,
+        mask,
+        bits,
+        field_stride,
+        &mut scratch,
+    );
+    (*trial_a, *trial_b) = scratch;
+    kind
 }
 
 /// `sum_b min(b, (1 << bits) - b)` — the abs-signed L1 norm of the
@@ -1798,18 +1709,19 @@ fn abs_signed_sum_u16(block: &[u16], half: u32) -> u64 {
     s
 }
 
-fn apply_rgb_decorrelation_u16(planes: Vec<Vec<u16>>, mask: u16) -> Vec<Vec<u16>> {
+fn apply_rgb_decorrelation_u16(planes: Vec<Vec<u16>>, mask: u16, threads: usize) -> Vec<Vec<u16>> {
     let mut iter = planes.into_iter();
     let g = iter.next().unwrap();
     let mut b = iter.next().unwrap();
     let mut r = iter.next().unwrap();
     let a_opt = iter.next();
-    for (bv, &gv) in b.iter_mut().zip(g.iter()) {
-        *bv = bv.wrapping_sub(gv) & mask;
-    }
-    for (rv, &gv) in r.iter_mut().zip(g.iter()) {
-        *rv = rv.wrapping_sub(gv) & mask;
-    }
+    let sub_green = |x: &mut [u16], g: &[u16]| {
+        for (v, &gv) in x.iter_mut().zip(g) {
+            *v = v.wrapping_sub(gv) & mask;
+        }
+    };
+    crate::parallel::zip_chunks(&mut b, &g, threads, sub_green);
+    crate::parallel::zip_chunks(&mut r, &g, threads, sub_green);
     let mut out = vec![b, g, r];
     if let Some(a) = a_opt {
         out.push(a);

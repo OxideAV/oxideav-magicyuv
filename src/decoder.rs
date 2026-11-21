@@ -196,8 +196,45 @@ impl DecodedPlane {
 /// per-plane buffers. Convenience wrapper around [`decode_into`] for
 /// one-shot callers.
 pub fn decode_frame(bytes: &[u8]) -> Result<DecodedFrame> {
+    decode_frame_with(bytes, DecodeOptions::new())
+}
+
+/// Decoder knobs. The default is a serial decode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DecodeOptions {
+    /// Upper bound on the worker threads one frame may use. Slices are
+    /// independent (`spec/04` §5.2), so they are decoded on up to this
+    /// many scoped threads, the calling thread included. `0` and `1`
+    /// both mean serial. The decoded samples are identical at every
+    /// value.
+    pub threads: usize,
+}
+
+impl DecodeOptions {
+    /// Serial decode.
+    pub const fn new() -> Self {
+        Self { threads: 1 }
+    }
+
+    /// Set `threads`.
+    #[must_use]
+    pub const fn with_threads(mut self, threads: usize) -> Self {
+        self.threads = threads;
+        self
+    }
+}
+
+impl Default for DecodeOptions {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// [`decode_frame`] with explicit [`DecodeOptions`].
+pub fn decode_frame_with(bytes: &[u8], options: DecodeOptions) -> Result<DecodedFrame> {
     let mut dst = DecodedFrame::empty();
-    decode_into(bytes, &mut dst)?;
+    decode_into_with(bytes, &mut dst, options)?;
     Ok(dst)
 }
 
@@ -219,6 +256,15 @@ pub fn decode_frame(bytes: &[u8]) -> Result<DecodedFrame> {
 /// should treat the value as "needs re-decode" after any `Err`
 /// return.
 pub fn decode_into(bytes: &[u8], dst: &mut DecodedFrame) -> Result<()> {
+    decode_into_with(bytes, dst, DecodeOptions::new())
+}
+
+/// [`decode_into`] with explicit [`DecodeOptions`].
+pub fn decode_into_with(
+    bytes: &[u8],
+    dst: &mut DecodedFrame,
+    options: DecodeOptions,
+) -> Result<()> {
     if bytes.len() < header::HEADER_SIZE {
         return Err(Error::Truncated {
             what: "MAGY frame",
@@ -442,6 +488,14 @@ pub fn decode_into(bytes: &[u8], dst: &mut DecodedFrame) -> Result<()> {
         FieldStride::PROGRESSIVE
     };
 
+    // A grant is only worth its thread start-up on frames of some size.
+    let samples: usize = plane_geoms.iter().map(|g| g.width * g.height).sum();
+    let threads = if samples < MIN_SAMPLES_FOR_THREADS {
+        1
+    } else {
+        options.threads.max(1)
+    };
+
     if rec.is_high_bit_depth() {
         decode_high_bit_depth(
             bytes,
@@ -455,6 +509,7 @@ pub fn decode_into(bytes: &[u8], dst: &mut DecodedFrame) -> Result<()> {
             tracer.as_ref(),
             hdr,
             dst,
+            threads,
         )
     } else {
         decode_eight_bit(
@@ -469,8 +524,137 @@ pub fn decode_into(bytes: &[u8], dst: &mut DecodedFrame) -> Result<()> {
             tracer.as_ref(),
             hdr,
             dst,
+            threads,
         )
     }
+}
+
+/// Frames with fewer samples than this are decoded serially whatever
+/// the grant: starting threads would cost more than the decode.
+const MIN_SAMPLES_FOR_THREADS: usize = 1 << 16;
+
+/// One slice's decode work: its payload and the rows it reconstructs.
+struct SliceJob<'a, T> {
+    /// Position in the slice table.
+    slice: usize,
+    plane: usize,
+    #[cfg_attr(not(feature = "trace"), allow(dead_code))]
+    in_plane_idx: usize,
+    #[cfg_attr(not(feature = "trace"), allow(dead_code))]
+    row_start: usize,
+    rows: usize,
+    width: usize,
+    #[cfg_attr(not(feature = "trace"), allow(dead_code))]
+    file_offset: usize,
+    payload: &'a [u8],
+    out: &'a mut [T],
+}
+
+/// What a decoded slice reports back (for the trace tape).
+#[cfg_attr(not(feature = "trace"), allow(dead_code))]
+struct SliceDone {
+    slice: usize,
+    plane: usize,
+    in_plane_idx: usize,
+    row_start: usize,
+    rows: usize,
+    width: usize,
+    file_offset: usize,
+    payload_size: usize,
+    slice_flags: u8,
+    predictor_id: u8,
+}
+
+impl<T> SliceJob<'_, T> {
+    fn done(&self, slice_flags: u8, predictor_id: u8) -> SliceDone {
+        SliceDone {
+            slice: self.slice,
+            plane: self.plane,
+            in_plane_idx: self.in_plane_idx,
+            row_start: self.row_start,
+            rows: self.rows,
+            width: self.width,
+            file_offset: self.file_offset,
+            payload_size: self.payload.len(),
+            slice_flags,
+            predictor_id,
+        }
+    }
+}
+
+/// Carve the plane buffers into one disjoint row block per slice and
+/// pair each with its payload, in slice-table order.
+fn slice_jobs<'a, T>(
+    bytes: &'a [u8],
+    slice_ranges: &[(usize, usize)],
+    slice_plane_map: &[(usize, usize)],
+    plane_geoms: &[PlaneGeom],
+    plane_bufs: &'a mut [Vec<T>],
+) -> Vec<SliceJob<'a, T>> {
+    let slices_per_plane = slice_plane_map.len() / plane_geoms.len().max(1);
+    // table position of the i-th slice of each plane
+    let mut table_pos = vec![vec![0usize; slices_per_plane]; plane_geoms.len()];
+    for (s, &(plane, in_plane_idx)) in slice_plane_map.iter().enumerate() {
+        table_pos[plane][in_plane_idx] = s;
+    }
+    let mut jobs = Vec::with_capacity(slice_plane_map.len());
+    for ((plane, buf), g) in plane_bufs.iter_mut().enumerate().zip(plane_geoms) {
+        let mut rest = buf.as_mut_slice();
+        for (in_plane_idx, &slice) in table_pos[plane].iter().enumerate() {
+            let row_start = (in_plane_idx * g.plane_slice_height).min(g.height);
+            let row_end = ((in_plane_idx + 1) * g.plane_slice_height).min(g.height);
+            let rows = row_end - row_start;
+            let (out, tail) = std::mem::take(&mut rest).split_at_mut(rows * g.width);
+            rest = tail;
+            let (start, end) = slice_ranges[slice];
+            jobs.push(SliceJob {
+                slice,
+                plane,
+                in_plane_idx,
+                row_start,
+                rows,
+                width: g.width,
+                file_offset: start,
+                payload: &bytes[start..end],
+                out,
+            });
+        }
+    }
+    jobs.sort_unstable_by_key(|j| j.slice);
+    jobs
+}
+
+/// Hand the per-slice results to the trace tape (in slice order, up to
+/// the first failure) and surface the first failure.
+fn finish_slices(
+    results: Vec<Result<SliceDone>>,
+    #[cfg(feature = "trace")] tracer: Option<&Tracer>,
+) -> Result<()> {
+    for r in results {
+        let _done = r?;
+        #[cfg(feature = "trace")]
+        if let Some(t) = tracer {
+            t.emit(Event::Payload {
+                slice: _done.slice,
+                plane: _done.plane,
+                slice_in_plane: _done.in_plane_idx,
+                row_start: _done.row_start,
+                row_end: _done.row_start + _done.rows,
+                cols: _done.width,
+                file_offset: _done.file_offset,
+                payload_size: _done.payload_size,
+                slice_flags: _done.slice_flags,
+                predictor_id: _done.predictor_id,
+                mode: if (_done.slice_flags & 0x01) != 0 {
+                    "raw"
+                } else {
+                    "huffman"
+                },
+                n_pixels: _done.rows * _done.width,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Resolve the preamble's `total_slices` index bytes into, for each
@@ -709,82 +893,63 @@ fn decode_eight_bit(
     #[cfg(feature = "trace")] tracer: Option<&Tracer>,
     hdr: FrameHeader,
     dst: &mut DecodedFrame,
+    threads: usize,
 ) -> Result<()> {
-    let _num_planes = rec.planes as usize;
     // Re-use existing per-plane storage when geometry matches; only
     // size-mismatched (or previously-U16) slots allocate.
     let mut plane_bufs: Vec<Vec<u8>> = take_plane_bufs_u8(dst, plane_geoms);
 
-    for (s, &(slice_start, slice_end)) in slice_ranges.iter().enumerate() {
-        // `(plane, in_plane_idx)` comes from the on-wire
-        // `per_slice_plane_index` mapping (spec/02 §7.3), not the
-        // assumed plane-major `s / slices_per_plane`.
-        let (plane, in_plane_idx) = slice_plane_map[s];
-        let g = plane_geoms[plane];
-        let row_start = in_plane_idx * g.plane_slice_height;
-        let row_end = ((in_plane_idx + 1) * g.plane_slice_height).min(g.height);
-        let slice_rows = row_end - row_start;
-
-        // Bounds, prefix and minimum size were checked by
-        // `validate_slices`.
-        let payload = &bytes[slice_start..slice_end];
-        let slice_flags = payload[0];
-        let predictor_id = payload[1];
-        let pred_kind = tables::lookup_predictor(predictor_id)?;
-
-        let pixels_in_slice = slice_rows * g.width;
-        let buf = &mut plane_bufs[plane][row_start * g.width..row_end * g.width];
-
-        let mode_str: &str;
-        if (slice_flags & 0x01) != 0 {
-            mode_str = "raw";
-            let needed = pixels_in_slice;
-            if payload.len() - 2 < needed {
-                return Err(Error::SliceTruncated { slice_index: s });
+    // `(plane, in_plane_idx)` of every slice comes from the on-wire
+    // mapping (spec/02 §7.3). Bounds, prefix and minimum size were
+    // checked by `validate_slices`.
+    let jobs = slice_jobs(
+        bytes,
+        slice_ranges,
+        slice_plane_map,
+        plane_geoms,
+        &mut plane_bufs,
+    );
+    let results = crate::parallel::for_each_job(
+        jobs,
+        threads,
+        || (),
+        |_, job| -> Result<SliceDone> {
+            let slice_flags = job.payload[0];
+            let predictor_id = job.payload[1];
+            let pred_kind = tables::lookup_predictor(predictor_id)?;
+            let done = job.done(slice_flags, predictor_id);
+            if (slice_flags & 0x01) != 0 {
+                let needed = job.out.len();
+                if job.payload.len() - 2 < needed {
+                    return Err(Error::SliceTruncated {
+                        slice_index: job.slice,
+                    });
+                }
+                job.out.copy_from_slice(&job.payload[2..2 + needed]);
+            } else {
+                let mut br = BitReader::new(&job.payload[2..]);
+                // A `false` return means a symbol indexed an
+                // unused-codespace slot of an under-full descriptor
+                // (`spec/05` §2.1) — reject the slice as malformed
+                // rather than emit garbage.
+                if !huff_tables[job.plane].decode_into_u8(&mut br, job.out) {
+                    return Err(Error::HuffmanIncomplete { plane: job.plane });
+                }
             }
-            buf.copy_from_slice(&payload[2..2 + needed]);
-        } else {
-            mode_str = "huffman";
-            let bits = &payload[2..];
-            let mut br = BitReader::new(bits);
-            let table = &huff_tables[plane];
-            // Inline batch helper — folds peek+consume into a single
-            // tight loop so the compiler keeps BitReader state in
-            // registers across iterations. Same observable bit stream
-            // as the per-symbol `decode` call (kept as the slow
-            // fallback inside `decode_into_u8`). A `false` return means
-            // a symbol indexed an unused-codespace slot of an under-full
-            // descriptor (`spec/05` §2.1) — reject the slice as
-            // malformed rather than emit garbage.
-            if !table.decode_into_u8(&mut br, buf) {
-                return Err(Error::HuffmanIncomplete { plane });
-            }
-        }
-
+            predict::apply_u8_with_stride(pred_kind, job.out, job.rows, job.width, field_stride);
+            Ok(done)
+        },
+    );
+    finish_slices(
+        results,
         #[cfg(feature = "trace")]
-        if let Some(t) = tracer {
-            t.emit(Event::Payload {
-                slice: s,
-                plane,
-                slice_in_plane: in_plane_idx,
-                row_start,
-                row_end,
-                cols: g.width,
-                file_offset: slice_start,
-                payload_size: payload.len(),
-                slice_flags,
-                predictor_id,
-                mode: mode_str,
-                n_pixels: pixels_in_slice,
-            });
-        }
-        let _ = mode_str;
-
-        predict::apply_u8_with_stride(pred_kind, buf, slice_rows, g.width, field_stride);
-    }
+        tracer,
+    )?;
 
     let final_planes = match rec.family {
-        Family::Rgb | Family::Rgba => reverse_rgb_decorrelation_u8(plane_bufs, plane_geoms, rec),
+        Family::Rgb | Family::Rgba => {
+            reverse_rgb_decorrelation_u8(plane_bufs, plane_geoms, rec, threads)
+        }
         Family::Yuv | Family::Yuva | Family::Gray => plane_bufs
             .into_iter()
             .zip(plane_geoms.iter())
@@ -817,84 +982,78 @@ fn decode_high_bit_depth(
     #[cfg(feature = "trace")] tracer: Option<&Tracer>,
     hdr: FrameHeader,
     dst: &mut DecodedFrame,
+    threads: usize,
 ) -> Result<()> {
-    let _num_planes = rec.planes as usize;
     let bits = rec.bit_depth;
     let mask = rec.sample_mask() as u16;
 
     let mut plane_bufs: Vec<Vec<u16>> = take_plane_bufs_u16(dst, plane_geoms);
 
-    for (s, &(slice_start, slice_end)) in slice_ranges.iter().enumerate() {
-        // On-wire slice→plane mapping (spec/02 §7.3); see
-        // `decode_eight_bit` for the rationale.
-        let (plane, in_plane_idx) = slice_plane_map[s];
-        let g = plane_geoms[plane];
-        let row_start = in_plane_idx * g.plane_slice_height;
-        let row_end = ((in_plane_idx + 1) * g.plane_slice_height).min(g.height);
-        let slice_rows = row_end - row_start;
-
-        // Bounds, prefix and minimum size were checked by
-        // `validate_slices`.
-        let payload = &bytes[slice_start..slice_end];
-        let slice_flags = payload[0];
-        let predictor_id = payload[1];
-        let pred_kind = tables::lookup_predictor(predictor_id)?;
-
-        let pixels_in_slice = slice_rows * g.width;
-        let buf = &mut plane_bufs[plane][row_start * g.width..row_end * g.width];
-
-        let mode_str: &str;
-        if (slice_flags & 0x01) != 0 {
-            mode_str = "raw";
-            // High-bit-depth raw mode: residuals are bit-packed at
-            // `bits` bits per sample, MSB-first, total
-            // `pixels_in_slice * bits` bits (`spec/05` §4.1).
-            let needed_bytes = min_payload_bytes(pixels_in_slice, bits as u32)
-                .ok_or(Error::SliceTruncated { slice_index: s })?;
-            if payload.len() - 2 < needed_bytes {
-                return Err(Error::SliceTruncated { slice_index: s });
+    // On-wire slice→plane mapping (spec/02 §7.3); see
+    // `decode_eight_bit` for the rationale.
+    let jobs = slice_jobs(
+        bytes,
+        slice_ranges,
+        slice_plane_map,
+        plane_geoms,
+        &mut plane_bufs,
+    );
+    let results = crate::parallel::for_each_job(
+        jobs,
+        threads,
+        || (),
+        |_, job| -> Result<SliceDone> {
+            let slice_flags = job.payload[0];
+            let predictor_id = job.payload[1];
+            let pred_kind = tables::lookup_predictor(predictor_id)?;
+            let done = job.done(slice_flags, predictor_id);
+            if (slice_flags & 0x01) != 0 {
+                // High-bit-depth raw mode: residuals are bit-packed at
+                // `bits` bits per sample, MSB-first, total
+                // `pixels * bits` bits (`spec/05` §4.1).
+                let needed_bytes =
+                    min_payload_bytes(job.out.len(), bits as u32).ok_or(Error::SliceTruncated {
+                        slice_index: job.slice,
+                    })?;
+                if job.payload.len() - 2 < needed_bytes {
+                    return Err(Error::SliceTruncated {
+                        slice_index: job.slice,
+                    });
+                }
+                // Batched unpacker — same observable bit stream as a
+                // per-pixel `BitReader::read_bits(bits)` loop but folds
+                // the refill check into a per-`floor(56/bits)` cadence
+                // rather than firing once per pixel.
+                unpack_raw_bits_to_u16(&job.payload[2..2 + needed_bytes], job.out, bits, mask);
+            } else {
+                let mut br = BitReader::new(&job.payload[2..]);
+                // `false` ⇒ a symbol hit an unused-codespace slot of an
+                // under-full descriptor (`spec/05` §2.1); reject as
+                // malformed.
+                if !huff_tables[job.plane].decode_into_u16(&mut br, job.out, mask) {
+                    return Err(Error::HuffmanIncomplete { plane: job.plane });
+                }
             }
-            // Batched unpacker — same observable bit stream as a
-            // per-pixel `BitReader::read_bits(bits)` loop but folds
-            // the refill check into a per-`floor(56/bits)` cadence
-            // rather than firing once per pixel.
-            unpack_raw_bits_to_u16(&payload[2..2 + needed_bytes], buf, bits, mask);
-        } else {
-            mode_str = "huffman";
-            let mut br = BitReader::new(&payload[2..]);
-            let table = &huff_tables[plane];
-            // `false` ⇒ a symbol hit an unused-codespace slot of an
-            // under-full descriptor (`spec/05` §2.1); reject as malformed.
-            if !table.decode_into_u16(&mut br, buf, mask) {
-                return Err(Error::HuffmanIncomplete { plane });
-            }
-        }
-
+            predict::apply_u16_with_stride(
+                pred_kind,
+                job.out,
+                job.rows,
+                job.width,
+                mask,
+                field_stride,
+            );
+            Ok(done)
+        },
+    );
+    finish_slices(
+        results,
         #[cfg(feature = "trace")]
-        if let Some(t) = tracer {
-            t.emit(Event::Payload {
-                slice: s,
-                plane,
-                slice_in_plane: in_plane_idx,
-                row_start,
-                row_end,
-                cols: g.width,
-                file_offset: slice_start,
-                payload_size: payload.len(),
-                slice_flags,
-                predictor_id,
-                mode: mode_str,
-                n_pixels: pixels_in_slice,
-            });
-        }
-        let _ = mode_str;
-
-        predict::apply_u16_with_stride(pred_kind, buf, slice_rows, g.width, mask, field_stride);
-    }
+        tracer,
+    )?;
 
     let final_planes = match rec.family {
         Family::Rgb | Family::Rgba => {
-            reverse_rgb_decorrelation_u16(plane_bufs, plane_geoms, rec, mask)
+            reverse_rgb_decorrelation_u16(plane_bufs, plane_geoms, rec, mask, threads)
         }
         Family::Yuv | Family::Yuva | Family::Gray => plane_bufs
             .into_iter()
@@ -943,6 +1102,7 @@ fn reverse_rgb_decorrelation_u8(
     mut wire_planes: Vec<Vec<u8>>,
     geoms: &[PlaneGeom],
     rec: FourccRecord,
+    threads: usize,
 ) -> Vec<DecodedPlane> {
     debug_assert!(matches!(rec.family, Family::Rgb | Family::Rgba));
     debug_assert!(wire_planes.len() == geoms.len());
@@ -957,12 +1117,13 @@ fn reverse_rgb_decorrelation_u8(
         let b_prime = &mut b_slice[0];
         let g_plane = &g_slice[0];
         let r_prime = &mut r_slice[0];
-        for (b, &gv) in b_prime.iter_mut().zip(g_plane.iter()) {
-            *b = b.wrapping_add(gv);
-        }
-        for (r, &gv) in r_prime.iter_mut().zip(g_plane.iter()) {
-            *r = r.wrapping_add(gv);
-        }
+        let add_green = |x: &mut [u8], g: &[u8]| {
+            for (v, &gv) in x.iter_mut().zip(g) {
+                *v = v.wrapping_add(gv);
+            }
+        };
+        crate::parallel::zip_chunks(b_prime, g_plane, threads, add_green);
+        crate::parallel::zip_chunks(r_prime, g_plane, threads, add_green);
     }
     let mut iter = wire_planes.into_iter();
     let b = iter.next().unwrap();
@@ -1004,6 +1165,7 @@ fn reverse_rgb_decorrelation_u16(
     geoms: &[PlaneGeom],
     rec: FourccRecord,
     mask: u16,
+    threads: usize,
 ) -> Vec<DecodedPlane> {
     debug_assert!(matches!(rec.family, Family::Rgb | Family::Rgba));
     debug_assert!(wire_planes.len() == geoms.len());
@@ -1017,12 +1179,13 @@ fn reverse_rgb_decorrelation_u16(
         let b_prime = &mut b_slice[0];
         let g_plane = &g_slice[0];
         let r_prime = &mut r_slice[0];
-        for (b, &gv) in b_prime.iter_mut().zip(g_plane.iter()) {
-            *b = b.wrapping_add(gv) & mask;
-        }
-        for (r, &gv) in r_prime.iter_mut().zip(g_plane.iter()) {
-            *r = r.wrapping_add(gv) & mask;
-        }
+        let add_green = |x: &mut [u16], g: &[u16]| {
+            for (v, &gv) in x.iter_mut().zip(g) {
+                *v = v.wrapping_add(gv) & mask;
+            }
+        };
+        crate::parallel::zip_chunks(b_prime, g_plane, threads, add_green);
+        crate::parallel::zip_chunks(r_prime, g_plane, threads, add_green);
     }
     let bd = rec.bit_depth;
     let mut iter = wire_planes.into_iter();

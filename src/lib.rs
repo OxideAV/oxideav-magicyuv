@@ -67,6 +67,7 @@ pub mod header;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod huffman;
+mod parallel;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod predict;
@@ -78,7 +79,10 @@ pub mod tables;
 #[cfg(feature = "trace")]
 pub(crate) mod trace;
 
-pub use crate::decoder::{DecodedFrame, DecodedPlane, Samples, decode_frame, decode_into};
+pub use crate::decoder::{
+    DecodeOptions, DecodedFrame, DecodedPlane, Samples, decode_frame, decode_frame_with,
+    decode_into, decode_into_with,
+};
 #[cfg(feature = "registry")]
 pub use crate::encoder::output_params;
 pub use crate::encoder::{EncodeOptions, PlaneInput, PredictorStrategy, SliceMode, encode_frame};

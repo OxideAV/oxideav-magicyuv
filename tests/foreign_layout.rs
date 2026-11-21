@@ -240,3 +240,135 @@ fn encoder_never_emits_a_zero_length_symbol() {
         }
     }
 }
+
+/// Planes with enough samples that a thread grant is honoured.
+fn large_planes(r: FourccRecord, w: usize, h: usize) -> Vec<PlaneInput> {
+    let mut state = 0x9e37_79b9u32;
+    (0..r.planes as usize)
+        .map(|p| {
+            let chroma = (p == 1 || p == 2) && (r.sub_x > 1 || r.sub_y > 1);
+            let (pw, ph) = if chroma {
+                (w.div_ceil(r.sub_x as usize), h.div_ceil(r.sub_y as usize))
+            } else {
+                (w, h)
+            };
+            let v = (0..pw * ph).map(|i| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                // smooth in the top half, noise below: raw and Huffman
+                // slices in one frame under `SliceMode::Auto`
+                if i < pw * ph / 2 {
+                    (i % pw + i / pw + p * 9) as u32 + (state & 3)
+                } else {
+                    state >> 8
+                }
+            });
+            if r.is_high_bit_depth() {
+                PlaneInput::U16(v.map(|x| (x & r.sample_mask()) as u16).collect())
+            } else {
+                PlaneInput::U8(v.map(|x| x as u8).collect())
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn thread_grant_changes_neither_the_bytes_nor_the_samples() {
+    use oxideav_magicyuv::{DecodeOptions, decode_frame_with};
+    let (w, h) = (331usize, 257usize);
+    for fourcc in [
+        b"M8RG", b"M8RA", b"M8Y0", b"M8Y2", b"M8G0", b"M0RG", b"M0Y0", b"M4RA",
+    ] {
+        let r = rec(fourcc);
+        for (strategy, mode, slice_height, interlaced) in [
+            (PredictorStrategy::Dynamic, SliceMode::Auto, 28u32, false),
+            (PredictorStrategy::Dynamic, SliceMode::Auto, 6, true),
+            (
+                PredictorStrategy::Fixed(PredictorKind::Median),
+                SliceMode::Huffman,
+                258,
+                false,
+            ),
+            (
+                PredictorStrategy::Fixed(PredictorKind::Gradient),
+                SliceMode::Raw,
+                2,
+                false,
+            ),
+        ] {
+            let opts = EncodeOptions::default()
+                .with_strategy(strategy)
+                .with_mode(mode)
+                .with_interlaced(interlaced);
+            let encode = |threads: usize| {
+                encode_frame(
+                    r,
+                    w as u32,
+                    h as u32,
+                    slice_height,
+                    large_planes(r, w, h),
+                    opts.with_threads(threads),
+                )
+                .unwrap()
+            };
+            let serial = encode(1);
+            for threads in [0usize, 2, 3, 8, 64] {
+                assert!(
+                    encode(threads) == serial,
+                    "{:?} sh={slice_height}: encode differs at threads={threads}",
+                    r.fourcc
+                );
+            }
+            let want = decoded_bytes(&serial);
+            for threads in [0usize, 2, 3, 8, 64] {
+                let f =
+                    decode_frame_with(&serial, DecodeOptions::new().with_threads(threads)).unwrap();
+                let mut got = Vec::new();
+                for p in &f.planes {
+                    match &p.samples {
+                        Samples::U8(v) => got.extend_from_slice(v),
+                        Samples::U16(v) => got.extend(v.iter().flat_map(|s| s.to_le_bytes())),
+                    }
+                }
+                assert!(
+                    got == want,
+                    "{:?} sh={slice_height}: decode differs at threads={threads}",
+                    r.fourcc
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn threaded_decode_reports_the_first_bad_slice() {
+    use oxideav_magicyuv::{DecodeOptions, decode_frame_with};
+    let r = rec(b"M8RG");
+    let (w, h, slice_height) = (331usize, 257usize, 16u32);
+    let per_plane = h.div_ceil(slice_height as usize);
+    let total = 3 * per_plane;
+    let mut frame = encode_frame(
+        r,
+        w as u32,
+        h as u32,
+        slice_height,
+        large_planes(r, w, h),
+        EncodeOptions::default(),
+    )
+    .unwrap();
+    // Give slices 7 and 30 an unknown predictor id.
+    for k in [30usize, 7] {
+        let start =
+            u32::from_le_bytes(frame[36 + 4 * k..40 + 4 * k].try_into().unwrap()) as usize + 32;
+        frame[start + 1] = 0x09;
+    }
+    assert!(total > 30);
+    for threads in [1usize, 2, 8] {
+        let got = decode_frame_with(&frame, DecodeOptions::new().with_threads(threads));
+        assert!(
+            matches!(got, Err(Error::BadPredictorId(0x09))),
+            "threads={threads}"
+        );
+    }
+}

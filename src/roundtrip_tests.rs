@@ -235,6 +235,7 @@ fn roundtrip(
             interlaced,
             color_matrix: 1,
             full_range: false,
+            threads: 1,
         },
     )
     .unwrap_or_else(|e| {
@@ -2500,6 +2501,7 @@ fn encoder_color_matrix_composes_with_interlaced_flag() {
         color_matrix: 0xa,
         full_range: false,
         predictor: PredictorKind::Gradient,
+        threads: 1,
     };
     let bytes = encode_frame(rec, w, h, sh, planes.clone(), opts).expect("encode_frame combined");
     let parsed = parse_header(&bytes).expect("parse combined-flags header");
@@ -2660,6 +2662,7 @@ fn full_range_override_clears_bit_2_for_rgb_family() {
             color_matrix: 0xa,
             full_range: true,
             predictor: PredictorKind::Gradient,
+            threads: 1,
         };
         let bytes = encode_frame(rec, w, h, sh, planes.clone(), opts)
             .expect("encode_frame RGB-family full_range");
@@ -2759,6 +2762,7 @@ fn encoder_full_range_composes_with_interlaced_and_color_matrix() {
         color_matrix: 0xa,
         full_range: true,
         predictor: PredictorKind::Gradient,
+        threads: 1,
     };
     let bytes =
         encode_frame(rec, w, h, sh, planes.clone(), opts).expect("encode_frame combined-three");
@@ -2863,6 +2867,7 @@ fn roundtrip_seeded(
             interlaced,
             color_matrix: 1,
             full_range: false,
+            threads: 1,
         },
     )
     .unwrap_or_else(|e| {
