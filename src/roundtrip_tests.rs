@@ -3247,8 +3247,8 @@ mod per_slice_plane_index_ordering {
         let pf = parse(&bytes, total_slices);
 
         // Sanity: the original is plane-major (s / slices_per_plane).
-        for s in 0..total_slices {
-            assert_eq!(pf.slice_plane[s] as usize, s / slices_per_plane);
+        for (s, &plane) in pf.slice_plane.iter().enumerate().take(total_slices) {
+            assert_eq!(plane as usize, s / slices_per_plane);
         }
 
         let permuted = reemit_permuted(&pf, order);
