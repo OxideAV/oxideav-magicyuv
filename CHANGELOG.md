@@ -6,6 +6,20 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-magicyuv/compare/v0.0.7...v0.0.8) - 2026-11-21
+
+### Other
+
+- crate docs list the options entry points and the interoperability test; README scope heading
+- sweep the black-box encoder up to 64 requested slices; README size figures
+- Serial hot paths: two-symbol Huffman lookups, grouped code stores, lane histogram
+- Slice-parallel decode and encode under a caller-granted thread budget
+- Live black-box interoperability matrix; interlaced slice guard; README states what was measured
+- accept the row-major-rank multi-slice layout and odd subsampled sizes
+- code the whole residual alphabet (no zero-length symbols)
+- iterate the plane-index bytes instead of indexing (clippy 1.100 needless_range_loop)
+- API hygiene: #[non_exhaustive] on growable enums + option / header records, with_* setters and constructors
+
 ### Fixed
 
 - **Encoder output was refused by a black-box decoder (every frame, every option).** The per-plane Huffman book marked unused residual symbols with length 0; the black-box decoder rejects any such descriptor ("invalid Huffman codes"), and every book in `spec/05` §1.2 / §1.3 codes the whole alphabet. The encoder now builds an optimal length-limited complete code over all `1 << bit_depth` symbols (package-merge, `O(max_length · N)`), unused symbols sinking to the longest lengths (at most 1/16 of the codespace).
