@@ -112,12 +112,10 @@ pub enum Error {
         /// Slice index inside the frame.
         slice_index: usize,
     },
-    /// Header (decode) or requested (encode) dimensions don't divide
-    /// evenly by the FOURCC's chroma subsampling factor (`spec/03`
-    /// §8.2). The ceiling-vs-floor rounding rule for chroma planes at
-    /// odd resolutions is an unverified open question, so both the
-    /// decoder and [`crate::encode_frame`] conservatively reject the
-    /// ambiguous case rather than silently flooring `dim / factor`.
+    /// No longer produced: odd dimensions on a subsampled FOURCC are
+    /// decoded and encoded with chroma planes of
+    /// `ceil(width / sub_x) × ceil(height / sub_y)` samples (`spec/03`
+    /// §8.2). The variant is kept for source compatibility.
     OddDimensionForSubsampling {
         /// `width` or `height`.
         what: &'static str,
@@ -140,9 +138,8 @@ pub enum Error {
     /// silently-truncated, partly-zero chroma plane). The v2.4.2
     /// encoder only ever writes `slice_height = 28`, which divides
     /// every native `sub_y ∈ {1, 2}` cleanly, so the spec leaves the
-    /// indivisible case unverified. Both directions reject it — the
-    /// same defensive posture as
-    /// [`Self::OddDimensionForSubsampling`] — so the encoder never
+    /// indivisible case unverified. Both directions reject it, so the
+    /// encoder never
     /// emits a stream it cannot itself round-trip and the decoder
     /// never silently drops chroma rows from a hostile header. For
     /// `sub_y == 1` (RGB / Gray / 4:4:4 / 4:2:2) the guard is inert.

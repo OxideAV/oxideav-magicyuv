@@ -274,29 +274,6 @@ pub fn encode_frame(
     planes: Vec<PlaneInput>,
     options: EncodeOptions,
 ) -> Result<Vec<u8>> {
-    // Reject odd dimensions that don't divide the FOURCC's chroma
-    // subsampling factor cleanly (`spec/03` §8.2). The ceiling-vs-floor
-    // rounding rule for chroma planes at odd resolutions is an
-    // unverified open question in the spec, so — symmetric with the
-    // decoder's `OddDimensionForSubsampling` rejection — the encoder
-    // refuses the ambiguous case rather than silently flooring
-    // `width / sub_x` (which drops the last chroma column/row and
-    // produces a stream the decoder then rejects). For even
-    // dimensions `ceil == floor` and this guard is inert.
-    if rec.sub_x as u32 > 1 && !width.is_multiple_of(rec.sub_x as u32) {
-        return Err(Error::OddDimensionForSubsampling {
-            what: "width",
-            got: width,
-            factor: rec.sub_x as u32,
-        });
-    }
-    if rec.sub_y as u32 > 1 && !height.is_multiple_of(rec.sub_y as u32) {
-        return Err(Error::OddDimensionForSubsampling {
-            what: "height",
-            got: height,
-            factor: rec.sub_y as u32,
-        });
-    }
     // Reject a `slice_height` the §6 chroma partition can't tile (an
     // indivisible-by-`sub_y` value floors `slice_height / sub_y` and
     // drops the bottom chroma rows). Symmetric with the decoder guard;
@@ -1795,8 +1772,9 @@ fn plane_dims_for(
         Family::Yuva if plane == 1 || plane == 2 => (rec.sub_x as usize, rec.sub_y as usize),
         _ => (1usize, 1usize),
     };
-    let pw = width / sub_x;
-    let ph = height / sub_y;
+    // Chroma planes round up at odd sizes (`spec/03` §8.2).
+    let pw = width.div_ceil(sub_x);
+    let ph = height.div_ceil(sub_y);
     let psh = slice_height / sub_y;
     (pw, ph, psh)
 }

@@ -9,6 +9,8 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - **Encoder output was refused by a black-box decoder (every frame, every option).** The per-plane Huffman book marked unused residual symbols with length 0; the black-box decoder rejects any such descriptor ("invalid Huffman codes"), and every book in `spec/05` §1.2 / §1.3 codes the whole alphabet. The encoder now builds an optimal length-limited complete code over all `1 << bit_depth` symbols (package-merge, `O(max_length · N)`), unused symbols sinking to the longest lengths (at most 1/16 of the codespace).
+- **Multi-slice frames from a black-box encoder were refused** (`BadPlaneIndex`; 4 896 of the 6 048 streams of the first live matrix, counting the odd-size refusals below). Such frames store their slice payloads slice-row by slice-row behind a plane-major, non-monotonic slice table, and their preamble index bytes hold the row-major rank `s·P + p` at position `p·S + s` instead of the plane index of `spec/02` §7.3. The decoder now accepts exactly that shape next to the documented one (the two cannot be confused: with more than one slice per plane a rank byte always exceeds the plane count), deriving each slice's extent from the nearest later slice start. The layout is not described by `spec/02`; see the README.
+- **Odd widths / heights on 4:2:2 and 4:2:0 FOURCCs were refused** by both the decoder and the encoder (`OddDimensionForSubsampling`). Chroma planes are now `ceil(width / sub_x) × ceil(height / sub_y)` as `spec/03` §8.2 / `spec/04` §6 state, confirmed bit-exact against a black-box encoder and decoder down to 1×1. The error variant is kept but no longer produced.
 
 ### Added
 

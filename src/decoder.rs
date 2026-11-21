@@ -262,22 +262,6 @@ pub fn decode_into(bytes: &[u8], dst: &mut DecodedFrame) -> Result<()> {
     let num_planes = rec.planes as usize;
     let total_slices = num_planes * slices_per_plane;
 
-    // Reject odd dims that don't divide chroma subsampling cleanly —
-    // the rounding rule is unverified at odd sizes (spec/03 §8.2).
-    if rec.sub_x as u32 > 1 && (hdr.width % rec.sub_x as u32) != 0 {
-        return Err(Error::OddDimensionForSubsampling {
-            what: "width",
-            got: hdr.width,
-            factor: rec.sub_x as u32,
-        });
-    }
-    if rec.sub_y as u32 > 1 && (hdr.height % rec.sub_y as u32) != 0 {
-        return Err(Error::OddDimensionForSubsampling {
-            what: "height",
-            got: hdr.height,
-            factor: rec.sub_y as u32,
-        });
-    }
     // Reject a `slice_height` the §6 chroma partition can't tile. With
     // `chroma_psh = slice_height / sub_y` (floor) and the chroma plane
     // reusing the luma `slices_per_plane`, an indivisible `slice_height`
@@ -366,33 +350,8 @@ pub fn decode_into(bytes: &[u8], dst: &mut DecodedFrame) -> Result<()> {
         });
     }
     let per_slice_plane = &preamble[1..1 + total_slices];
-    // Honour the on-wire slice→plane mapping rather than assuming the
-    // plane-major ordering (`spec/02` §7.3: "A spec-compliant decoder
-    // MUST read `per_slice_plane_index` from the preamble (not assume
-    // the plane-major ordering); the encoder's freedom to interleave
-    // is preserved by the table format."). Each `per_slice_plane_index`
-    // byte names the plane its slice belongs to; the slice's
-    // within-plane index is the running count of slices already seen
-    // for that plane (so the k-th slice of plane p covers chroma /
-    // luma rows `[k*plane_slice_height, …)` per §6 regardless of where
-    // it sits in the global slice order). A plane index outside
-    // `[0, num_planes)`, or one that over-fills a plane's
-    // `slices_per_plane` quota, is rejected as malformed.
-    let mut slice_plane_map: Vec<(usize, usize)> = Vec::with_capacity(total_slices);
-    let mut plane_fill = vec![0usize; num_planes];
-    for (s, &p) in per_slice_plane.iter().enumerate() {
-        let plane = p as usize;
-        if plane >= num_planes || plane_fill[plane] >= slices_per_plane {
-            return Err(Error::BadPlaneIndex {
-                slice_index: s,
-                got: plane,
-                num_planes,
-            });
-        }
-        let in_plane_idx = plane_fill[plane];
-        plane_fill[plane] += 1;
-        slice_plane_map.push((plane, in_plane_idx));
-    }
+    let (slice_plane_map, scattered) =
+        resolve_slice_map(per_slice_plane, num_planes, slices_per_plane)?;
 
     #[cfg(feature = "trace")]
     if let Some(t) = &tracer {
@@ -473,6 +432,7 @@ pub fn decode_into(bytes: &[u8], dst: &mut DecodedFrame) -> Result<()> {
         &plane_geoms,
         &huff_tables,
         rec,
+        scattered,
     )?;
 
     let interlaced = (hdr.flags & FLAG_INTERLACED) != 0;
@@ -511,6 +471,64 @@ pub fn decode_into(bytes: &[u8], dst: &mut DecodedFrame) -> Result<()> {
             dst,
         )
     }
+}
+
+/// Resolve the preamble's `total_slices` index bytes into, for each
+/// slice-table position, the plane it belongs to and its index within
+/// that plane. The `bool` is `true` for the second layout below.
+///
+/// Two layouts are accepted:
+///
+/// 1. **Plane-index bytes** (`spec/02` §7.3): byte `k` names the plane
+///    of slice `k`; a slice's within-plane index is the running count
+///    of earlier slices of the same plane. The slice table is walked
+///    with the `spec/02` §5.1 rule (slice `k` ends where slice `k + 1`
+///    starts).
+/// 2. **Row-major rank bytes**: byte `p·S + s` holds `s·P + p` (`P`
+///    planes, `S` slices per plane) and the slice table is indexed
+///    plane-major — entry `1 + p·S + s` is the start of slice `s` of
+///    plane `p` — while the payloads themselves are stored slice-row by
+///    slice-row, so the table is not monotonic. This shape is not in
+///    `spec/02`; it is what a black-box encoder writes for every
+///    multi-slice frame, and it is accepted only in exactly this form.
+///    With `S == 1` the two layouts are the same bytes.
+///
+/// The layouts cannot be confused: with `S > 1` layout 2 always
+/// contains a value `≥ P`, which layout 1 rejects.
+fn resolve_slice_map(
+    index_bytes: &[u8],
+    num_planes: usize,
+    slices_per_plane: usize,
+) -> Result<(Vec<(usize, usize)>, bool)> {
+    let mut map: Vec<(usize, usize)> = Vec::with_capacity(index_bytes.len());
+    let mut plane_fill = vec![0usize; num_planes];
+    let mut bad: Option<(usize, usize)> = None;
+    for (s, &p) in index_bytes.iter().enumerate() {
+        let plane = p as usize;
+        if plane >= num_planes || plane_fill[plane] >= slices_per_plane {
+            bad = Some((s, plane));
+            break;
+        }
+        map.push((plane, plane_fill[plane]));
+        plane_fill[plane] += 1;
+    }
+    let Some((slice_index, got)) = bad else {
+        return Ok((map, false));
+    };
+    let row_major_rank = index_bytes.iter().enumerate().all(|(k, &b)| {
+        let (plane, in_plane) = (k / slices_per_plane, k % slices_per_plane);
+        b as usize == in_plane * num_planes + plane
+    });
+    if !row_major_rank {
+        return Err(Error::BadPlaneIndex {
+            slice_index,
+            got,
+            num_planes,
+        });
+    }
+    map.clear();
+    map.extend((0..index_bytes.len()).map(|k| (k / slices_per_plane, k % slices_per_plane)));
+    Ok((map, true))
 }
 
 /// Minimum number of payload bytes (after the 2-byte slice prefix)
@@ -562,6 +580,7 @@ fn validate_slices(
     plane_geoms: &[PlaneGeom],
     huff_tables: &[HuffmanTable],
     rec: FourccRecord,
+    scattered: bool,
 ) -> Result<Vec<(usize, usize)>> {
     let offset = |e: u32, s: usize| {
         usize::try_from(e)
@@ -581,10 +600,29 @@ fn validate_slices(
                 .unwrap_or(0) as u32
         })
         .collect();
+    let mut sorted_starts: Vec<usize> = Vec::new();
+    let mut first_start = 0usize;
+    if scattered {
+        for (s, &e) in entries[1..].iter().enumerate() {
+            sorted_starts.push(offset(e, s)?);
+        }
+        first_start = sorted_starts[0];
+        sorted_starts.sort_unstable();
+    }
     let mut ranges = Vec::with_capacity(total_slices);
     for (s, &(plane, in_plane_idx)) in slice_plane_map.iter().enumerate() {
         let start = offset(entries[s + 1], s)?;
-        let end = if s + 1 < total_slices {
+        let end = if scattered {
+            // Payloads are not in table order: a slice ends at the
+            // nearest later slice start (or the packet end). No two
+            // slices may share a start and none may begin before the
+            // preamble end (`entry[1]`).
+            let at = sorted_starts.partition_point(|&e| e <= start);
+            if start < first_start || (at >= 2 && sorted_starts[at - 2] == start) {
+                return Err(Error::SliceTruncated { slice_index: s });
+            }
+            sorted_starts.get(at).copied().unwrap_or(bytes.len())
+        } else if s + 1 < total_slices {
             offset(entries[s + 2], s)?
         } else {
             bytes.len()
@@ -890,8 +928,10 @@ fn plane_geom(
         Family::Yuva if plane == 1 || plane == 2 => (rec.sub_x as usize, rec.sub_y as usize),
         _ => (1, 1),
     };
-    let pw = width / sub_x;
-    let ph = height / sub_y;
+    // Chroma planes round up at odd sizes (`spec/03` §8.2,
+    // `spec/04` §6: `ceil(width / sub_x)`).
+    let pw = width.div_ceil(sub_x);
+    let ph = height.div_ceil(sub_y);
     PlaneGeom {
         width: pw,
         height: ph,

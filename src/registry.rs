@@ -511,8 +511,7 @@ struct MagicYuvEncoder {
 
 impl MagicYuvEncoder {
     /// Per-plane element count for plane index `p` at this FOURCC's
-    /// geometry (`spec/03` §8 chroma rounding — exact division because
-    /// `encode_frame` rejects odd subsampled dimensions).
+    /// geometry (`spec/03` §8.2: chroma dimensions round up).
     fn plane_pixel_count(&self, plane_index: usize) -> usize {
         let (w, h) = (self.width as usize, self.height as usize);
         // Plane 0 (luma / G) and any alpha plane are full-resolution;
@@ -522,7 +521,7 @@ impl MagicYuvEncoder {
         let is_chroma =
             matches!(self.rec.family, Family::Yuv) && (plane_index == 1 || plane_index == 2);
         if is_chroma {
-            (w / self.rec.sub_x as usize) * (h / self.rec.sub_y as usize)
+            w.div_ceil(self.rec.sub_x as usize) * h.div_ceil(self.rec.sub_y as usize)
         } else {
             w * h
         }
@@ -845,7 +844,7 @@ mod tests {
             .map(|i| {
                 let chroma = matches!(rec.family, Family::Yuv) && (i == 1 || i == 2);
                 if chroma {
-                    (w / rec.sub_x as usize) * (h / rec.sub_y as usize)
+                    w.div_ceil(rec.sub_x as usize) * h.div_ceil(rec.sub_y as usize)
                 } else {
                     w * h
                 }
@@ -871,7 +870,7 @@ mod tests {
                     ) {
                     w
                 } else {
-                    w / rec.sub_x as usize
+                    w.div_ceil(rec.sub_x as usize)
                 };
                 planes.push(VideoPlane { stride, data });
             } else {
@@ -887,7 +886,7 @@ mod tests {
                     ) {
                     w
                 } else {
-                    w / rec.sub_x as usize
+                    w.div_ceil(rec.sub_x as usize)
                 };
                 planes.push(VideoPlane {
                     stride: pw * 2,
