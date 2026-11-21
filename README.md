@@ -199,8 +199,11 @@ robustness against a regression that tightened a tolerance:
   10/12/14-bit FOURCCs).
 - [`decode_into`] — streaming variant reusing caller-owned per-plane
   storage when geometry matches.
+- [`decode_frame_with`] / [`decode_into_with`] — the same with
+  [`DecodeOptions`] (`with_threads(n)`).
 - [`encode_frame`] — encode one frame from per-plane pixel buffers,
-  driven by [`EncodeOptions`].
+  driven by [`EncodeOptions`] (predictor strategy, slice mode,
+  interlacing, header flags, `with_threads(n)`).
 - [`header::parse`] — standalone v7 header parser, plus
   `is_interlaced` / `is_full_range` / `color_matrix_nibble` typed
   accessors and the `FLAG_*` constants.
@@ -238,6 +241,52 @@ cd fuzz && cargo +nightly fuzz run decode_magicyuv -- -max_total_time=60
 cd fuzz && cargo +nightly fuzz run encode_magicyuv -- -max_total_time=60
 cd fuzz && cargo +nightly fuzz run huffman_descriptor -- -max_total_time=60
 ```
+
+## Threads and throughput
+
+Every entry point is serial unless the caller grants threads:
+`DecodeOptions::with_threads(n)`, `EncodeOptions::with_threads(n)`, or
+`set_execution_context` on the registry decoder / encoder. Slices are
+independent (`spec/04` §5.2), so with a grant they are predicted and
+entropy-coded on up to `n` scoped `std::thread` workers (no
+dependency, blocking hand-off). Decoded samples and encoded bytes are
+identical at every grant. The grant only helps when a plane has
+several slices: the registry encoder's default is one slice per plane
+(best compression); set its `slice_height` option (28 is what the
+vendor encoder writes) to make frames that encode and decode in
+parallel.
+
+MiB of raw samples per second, `examples/throughput.rs`, slice height
+28, a real image crop with added noise (compresses to 0.52 at 8-bit).
+18-core arm64 host shared with other build jobs, so every figure is
+the median of 3 rounds of a median-of-7 and still moves by ±15 %
+between sessions. "before" is the serial code at the start of this
+work; the serial and the 8-thread columns are the current code.
+
+| Frame, operation                     | before | serial | 8 threads |
+| ------------------------------------ | -----: | -----: | --------: |
+| RGB 8-bit 2160p, encode Median       |    312 |    458 |      2363 |
+| RGB 8-bit 2160p, encode Dynamic+Auto |    216 |    273 |      1649 |
+| RGB 8-bit 2160p, decode              |    351 |    596 |      3768 |
+| RGB 8-bit 1080p, encode Median       |    275 |    444 |      2414 |
+| RGB 8-bit 1080p, encode Dynamic+Auto |    198 |    280 |      1637 |
+| RGB 8-bit 1080p, decode              |    314 |    470 |      2916 |
+| 4:2:0 8-bit 2160p, encode Median     |    266 |    378 |      2398 |
+| 4:2:0 8-bit 2160p, encode Dyn+Auto   |    201 |    250 |      1602 |
+| 4:2:0 8-bit 2160p, decode            |    329 |    524 |      3588 |
+| 4:2:0 8-bit 1080p, decode            |    308 |    511 |      2985 |
+| RGB 10-bit 2160p, encode Median      |    393 |    458 |      3834 |
+| RGB 10-bit 2160p, encode Dyn+Auto    |    315 |    315 |      1836 |
+| RGB 10-bit 2160p, decode             |    329 |    347 |      2534 |
+
+Where the serial gains come from: the 8-bit Huffman decoder reads two
+symbols per table lookup whenever both codes fit the 12-bit window and
+refills its bit buffer once per four lookups; the encoder gathers
+three or four codes per 64-bit store instead of emitting byte by byte,
+computes residuals in place, and counts symbols in four interleaved
+histograms. The 10/12/14-bit decoder (two-level table) is unchanged,
+its serial figures above are noise. The registry decoder no longer
+copies 8-bit planes into the output frame.
 
 ## Profiling
 

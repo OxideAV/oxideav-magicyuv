@@ -843,114 +843,60 @@ pub(crate) fn pack_raw_bits_from_u16(dst: &mut Vec<u8>, src: &[u16], bits: u8) {
     }
 }
 
-/// Batched packer for the encoder's per-plane Huffman emit hot loop
-/// (8-bit residuals). Mirrors `pack_raw_bits_from_u16` (and the
-/// decoder's `decode_into_u8` batched hot loop, BENCHMARKS opt-2): the
-/// 64-bit accumulator + whole-byte drain state lives in stack locals
-/// across the whole slice, so the optimiser keeps `acc` / `bits_used`
-/// / the `Vec::push` length in registers across every symbol — the
-/// generic `BitWriter::write` path took `&mut self`, which forced a
-/// reload of `self.bytes` / `self.acc` / `self.bits_used` after every
-/// call and carried the `if len == 0 { return; }` early-return branch
-/// at every call site.
+/// Append the Huffman codes of `src` to `dst`, MSB-first with the last
+/// partial byte zero-padded (`spec/05` §2.2, §3.3).
 ///
-/// Per-symbol table fetch is **one** u32 from `packed` (low 8 b length,
-/// high 24 b code) instead of two separate `lengths[sym]` + `codes[sym]`
-/// indexes — matches the encoder-side reshape of the decoder's
-/// `Vec<u32>` packed primary table (opt-6).
-///
-/// Same observable byte stream as the per-pixel
-/// `for &sym in src { bw.write(huff.codes[sym], huff.lengths[sym]); }`
-/// loop the call sites previously walked. Pinned against that
-/// reference by the `pack_huffman_residuals_tests` module + verified
-/// end-to-end by the existing round-trip suite (every FOURCC ×
-/// predictor × Huffman / Auto configuration).
-#[inline]
-pub(crate) fn pack_huffman_residuals_u8(dst: &mut Vec<u8>, src: &[u8], packed: &[u32]) {
-    if src.is_empty() {
-        return;
-    }
-    // Reserve a conservative upper bound: the per-symbol code length is
-    // at most `MAX_HUFF_LEN_8BIT = 12`, so `(src.len() * 12 + 7) / 8`.
-    // Falls short of the cap an over-bit-depth-prefixed `packed` could
-    // request (e.g. if the caller passed a 10/12/14-bit table by
-    // mistake), but the call sites already pre-size the `dst` Vec with
-    // a tight slice-payload cap, so this reservation is a hint at most.
-    dst.reserve((src.len() * 12).div_ceil(8));
+/// `packed[symbol]` holds `(code << 8) | length`. Codes are gathered
+/// `GROUP` at a time in a 64-bit accumulator and stored eight bytes at
+/// a time into pre-sized output, so the per-symbol work is a table
+/// fetch, a shift and an OR; `7 + GROUP × MAX_LEN ≤ 64` keeps a group
+/// from overflowing the accumulator.
+#[inline(always)]
+fn pack_codes<T: Copy, const GROUP: usize, const MAX_LEN: usize>(
+    dst: &mut Vec<u8>,
+    src: &[T],
+    packed: &[u32],
+    index: impl Fn(T) -> usize,
+) {
+    const { assert!(7 + GROUP * MAX_LEN <= 64) };
+    let start = dst.len();
+    // Worst case plus the slack of the last eight-byte store.
+    dst.resize(start + (src.len() * MAX_LEN).div_ceil(8) + 8, 0);
+    let out = &mut dst[start..];
+    let mut pos = 0usize;
     let mut acc: u64 = 0;
-    let mut bits_used: u32 = 0;
-    for &sym in src {
-        // Single table fetch per symbol — splits the packed u32 into
-        // `(code, length)` once. `length ≤ 18 ≤ 32` so the `BitWriter`
-        // arithmetic below stays in bounds.
-        let entry = packed[sym as usize];
-        let length = (entry & 0xff) as u8;
-        let code = entry >> 8;
-        if length == 0 {
-            // Same as `BitWriter::write`'s `if len == 0 { return; }`
-            // early-return: an unused symbol carries no bits. Keeping
-            // this branch here (rather than at the per-call-site loop
-            // body) keeps the per-symbol cost paid once per *unused*
-            // symbol the encoder hands us — which shouldn't happen
-            // because the histogram is built from this very residual
-            // stream, but the build path tolerates the all-unused
-            // descriptor so we must too.
-            continue;
+    let mut used: u32 = 0;
+    for group in src.chunks(GROUP) {
+        for &sym in group {
+            let entry = packed[index(sym)];
+            let len = entry & 0xff;
+            debug_assert!(len as usize <= MAX_LEN);
+            // `code << (64 - len)` written so that `len == 0` (a symbol
+            // without a code) shifts everything out instead of
+            // overflowing the shift.
+            acc |= (((entry >> 8) as u64) << 32 << (32 - len)) >> used;
+            used += len;
         }
-        // Same MSB-first placement as `BitWriter::write`. With
-        // `length ≤ 12` (8-bit max code length) and entry-condition
-        // `bits_used ≤ 7`, the post-merge `bits_used ≤ 19`, so the
-        // drain loop runs ≤ 2 times.
-        let shift = 64 - bits_used - (length as u32);
-        acc |= (code as u64) << shift;
-        bits_used += length as u32;
-        while bits_used >= 8 {
-            dst.push((acc >> 56) as u8);
-            acc <<= 8;
-            bits_used -= 8;
-        }
+        out[pos..pos + 8].copy_from_slice(&acc.to_be_bytes());
+        let whole = used >> 3;
+        pos += whole as usize;
+        acc <<= whole * 8;
+        used &= 7;
     }
-    if bits_used > 0 {
-        // Same partial-byte zero-pad as `BitWriter::finish`.
-        dst.push((acc >> 56) as u8);
-    }
+    // The partial last byte, if any, was part of the last store.
+    dst.truncate(start + pos + usize::from(used > 0));
 }
 
-/// 10/12/14-bit analogue of `pack_huffman_residuals_u8`. Symbol index
-/// type widens to `u16` (the residual alphabet is up to 16384 entries
-/// at 14-bit), but the accumulator / drain logic is identical. Per-
-/// symbol code length is at most `MAX_HUFF_LEN_14BIT = 18`, so the
-/// post-merge `bits_used ≤ 25` and the drain loop still runs ≤ 3 times.
-#[inline]
+/// 8-bit residuals: codes are at most 12 bits (`spec/05` §1.1), four
+/// to an accumulator flush.
+pub(crate) fn pack_huffman_residuals_u8(dst: &mut Vec<u8>, src: &[u8], packed: &[u32]) {
+    pack_codes::<u8, 4, 14>(dst, src, packed, |s| s as usize);
+}
+
+/// 10/12/14-bit residuals: codes are at most 18 bits (`spec/05` §1.1),
+/// three to an accumulator flush.
 pub(crate) fn pack_huffman_residuals_u16(dst: &mut Vec<u8>, src: &[u16], packed: &[u32]) {
-    if src.is_empty() {
-        return;
-    }
-    // Reserve a conservative upper bound: `MAX_HUFF_LEN_14BIT = 18`,
-    // so `(src.len() * 18 + 7) / 8`. As with the u8 variant this is a
-    // hint — the call sites pre-size `dst` to `2 * raw_size + 2`.
-    dst.reserve((src.len() * 18).div_ceil(8));
-    let mut acc: u64 = 0;
-    let mut bits_used: u32 = 0;
-    for &sym in src {
-        let entry = packed[sym as usize];
-        let length = (entry & 0xff) as u8;
-        let code = entry >> 8;
-        if length == 0 {
-            continue;
-        }
-        let shift = 64 - bits_used - (length as u32);
-        acc |= (code as u64) << shift;
-        bits_used += length as u32;
-        while bits_used >= 8 {
-            dst.push((acc >> 56) as u8);
-            acc <<= 8;
-            bits_used -= 8;
-        }
-    }
-    if bits_used > 0 {
-        dst.push((acc >> 56) as u8);
-    }
+    pack_codes::<u16, 3, 19>(dst, src, packed, |s| s as usize);
 }
 
 // ─────────────────────────── 8-bit encode ───────────────────────────
@@ -1131,8 +1077,6 @@ const MIN_SAMPLES_FOR_THREADS: usize = 1 << 16;
 /// The operations of the slice pipeline that depend on the sample
 /// container (one byte at 8-bit, a 16-bit word above).
 trait WireSample: Copy + Send + Sync + 'static {
-    /// Residual symbol index.
-    fn symbol(self) -> usize;
     /// Replace a slice's samples by its residuals, in place.
     fn predict(
         kind: PredictorKind,
@@ -1148,13 +1092,13 @@ trait WireSample: Copy + Send + Sync + 'static {
     fn pack_huffman(dst: &mut Vec<u8>, block: &[Self], packed: &[u32]);
     /// Append the raw-mode residuals (`spec/05` §4.1).
     fn pack_raw(dst: &mut Vec<u8>, block: &[Self], bits: u8);
+    /// Occurrences of each residual symbol in `block`.
+    fn histogram(block: &[Self], n_symbols: usize) -> Vec<u32>;
+    /// Bits per sample [`Self::pack_huffman`] sizes its output for.
+    const PACK_BOUND_BITS: usize;
 }
 
 impl WireSample for u8 {
-    #[inline(always)]
-    fn symbol(self) -> usize {
-        self as usize
-    }
     fn predict(
         kind: PredictorKind,
         block: &mut [u8],
@@ -1174,13 +1118,31 @@ impl WireSample for u8 {
     fn pack_raw(dst: &mut Vec<u8>, block: &[u8], _bits: u8) {
         dst.extend_from_slice(block);
     }
+    fn histogram(block: &[u8], n_symbols: usize) -> Vec<u32> {
+        // Four interleaved tables: consecutive equal bytes (the common
+        // case for residuals) then update different counters instead
+        // of chaining through one memory cell.
+        let mut lanes = [[0u32; 256]; 4];
+        let (quads, tail) = block.as_chunks::<4>();
+        for q in quads {
+            lanes[0][q[0] as usize] += 1;
+            lanes[1][q[1] as usize] += 1;
+            lanes[2][q[2] as usize] += 1;
+            lanes[3][q[3] as usize] += 1;
+        }
+        for &b in tail {
+            lanes[0][b as usize] += 1;
+        }
+        let mut hist = vec![0u32; n_symbols.max(256)];
+        for (s, h) in hist.iter_mut().take(256).enumerate() {
+            *h = lanes[0][s] + lanes[1][s] + lanes[2][s] + lanes[3][s];
+        }
+        hist
+    }
+    const PACK_BOUND_BITS: usize = 14;
 }
 
 impl WireSample for u16 {
-    #[inline(always)]
-    fn symbol(self) -> usize {
-        self as usize
-    }
     fn predict(
         kind: PredictorKind,
         block: &mut [u16],
@@ -1200,6 +1162,14 @@ impl WireSample for u16 {
     fn pack_raw(dst: &mut Vec<u8>, block: &[u16], bits: u8) {
         pack_raw_bits_from_u16(dst, block, bits);
     }
+    fn histogram(block: &[u16], n_symbols: usize) -> Vec<u32> {
+        let mut hist = vec![0u32; n_symbols];
+        for &v in block {
+            hist[v as usize] += 1;
+        }
+        hist
+    }
+    const PACK_BOUND_BITS: usize = 19;
 }
 
 /// Turn one slice's samples into its residuals in place and return the
@@ -1337,11 +1307,7 @@ fn encode_wire_planes<T: WireSample>(
                 field_stride,
                 scratch,
             );
-            let mut hist = vec![0u32; n_symbols];
-            for &v in block.iter() {
-                hist[v.symbol()] += 1;
-            }
-            (kind, hist)
+            (kind, T::histogram(block, n_symbols))
         },
     );
 
@@ -1384,11 +1350,10 @@ fn encode_wire_planes<T: WireSample>(
             let packed = &plane_huffs[plane].packed;
             // Raw body size: `ceil(samples * bits / 8)` (`spec/05` §4).
             let raw_size = (block.len() * bits as usize).div_ceil(8);
-            // Under Auto a Huffman body longer than the raw one loses,
-            // so the buffer never needs more than `raw_size + 1` bytes
-            // when Huffman wins; a forced Huffman body is bounded by
-            // the longest code.
-            let mut payload = Vec::with_capacity(2 + raw_size + raw_size / 2 + 1);
+            // Room for what the Huffman packer sizes its output to, so
+            // the payload is allocated once.
+            let huffman_bound = (block.len() * T::PACK_BOUND_BITS).div_ceil(8) + 8;
+            let mut payload = Vec::with_capacity(2 + huffman_bound.max(raw_size));
             payload.push(0x00);
             payload.push(predictor_id_byte(kind));
             match mode {
@@ -1993,6 +1958,32 @@ mod huffman_limit_tests {
             w.push(a + b);
         }
         total
+    }
+
+    #[test]
+    fn lane_histogram_counts_every_byte_once() {
+        let mut state = 7u32;
+        for n in [0usize, 1, 2, 3, 4, 5, 7, 8, 9, 1000, 1003] {
+            let block: Vec<u8> = (0..n)
+                .map(|_| {
+                    state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                    // runs of equal bytes, as residuals have
+                    if state & 0x300 == 0 {
+                        (state >> 16) as u8
+                    } else {
+                        0
+                    }
+                })
+                .collect();
+            let mut want = vec![0u32; 256];
+            for &b in &block {
+                want[b as usize] += 1;
+            }
+            assert_eq!(<u8 as WireSample>::histogram(&block, 256), want, "n={n}");
+        }
+        let words = [3u16, 3, 1023, 0, 3];
+        let got = <u16 as WireSample>::histogram(&words, 1024);
+        assert_eq!((got[3], got[1023], got[0], got.len()), (3, 1, 1, 1024));
     }
 
     #[test]

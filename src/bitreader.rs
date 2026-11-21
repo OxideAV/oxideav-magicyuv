@@ -178,6 +178,62 @@ impl<'a> BitReader<'a> {
     /// peeks the one assigned code's prefix and likewise never trips
     /// it. The check is a single `len == 0` OR fold per symbol — no
     /// branch, no extra memory traffic in the hot path.
+    /// As [`Self::decode_single_level_into_u8`], but reading up to two
+    /// symbols per table lookup from `pairs` (built by the Huffman
+    /// table from `primary`; same indexing). Each entry holds the bits
+    /// it consumes (bits 0..8, 0 for unused codespace), one or two
+    /// symbols (bits 8..16 and 16..24) and how many it yields (bits
+    /// 24..32, never 0). The final symbol of `out` is read through
+    /// `primary` so an entry never yields past the end.
+    ///
+    /// The accumulator is topped up whenever fewer than four windows
+    /// are buffered, so the four lookups of an iteration need no
+    /// further checks. Same observable bit stream and validity result
+    /// as the one-symbol loop.
+    #[inline]
+    pub fn decode_pairs_into_u8(
+        &mut self,
+        pairs: &[u32],
+        primary: &[u32],
+        primary_bits: u32,
+        out: &mut [u8],
+    ) -> bool {
+        let shift = 64 - primary_bits;
+        let mut all_valid = true;
+        let n = out.len();
+        let mut i = 0usize;
+        // Four lookups yield at most eight symbols.
+        if primary_bits * 4 <= 56 {
+            let mut acc = self.acc;
+            let mut fill = self.fill;
+            while i + 8 <= n {
+                if fill < primary_bits * 4 {
+                    self.acc = acc;
+                    self.fill = fill;
+                    self.refill();
+                    acc = self.acc;
+                    fill = self.fill;
+                }
+                let block = &mut out[i..i + 8];
+                let mut k = 0usize;
+                for _ in 0..4 {
+                    let entry = pairs[(acc >> shift) as usize];
+                    let len = entry & 0xff;
+                    all_valid &= len != 0;
+                    block[k] = (entry >> 8) as u8;
+                    block[k + 1] = (entry >> 16) as u8;
+                    k += (entry >> 24) as usize;
+                    acc <<= len;
+                    fill -= len;
+                }
+                i += k;
+            }
+            self.acc = acc;
+            self.fill = fill;
+        }
+        all_valid & self.decode_single_level_into_u8(primary, primary_bits, &mut out[i..])
+    }
+
     #[inline]
     pub fn decode_single_level_into_u8(
         &mut self,

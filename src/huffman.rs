@@ -165,6 +165,45 @@ pub struct HuffmanTable {
     /// symbol). Indexed by the next `(max_len - primary_bits)` bits.
     /// Empty when `max_len ≤ primary_bits`.
     secondary: Vec<Vec<u32>>,
+    /// Two-symbols-per-lookup table for the single-level 8-bit path,
+    /// indexed like `primary`. Each entry packs the total bits consumed
+    /// (bits 0..8), the first symbol (bits 8..16), the second symbol
+    /// (bits 16..24) and the number of symbols it yields, 1 or 2 (bits
+    /// 24..32). An entry yields two symbols when the first code and the
+    /// one following it both fit in the `primary_bits` window. A slot
+    /// of unused codespace has a zero bit count (and yields one symbol
+    /// so the decode loop still advances). Empty unless the alphabet is
+    /// 8-bit and the table is single-level.
+    pairs: Vec<u32>,
+}
+
+/// Build the two-symbols-per-lookup table from a single-level
+/// `primary` table (see [`HuffmanTable::pairs`]).
+fn pair_table(primary: &[u32], primary_bits: u32) -> Vec<u32> {
+    let window = (1usize << primary_bits) - 1;
+    primary
+        .iter()
+        .enumerate()
+        .map(|(key, &first)| {
+            let len1 = first & 0xff;
+            let sym1 = (first >> 8) & 0xff;
+            if len1 == 0 {
+                // Unused codespace: no bits, one (meaningless) symbol.
+                return 1 << 24;
+            }
+            // The bits after the first code, left-aligned in the
+            // window; only `primary_bits - len1` of them are stream
+            // bits, so the second code must fit in that many.
+            let second = primary[(key << len1) & window];
+            let len2 = second & 0xff;
+            if len2 != 0 && len1 + len2 <= primary_bits {
+                let sym2 = (second >> 8) & 0xff;
+                (2 << 24) | (sym2 << 16) | (sym1 << 8) | (len1 + len2)
+            } else {
+                (1 << 24) | (sym1 << 8) | len1
+            }
+        })
+        .collect()
 }
 
 impl HuffmanTable {
@@ -233,6 +272,7 @@ impl HuffmanTable {
                 primary,
                 primary_bits,
                 secondary,
+                pairs: Vec::new(),
             });
         }
 
@@ -327,6 +367,11 @@ impl HuffmanTable {
             }
         }
 
+        let pairs = if lengths.len() <= 256 && max_len <= primary_bits {
+            pair_table(&primary, primary_bits as u32)
+        } else {
+            Vec::new()
+        };
         Ok(Self {
             lengths,
             codes: code,
@@ -334,6 +379,7 @@ impl HuffmanTable {
             primary,
             primary_bits,
             secondary,
+            pairs,
         })
     }
 
@@ -423,7 +469,11 @@ impl HuffmanTable {
             // `peek_bits` + `consume` body — the EOF zero-pad + 8-byte
             // fast load are delegated to `BitReader::refill` unchanged,
             // pinned by `decode_into_u8_matches_per_pixel_decode`.
-            br.decode_single_level_into_u8(primary, primary_bits, out)
+            if self.pairs.len() == primary.len() {
+                br.decode_pairs_into_u8(&self.pairs, primary, primary_bits, out)
+            } else {
+                br.decode_single_level_into_u8(primary, primary_bits, out)
+            }
         } else {
             // Defensive two-level fallback (unreachable for native 8-bit
             // FOURCCs, whose `max_len ≤ 12 = PRIMARY_BITS`). Fold the
@@ -842,6 +892,76 @@ mod tests {
             let entry = pack_entry(sub_idx, REDIRECT_MARKER);
             assert_eq!((entry & 0xff) as u8, REDIRECT_MARKER);
             assert_eq!(entry >> 8, sub_idx);
+        }
+    }
+
+    /// Books for the two-symbol lookup test: the `spec/05` §1.2
+    /// all-zero book, a fixed-length book, a skewed complete book whose
+    /// short codes pair up, and an under-full one (unused codespace).
+    fn pair_test_books() -> Vec<Vec<u8>> {
+        let (spec_book, _) =
+            parse_lengths(&[0x01, 0x89, 0x5d, 0x08, 0x89, 0x9f], 256, 12, 0).unwrap();
+        // 1/2 + 1/4 + 1/8 + 16/128 = 1.
+        let mut skewed = vec![0u8; 256];
+        skewed[0] = 1;
+        skewed[1] = 2;
+        skewed[2] = 3;
+        skewed[3..19].fill(7);
+        let mut underfull = vec![0u8; 256];
+        underfull[0] = 1;
+        underfull[1] = 3;
+        underfull[2] = 3;
+        underfull[200] = 5;
+        vec![spec_book, vec![8u8; 256], skewed, underfull]
+    }
+
+    #[test]
+    fn pair_lookup_decode_matches_the_one_symbol_loop() {
+        // Any byte stream, any output length (so every tail length of
+        // the eight-symbol blocks), truncated input included: the
+        // symbols, the validity flag and the bits consumed must be
+        // those of the one-symbol-per-lookup loop.
+        let mut state = 0x2545_f491u32;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        for lens in pair_test_books() {
+            let table = HuffmanTable::build(lens, 0).expect("build");
+            assert_eq!(table.pairs.len(), table.primary.len());
+            for n in [0usize, 1, 2, 7, 8, 9, 15, 16, 17, 63, 64, 65, 500] {
+                for stream_len in [0usize, 1, 3, 9, 40, 2000] {
+                    let stream: Vec<u8> = (0..stream_len)
+                        .map(|_| {
+                            let r = next();
+                            // long runs of 1-bits make short codes common
+                            if r & 3 == 0 { (r >> 8) as u8 } else { 0xff }
+                        })
+                        .collect();
+                    let mut one = vec![0u8; n];
+                    let mut br_one = BitReader::new(&stream);
+                    let ok_one = br_one.decode_single_level_into_u8(
+                        &table.primary,
+                        table.primary_bits as u32,
+                        &mut one,
+                    );
+                    let mut two = vec![0u8; n];
+                    let mut br_two = BitReader::new(&stream);
+                    let ok_two = table.decode_into_u8(&mut br_two, &mut two);
+                    assert_eq!(ok_one, ok_two, "n={n} stream={stream_len}");
+                    if ok_one {
+                        assert_eq!(one, two, "n={n} stream={stream_len}");
+                        // Same position in the stream afterwards (the
+                        // batch loops leave the accumulator to be
+                        // topped up by the next `consume`).
+                        br_one.consume(0);
+                        br_two.consume(0);
+                        assert_eq!(br_one.read_bits(32), br_two.read_bits(32));
+                    }
+                }
+            }
         }
     }
 

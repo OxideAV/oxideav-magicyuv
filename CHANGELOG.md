@@ -26,6 +26,7 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 
 - Encoder: residuals are computed in place in the wire planes (one copy fewer per slice for a fixed predictor, one fewer of the three trial copies under `Dynamic`).
+- Serial throughput (README table, 2160p RGB 8-bit, MiB/s of raw samples): decode 351 → 596, encode with a fixed predictor 312 → 458, `dynamic_auto()` encode 216 → 273; with an 8-thread grant 3768 / 2363 / 1649. The 8-bit Huffman decoder reads two symbols per table lookup when both codes fit the 12-bit window; the Huffman packer stores three or four codes per 64-bit write; the residual histogram uses four interleaved tables; the registry decoder moves 8-bit planes into the output frame instead of copying them. Output is unchanged (encoder bytes compared against the previous build on 288 option combinations).
 
 - `#[non_exhaustive]` on the enums `Error`, `SliceMode`, `PredictorStrategy` and `tables::Family`, and on the records `DecodedFrame`, `DecodedPlane`, `EncodeOptions`, `FrameHeader`, `MagicYuvEncoderOptions`, `tables::FourccRecord`, `tables::PredictorRecord`. `Samples` / `PlaneInput` (8- vs 16-bit storage) and `tables::PredictorKind` (the format's three predictors) stay exhaustive.
 
