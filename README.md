@@ -5,7 +5,7 @@
 Pure-Rust MagicYUV lossless video codec for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
 
-## Status
+## Scope
 
 **Codec-only** (MagicYUV is a video codec; AVI/MOV containers live in
 their own crates). Decoder + encoder, with byte-for-byte round-trip.

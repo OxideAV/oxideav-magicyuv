@@ -37,8 +37,19 @@
 //!   caller-owned [`DecodedFrame`], re-using the per-plane storage
 //!   from the previous decode when geometry matches (avoids 4-7
 //!   `Vec` allocations per frame).
-//! - [`encode_frame`] — encode one frame from per-plane pixel buffers.
+//! - [`decode_frame_with`] / [`decode_into_with`] — the same with
+//!   [`DecodeOptions`]; `with_threads(n)` decodes the slices of a frame
+//!   on up to `n` scoped threads (serial by default, same samples).
+//! - [`encode_frame`] — encode one frame from per-plane pixel buffers;
+//!   [`EncodeOptions::with_threads`] codes its slices on up to `n`
+//!   scoped threads (serial by default, same bytes).
 //! - [`Error`] / [`Result`] — crate-local error type.
+//!
+//! ## Interoperability
+//!
+//! `tests/blackbox_matrix.rs` checks both directions against a
+//! black-box encoder and decoder (see the README for the matrix and
+//! for the multi-slice layout the decoder accepts beyond `spec/02`).
 //!
 //! ## Cargo features
 //!
